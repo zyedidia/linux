@@ -38,6 +38,10 @@ void get_safe_registers(unsigned long *regs, unsigned long *fp_regs)
 {
 	memcpy(regs, exec_regs, sizeof(exec_regs));
 
-	if (fp_regs)
+	/*
+	 * Both stay unset without userspace support - nothing probed the host
+	 * for an XSTATE size, and no task will ever run these registers.
+	 */
+	if (fp_regs && host_fp_size)
 		memcpy(fp_regs, exec_fp_regs, host_fp_size);
 }

@@ -103,6 +103,20 @@ int get_current_pid(void)
 	return task_pid_nr(current);
 }
 
+#ifdef CONFIG_UML_USERSPACE
+#define enter_userspace(regs) userspace(regs)
+#else
+/*
+ * Nothing in this build ever leaves kernel mode.  Both callers - a kernel
+ * thread whose function returned, and a fork that cannot happen - are bugs.
+ */
+static void __noreturn enter_userspace(struct uml_pt_regs *regs)
+{
+	panic("%s tried to enter userspace, which this kernel does not have",
+	      current->comm);
+}
+#endif
+
 /*
  * This is called magically, by its address being stuffed in a jmp_buf
  * and being longjmp-d to.
@@ -123,7 +137,7 @@ void new_thread_handler(void)
 	 * callback returns only if the kernel thread execs a process
 	 */
 	fn(arg);
-	userspace(&current->thread.regs.regs);
+	enter_userspace(&current->thread.regs.regs);
 }
 
 /* Called magically, see new_thread_handler above */
@@ -140,7 +154,7 @@ static void fork_handler(void)
 
 	current->thread.prev_sched = NULL;
 
-	userspace(&current->thread.regs.regs);
+	enter_userspace(&current->thread.regs.regs);
 }
 
 int copy_thread(struct task_struct * p, const struct kernel_clone_args *args)

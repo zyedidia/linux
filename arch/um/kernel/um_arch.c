@@ -320,16 +320,19 @@ int __init linux_main(int argc, char **argv, char **envp)
 		if (add)
 			add_arg(argv[i]);
 	}
-	if (have_root == 0)
+	/* Nothing mounts a root fs when there is no userspace to run off it. */
+	if (have_root == 0 && IS_ENABLED(CONFIG_UML_USERSPACE))
 		add_arg(DEFAULT_COMMAND_LINE_ROOT);
 
 	if (have_console == 0)
 		add_arg(DEFAULT_COMMAND_LINE_CONSOLE);
 
 	host_task_size = get_top_address(envp);
-	/* reserve a few pages for the stubs */
-	stub_start = host_task_size - STUB_SIZE;
-	host_task_size = stub_start;
+	if (IS_ENABLED(CONFIG_UML_USERSPACE)) {
+		/* reserve a few pages for the stubs */
+		stub_start = host_task_size - STUB_SIZE;
+		host_task_size = stub_start;
+	}
 
 	/* Limit TASK_SIZE to what is addressable by the page table */
 	task_size = host_task_size;

@@ -8,7 +8,16 @@
 
 #include <sysdep/ptrace.h>
 
+#ifdef CONFIG_UML_USERSPACE
 extern int using_seccomp;
+#else
+/*
+ * Nothing hosts userspace here, so the seccomp stub mode is simply never in
+ * use.  Defining it away lets the callers that are shared with a normal build
+ * fold their seccomp branches out instead of being #ifdef'd individually.
+ */
+#define using_seccomp 0
+#endif
 
 extern void new_thread_handler(void);
 extern void handle_syscall(struct uml_pt_regs *regs);

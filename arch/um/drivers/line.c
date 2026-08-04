@@ -381,9 +381,14 @@ int setup_one_line(struct line *lines, int n, char *init,
 			kfree(line->init_str);
 			tty_unregister_device(driver, n);
 			parse_chan_pair(NULL, line, n, opts, error_out);
-			err = 0;
 		}
-		*error_out = "configured as 'none'";
+		/*
+		 * A line that was never set up is already 'none', so asking
+		 * for that is what the caller wanted either way.  Reporting a
+		 * failure here just makes every boot with CON_CHAN="none" log
+		 * an error per unused line.
+		 */
+		err = 0;
 	} else {
 		char *new = kstrdup(init, GFP_KERNEL);
 		if (!new) {

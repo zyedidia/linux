@@ -14,11 +14,15 @@ CPPFLAGS_vmlinux.lds := -DSTART=$(LDS_START)		\
 			$(LDS_EXTRA)
 always-$(KBUILD_BUILTIN) := vmlinux.lds
 
-obj-y = config.o exec.o exitcode.o irq.o ksyms.o mem.o \
+obj-y = config.o exitcode.o irq.o kthread.o ksyms.o mem.o \
 	physmem.o process.o ptrace.o reboot.o sigio.o \
 	signal.o sysrq.o time.o tlb.o trap.o \
-	um_arch.o umid.o kmsg_dump.o capflags.o skas/
+	um_arch.o umid.o kmsg_dump.o capflags.o
 obj-y += load_file.o
+
+# Everything under skas/ exists only to host userspace processes.
+obj-$(CONFIG_UML_USERSPACE) += exec.o skas/
+obj-$(CONFIG_UML_NO_USERSPACE) += nouser.o
 
 obj-$(CONFIG_BLK_DEV_INITRD) += initrd.o
 obj-$(CONFIG_GPROF)	+= gprof_syms.o

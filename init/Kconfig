@@ -458,6 +458,14 @@ config DEFAULT_INIT
 	  locations (e.g. /sbin/init, etc). If this is empty, we will just use
 	  the fallback list when init= is not passed.
 
+config INIT_NONE
+	bool
+	help
+	  Selected by architectures that cannot execute userspace at all.
+	  Instead of looking for an init process and panicking when none can
+	  be run, the boot thread simply returns once initcalls are done and
+	  the kernel keeps running on interrupts and kernel threads alone.
+
 config DEFAULT_HOSTNAME
 	string "Default hostname"
 	default "(none)"

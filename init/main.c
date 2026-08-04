@@ -1570,6 +1570,21 @@ static int __ref kernel_init(void *unused)
 
 	do_sysctl_args();
 
+	if (IS_ENABLED(CONFIG_INIT_NONE)) {
+		pr_info("Booted without userspace support; idling.\n");
+
+		/*
+		 * There is no init to exec and killing PID 1 would panic, so
+		 * park it here.  The kernel stays up on interrupts, kernel
+		 * threads and workqueues; anything else has to be driven from
+		 * in-kernel code.
+		 */
+		for (;;) {
+			set_current_state(TASK_IDLE);
+			schedule();
+		}
+	}
+
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
@@ -1666,14 +1681,21 @@ static noinline void __init kernel_init_freeable(void)
 	 * check if there is an early userspace init.  If yes, let it do all
 	 * the work
 	 */
-	int ramdisk_command_access;
-	ramdisk_command_access = init_eaccess(ramdisk_execute_command);
-	if (ramdisk_command_access != 0) {
-		if (ramdisk_execute_command_set)
-			pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
-				ramdisk_execute_command, ramdisk_command_access);
-		ramdisk_execute_command = NULL;
-		prepare_namespace();
+	/*
+	 * Skipped entirely without userspace support - there is no init to
+	 * find, and mounting a root fs just to fail at it would panic.
+	 */
+	if (!IS_ENABLED(CONFIG_INIT_NONE)) {
+		int ramdisk_command_access;
+
+		ramdisk_command_access = init_eaccess(ramdisk_execute_command);
+		if (ramdisk_command_access != 0) {
+			if (ramdisk_execute_command_set)
+				pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
+					ramdisk_execute_command, ramdisk_command_access);
+			ramdisk_execute_command = NULL;
+			prepare_namespace();
+		}
 	}
 
 	/*

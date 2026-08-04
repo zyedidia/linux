@@ -50,6 +50,32 @@ config MMU
 	bool
 	default y
 
+config UML_NO_USERSPACE
+	bool "Build a kernel-only UML (no userspace support)"
+	select INIT_NONE
+	help
+	  Build a UML that can never leave kernel mode.  Everything used to
+	  host userspace processes is left out: the stub executable embedded
+	  in the image, the ptrace/seccomp probing done before the kernel
+	  starts, the syscall entry path, user memory access and the vDSO.
+	  Dropping the startup probing is what makes such a kernel boot
+	  noticeably faster - it costs several forks and a few hundred ptrace
+	  round trips on a normal UML.
+
+	  The resulting kernel has no init process.  It boots, runs its
+	  initcalls, probes its devices and then idles, servicing interrupts.
+	  Anything it does has to be done by in-kernel code, which makes this
+	  useful for driving a device from a driver under test and not much
+	  else.  There is no shell and no way to log in.
+
+	  This is incompatible with every binfmt handler, so BINFMT_ELF and
+	  friends have to be turned off as well.
+
+	  If unsure, say N.
+
+config UML_USERSPACE
+	def_bool !UML_NO_USERSPACE
+
 config UML_DMA_EMULATION
 	bool
 
