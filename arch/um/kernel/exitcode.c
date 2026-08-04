@@ -18,6 +18,8 @@
  */
 int uml_exitcode = 0;
 
+#ifdef CONFIG_PROC_FS
+
 static int exitcode_proc_show(struct seq_file *m, void *v)
 {
 	int val;
@@ -77,3 +79,5 @@ static int make_proc_exitcode(void)
 }
 
 __initcall(make_proc_exitcode);
+
+#endif /* CONFIG_PROC_FS */

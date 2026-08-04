@@ -171,6 +171,7 @@ int um_tlb_sync(struct mm_struct *mm)
 		return 0;
 
 	ops.mm_idp = &mm->context.id;
+#ifdef CONFIG_UML_USERSPACE
 	if (mm == &init_mm) {
 		ops.mmap = kern_map;
 		ops.unmap = kern_unmap;
@@ -178,6 +179,14 @@ int um_tlb_sync(struct mm_struct *mm)
 		ops.mmap = map;
 		ops.unmap = unmap;
 	}
+#else
+	/*
+	 * init_mm is the only mm there is - user address spaces are what the
+	 * stub process syscalls exist for, and there is no stub process.
+	 */
+	ops.mmap = kern_map;
+	ops.unmap = kern_unmap;
+#endif
 
 	addr = mm->context.sync_tlb_range_from;
 	pgd = pgd_offset(mm, addr);
@@ -205,6 +214,10 @@ int um_tlb_sync(struct mm_struct *mm)
 
 void flush_tlb_all(void)
 {
+	/* No user address spaces to flush, and kernel ones sync immediately. */
+	if (IS_ENABLED(CONFIG_UML_NO_USERSPACE))
+		return;
+
 	/*
 	 * Don't bother flushing if this address space is about to be
 	 * destroyed.

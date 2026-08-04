@@ -43,6 +43,17 @@ void um_trace_signals_off(void)
 		trace_hardirqs_off();
 }
 
+#ifndef CONFIG_UML_USERSPACE
+/*
+ * A signal frame is something userspace returns onto, so there is nothing to
+ * build one on.  get_signal() only ever hands us a handler for a task that
+ * installed one, which requires userspace, so this is unreachable.
+ */
+static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+{
+	signal_setup_done(-EFAULT, ksig, 0);
+}
+#else
 /*
  * OK, we're invoking a handler
  */
@@ -91,6 +102,7 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
 
 	signal_setup_done(err, ksig, singlestep);
 }
+#endif /* CONFIG_UML_USERSPACE */
 
 void do_signal(struct pt_regs *regs)
 {

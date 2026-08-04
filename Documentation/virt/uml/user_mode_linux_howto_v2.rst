@@ -1195,6 +1195,43 @@ E.g. ``os_close_file()`` is just a wrapper around ``close()``
 which ensures that the userspace function close does not clash
 with similarly named function(s) in the kernel part.
 
+Kernel-only builds
+------------------
+
+If all you want out of an instance is its drivers, ``CONFIG_UML_NO_USERSPACE``
+builds a UML that never leaves kernel mode. Everything that exists to host
+guest processes is left out: the stub executable embedded in the image, the
+ptrace/seccomp probing done before the kernel starts, the syscall entry path,
+user memory access and the vDSO.
+
+Such a kernel has no init process. It boots, runs its initcalls, probes its
+devices and then parks PID 1 in ``TASK_IDLE``, staying up on interrupts and
+kernel threads. There is no shell and no way to log in, so anything it does
+has to be driven from in-kernel code - a driver under test, a module you load
+at build time, or a kernel thread you start from an initcall.
+
+Note that this rules out every binfmt handler, so ``CONFIG_BINFMT_ELF`` and
+friends have to be off too. It also makes the userspace-facing subsystems
+(``CONFIG_FUTEX``, ``CONFIG_EPOLL``, ``CONFIG_AIO``, ``CONFIG_IO_URING`` and
+so on) pure dead weight, which is worth turning off as well.
+
+``arch/um/configs/nvme_defconfig`` is a worked example: a kernel-only build
+carrying the NVMe driver and VFIO-based PCI passthrough and very little else.
+Combined with ``CONFIG_UML_PCI_OVER_VFIO`` it lets a real NVMe device be
+driven from a UML kernel with no guest userspace underneath it::
+
+    # on the host, bind the device to vfio-pci first
+    ./vmlinux mem=64M vfio_uml.device=0000:01:00.0
+
+Once the userspace probing is gone, what is left of the boot is dominated by
+the delay loop calibration. Passing a precomputed ``lpj=`` skips it, which is
+worth doing if instances are started often::
+
+    ./vmlinux mem=64M lpj=36696064 vfio_uml.device=0000:01:00.0
+
+Take the value from the ``Calibrating delay loop...`` line of a normal boot on
+the same host.
+
 Using UML as a Test Platform
 ============================
 

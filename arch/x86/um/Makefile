@@ -10,10 +10,13 @@ else
 endif
 
 obj-y = bugs_$(BITS).o delay.o fault.o \
-	ptrace.o ptrace_$(BITS).o ptrace_user.o setjmp_$(BITS).o signal.o \
-	stub_segv.o \
-	sys_call_table_$(BITS).o sysrq_$(BITS).o tls_$(BITS).o \
+	ptrace.o ptrace_$(BITS).o ptrace_user.o setjmp_$(BITS).o \
+	sysrq_$(BITS).o tls_$(BITS).o \
 	subarch.o os-Linux/
+
+# Signal frames, the stub's SEGV handler and the syscall table only matter
+# when there is a userspace process to run.
+obj-$(CONFIG_UML_USERSPACE) += signal.o stub_segv.o sys_call_table_$(BITS).o
 
 ifeq ($(CONFIG_X86_32),y)
 
@@ -26,7 +29,10 @@ subarch-y += ../kernel/sys_ia32.o
 
 else
 
-obj-y += mem_64.o syscalls_64.o vdso/
+obj-y += syscalls_64.o
+
+# mem_64.o is only there to name the vDSO mapping in /proc/*/maps.
+obj-$(CONFIG_UML_USERSPACE) += mem_64.o vdso/
 
 subarch-y = ../lib/csum-partial_64.o ../lib/memcpy_64.o \
 	../lib/memmove_64.o ../lib/memset_64.o

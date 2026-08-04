@@ -37,6 +37,8 @@
 #include <skas.h>
 #include "internal.h"
 
+#ifdef CONFIG_UML_USERSPACE
+
 static void ptrace_child(void)
 {
 	int ret;
@@ -366,6 +368,7 @@ static bool __init init_seccomp(void)
 	return false;
 }
 
+#endif /* CONFIG_UML_USERSPACE */
 
 static void __init check_coredump_limit(void)
 {
@@ -421,6 +424,8 @@ void  __init get_host_cpu_features(
 	}
 }
 
+#ifdef CONFIG_UML_USERSPACE
+
 static int seccomp_config __initdata;
 
 static int __init uml_seccomp_config(char *line, int *add)
@@ -460,9 +465,13 @@ __uml_setup("seccomp=", uml_seccomp_config,
 "    This is insecure and should only be used with a trusted userspace\n\n"
 );
 
+#endif /* CONFIG_UML_USERSPACE */
+
 void __init os_early_checks(void)
 {
+#ifdef CONFIG_UML_USERSPACE
 	int pid;
+#endif
 
 	/* Print out the core dump limits early */
 	check_coredump_limit();
@@ -472,6 +481,14 @@ void __init os_early_checks(void)
 	 */
 	check_tmpexec();
 
+	/*
+	 * Everything below works out how to host userspace processes and what
+	 * a freshly exec'd one's registers look like.  Without userspace
+	 * support it is skipped, which is most of why such a build starts
+	 * faster: it is several forks and a few hundred ptrace round trips
+	 * that nothing would ever use.
+	 */
+#ifdef CONFIG_UML_USERSPACE
 	if (seccomp_config) {
 		if (init_seccomp()) {
 			using_seccomp = 1;
@@ -492,4 +509,5 @@ void __init os_early_checks(void)
 	if (init_pid_registers(pid))
 		fatal("Failed to initialize default registers");
 	stop_ptraced_child(pid, 1);
+#endif /* CONFIG_UML_USERSPACE */
 }
