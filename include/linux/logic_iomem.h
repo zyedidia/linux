@@ -44,6 +44,12 @@ struct logic_iomem_ops {
  *	The return value is negative for errors, or >= 0 for
  *	success. On success, the return value is added to the
  *	offset for later ops, to allow for partial mappings.
+ *	If CONFIG_INDIRECT_IOMEM_FALLBACK is enabled, the callback
+ *	may instead leave *ops NULL and store a directly usable
+ *	pointer in *priv. In that case ioremap() returns *priv plus
+ *	the return value, and all accesses to the mapping go through
+ *	the arch-provided real_* fallback accessors instead of being
+ *	emulated.
  */
 struct logic_iomem_region_ops {
 	long (*map)(unsigned long offset, size_t size,

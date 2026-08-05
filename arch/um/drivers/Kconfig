@@ -184,7 +184,12 @@ config UML_PCI_OVER_VIRTIO_DEVICE_ID
 config UML_PCI_OVER_VFIO
 	bool "Enable VFIO-based PCI passthrough"
 	select UML_PCI
+	select INDIRECT_IOMEM_FALLBACK
 	help
 	  This driver provides support for VFIO-based PCI passthrough.
 	  Currently, only MSI-X capable devices are supported, and it
 	  is assumed that drivers will use MSI-X.
+
+	  BARs that the host allows to be mmap()ed are mapped into the
+	  UML process and accessed with plain loads and stores, so MMIO
+	  does not require a host syscall per access.

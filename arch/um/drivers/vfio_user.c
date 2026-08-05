@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <linux/limits.h>
 #include <linux/vfio.h>
 #include <linux/pci_regs.h>
@@ -174,6 +175,47 @@ out:
 	return err;
 }
 
+static void vfio_map_region(struct uml_vfio_user_device *dev, int index,
+			    const struct vfio_region_info *region)
+{
+	int prot = 0;
+	void *map;
+
+	dev->region[index].map = NULL;
+
+	/* Only BARs are worth mapping. */
+	if (index > VFIO_PCI_BAR5_REGION_INDEX)
+		return;
+
+	if (!(region->flags & VFIO_REGION_INFO_FLAG_MMAP) || !region->size)
+		return;
+
+	if (region->flags & VFIO_REGION_INFO_FLAG_READ)
+		prot |= PROT_READ;
+	if (region->flags & VFIO_REGION_INFO_FLAG_WRITE)
+		prot |= PROT_WRITE;
+
+	map = mmap(NULL, region->size, prot, MAP_SHARED,
+		   dev->device, region->offset);
+	if (map == MAP_FAILED) {
+		printk(UM_KERN_INFO "vfio-uml: cannot mmap BAR%d (error %d), using pread/pwrite\n",
+		       index, errno);
+		return;
+	}
+
+	dev->region[index].map = map;
+}
+
+static void vfio_unmap_regions(struct uml_vfio_user_device *dev)
+{
+	int i;
+
+	for (i = 0; i < dev->num_regions; i++) {
+		if (dev->region[i].map)
+			munmap(dev->region[i].map, dev->region[i].size);
+	}
+}
+
 int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 			       int group, const char *device)
 {
@@ -200,6 +242,7 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 		err = -ENOMEM;
 		goto close_device;
 	}
+	memset(dev->region, 0, sizeof(*dev->region) * dev->num_regions);
 
 	for (i = 0; i < dev->num_regions; i++) {
 		struct vfio_region_info region = {
@@ -208,17 +251,18 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 		};
 		if (ioctl(dev->device, VFIO_DEVICE_GET_REGION_INFO, &region) < 0) {
 			err = -errno;
-			goto free_region;
+			goto unmap_region;
 		}
 		dev->region[i].size = region.size;
 		dev->region[i].offset = region.offset;
+		vfio_map_region(dev, i, &region);
 	}
 
 	/* Only MSI-X is supported currently. */
 	irq_info.index = VFIO_PCI_MSIX_IRQ_INDEX;
 	if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
 		err = -errno;
-		goto free_region;
+		goto unmap_region;
 	}
 
 	dev->irq_count = irq_info.count;
@@ -226,7 +270,7 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 	dev->irqfd = uml_kmalloc(sizeof(int) * dev->irq_count, UM_GFP_KERNEL);
 	if (!dev->irqfd) {
 		err = -ENOMEM;
-		goto free_region;
+		goto unmap_region;
 	}
 
 	memset(dev->irqfd, -1, sizeof(int) * dev->irq_count);
@@ -239,7 +283,8 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 
 free_irqfd:
 	kfree(dev->irqfd);
-free_region:
+unmap_region:
+	vfio_unmap_regions(dev);
 	kfree(dev->region);
 close_device:
 	close(dev->device);
@@ -249,6 +294,7 @@ close_device:
 void uml_vfio_user_teardown_device(struct uml_vfio_user_device *dev)
 {
 	kfree(dev->irqfd);
+	vfio_unmap_regions(dev);
 	kfree(dev->region);
 	close(dev->device);
 }

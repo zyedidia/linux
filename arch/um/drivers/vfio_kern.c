@@ -12,6 +12,7 @@
 #include <linux/list.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include <asm/io.h>
 #include <irq_kern.h>
 #include <init.h>
 #include <os.h>
@@ -340,10 +341,44 @@ static void uml_vfio_cfgspace_write(struct um_pci_device *pdev,
 	__uml_vfio_cfgspace_write(dev, offset, size, val);
 }
 
+/*
+ * Return a pointer into the mmap()ed view of a BAR for the given range,
+ * or NULL if the range must go through pread()/pwrite() on the VFIO fd.
+ * Accesses overlapping the MSI-X table must stay on the slow path, as
+ * they are intercepted and emulated.
+ */
+static void __iomem *uml_vfio_bar_mmio(struct uml_vfio_device *dev, int bar,
+				       unsigned int offset, size_t size)
+{
+	void *map;
+
+	if (bar >= dev->udev.num_regions)
+		return NULL;
+
+	map = dev->udev.region[bar].map;
+	if (!map)
+		return NULL;
+
+	if (offset + size > dev->udev.region[bar].size)
+		return NULL;
+
+	if (bar == dev->msix_bar && offset + size > dev->msix_offset &&
+	    offset < dev->msix_offset + dev->msix_size)
+		return NULL;
+
+	return (void __force __iomem *)(map + offset);
+}
+
 static void uml_vfio_bar_copy_from(struct um_pci_device *pdev, int bar,
 				   void *buffer, unsigned int offset, int size)
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
+	void __iomem *addr = uml_vfio_bar_mmio(dev, bar, offset, size);
+
+	if (addr) {
+		real_memcpy_fromio(buffer, addr, size);
+		return;
+	}
 
 	memset(buffer, 0xff, size);
 	uml_vfio_user_bar_read(&dev->udev, bar, offset, buffer, size);
@@ -352,7 +387,26 @@ static void uml_vfio_bar_copy_from(struct um_pci_device *pdev, int bar,
 static unsigned long uml_vfio_bar_read(struct um_pci_device *pdev, int bar,
 				       unsigned int offset, int size)
 {
+	struct uml_vfio_device *dev = to_vdev(pdev);
+	void __iomem *addr = uml_vfio_bar_mmio(dev, bar, offset, size);
 	u8 data[8];
+
+	if (addr) {
+		switch (size) {
+		case 1:
+			return real_raw_readb(addr);
+		case 2:
+			return le16_to_cpu((__force __le16)real_raw_readw(addr));
+		case 4:
+			return le32_to_cpu((__force __le32)real_raw_readl(addr));
+#ifdef CONFIG_64BIT
+		case 8:
+			return le64_to_cpu((__force __le64)real_raw_readq(addr));
+#endif
+		default:
+			return ULONG_MAX;
+		}
+	}
 
 	uml_vfio_bar_copy_from(pdev, bar, data, offset, size);
 
@@ -377,6 +431,12 @@ static void uml_vfio_bar_copy_to(struct um_pci_device *pdev, int bar,
 				 int size)
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
+	void __iomem *addr = uml_vfio_bar_mmio(dev, bar, offset, size);
+
+	if (addr) {
+		real_memcpy_toio(addr, buffer, size);
+		return;
+	}
 
 	uml_vfio_user_bar_write(&dev->udev, bar, offset, buffer, size);
 }
@@ -386,11 +446,34 @@ static void uml_vfio_bar_write(struct um_pci_device *pdev, int bar,
 			       unsigned long val)
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
+	void __iomem *addr;
 	u8 data[8];
 
 	if (bar == dev->msix_bar && offset + size > dev->msix_offset &&
 	    offset < dev->msix_offset + dev->msix_size)
 		WARN_ON(uml_vfio_update_msix_table(dev, offset, size, val));
+
+	addr = uml_vfio_bar_mmio(dev, bar, offset, size);
+	if (addr) {
+		switch (size) {
+		case 1:
+			real_raw_writeb(val, addr);
+			return;
+		case 2:
+			real_raw_writew((__force u16)cpu_to_le16(val), addr);
+			return;
+		case 4:
+			real_raw_writel((__force u32)cpu_to_le32(val), addr);
+			return;
+#ifdef CONFIG_64BIT
+		case 8:
+			real_raw_writeq((__force u64)cpu_to_le64(val), addr);
+			return;
+#endif
+		default:
+			return;
+		}
+	}
 
 	switch (size) {
 	case 1:
@@ -416,10 +499,24 @@ static void uml_vfio_bar_set(struct um_pci_device *pdev, int bar,
 			     unsigned int offset, u8 value, int size)
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
+	void __iomem *addr = uml_vfio_bar_mmio(dev, bar, offset, size);
 	int i;
+
+	if (addr) {
+		real_memset_io(addr, value, size);
+		return;
+	}
 
 	for (i = 0; i < size; i++)
 		uml_vfio_user_bar_write(&dev->udev, bar, offset + i, &value, 1);
+}
+
+static void __iomem *uml_vfio_bar_map(struct um_pci_device *pdev, int bar,
+				      unsigned int offset, size_t size)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+
+	return uml_vfio_bar_mmio(dev, bar, offset, size);
 }
 
 static const struct um_pci_ops uml_vfio_um_pci_ops = {
@@ -430,6 +527,7 @@ static const struct um_pci_ops uml_vfio_um_pci_ops = {
 	.bar_copy_from	= uml_vfio_bar_copy_from,
 	.bar_copy_to	= uml_vfio_bar_copy_to,
 	.bar_set	= uml_vfio_bar_set,
+	.bar_map	= uml_vfio_bar_map,
 };
 
 static u8 uml_vfio_find_capability(struct uml_vfio_device *dev, u8 cap)
