@@ -306,6 +306,23 @@ static int um_pci_map_iomem_walk(struct pci_dev *pdev, void *_data)
 			continue;
 
 		dev = reg->dev;
+
+		if (IS_ENABLED(CONFIG_INDIRECT_IOMEM_FALLBACK) &&
+		    dev->ops->bar_map) {
+			void __iomem *addr;
+
+			addr = dev->ops->bar_map(dev, i,
+						 data->offset - r->start,
+						 data->size);
+			if (addr) {
+				/* direct mapping, see logic_iomem */
+				*data->ops = NULL;
+				*data->priv = (void __force *)addr;
+				data->ret = 0;
+				return 1;
+			}
+		}
+
 		*data->ops = &um_pci_device_bar_ops;
 		dev->resptr[i] = i;
 		*data->priv = &dev->resptr[i];

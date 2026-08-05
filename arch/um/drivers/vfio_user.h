@@ -8,6 +8,8 @@ struct uml_vfio_user_device {
 	struct {
 		uint64_t size;
 		uint64_t offset;
+		/* host address the region is mmap()ed at, NULL if not */
+		void *map;
 	} *region;
 	int num_regions;
 

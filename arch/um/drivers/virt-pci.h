@@ -30,6 +30,15 @@ struct um_pci_ops {
 			    unsigned int offset, const void *buffer, int size);
 	void (*bar_set)(struct um_pci_device *dev, int bar,
 			unsigned int offset, u8 value, int size);
+
+	/*
+	 * Optional: return a directly usable pointer for the given range
+	 * of the BAR (e.g. into an mmap()ed VFIO region), or NULL if the
+	 * range must be accessed through the emulated ops above. Only
+	 * used with CONFIG_INDIRECT_IOMEM_FALLBACK.
+	 */
+	void __iomem *(*bar_map)(struct um_pci_device *dev, int bar,
+				 unsigned int offset, size_t size);
 };
 
 int um_pci_device_register(struct um_pci_device *dev);

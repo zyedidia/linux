@@ -108,6 +108,7 @@ void __iomem *ioremap(phys_addr_t offset, size_t size)
 		if (mapped_areas[i].ops)
 			continue;
 
+		mapped_areas[i].priv = NULL;
 		offs = rreg->ops->map(offset - found->res->start,
 				      size, &mapped_areas[i].ops,
 				      &mapped_areas[i].priv);
@@ -116,8 +117,19 @@ void __iomem *ioremap(phys_addr_t offset, size_t size)
 			break;
 		}
 
-		if (WARN_ON(!mapped_areas[i].ops)) {
-			mapped_areas[i].ops = NULL;
+		if (!mapped_areas[i].ops) {
+			/*
+			 * The map callback provided a direct mapping in
+			 * *priv; accesses go through the real_* fallbacks
+			 * and no emulation area is consumed.
+			 */
+			if (IS_ENABLED(CONFIG_INDIRECT_IOMEM_FALLBACK) &&
+			    mapped_areas[i].priv)
+				ret = (void __force __iomem *)
+					(mapped_areas[i].priv + offs);
+			else
+				WARN_ON(1);
+			mapped_areas[i].priv = NULL;
 			break;
 		}
 
@@ -138,8 +150,11 @@ get_area(const volatile void __iomem *addr)
 	unsigned long a = (unsigned long)addr;
 	unsigned int idx;
 
-	if (WARN_ON((a & IOREMAP_MASK) != IOREMAP_BIAS))
+	if ((a & IOREMAP_MASK) != IOREMAP_BIAS) {
+		/* direct mappings are handled by the real_* fallbacks */
+		WARN_ON(!IS_ENABLED(CONFIG_INDIRECT_IOMEM_FALLBACK));
 		return NULL;
+	}
 
 	idx = (a & AREA_BITS) >> AREA_SHIFT;
 

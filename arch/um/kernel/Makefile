@@ -28,6 +28,7 @@ obj-$(CONFIG_UML_USERSPACE) += exec.o skas/
 obj-$(CONFIG_UML_NO_USERSPACE) += nouser.o
 
 obj-$(CONFIG_BLK_DEV_INITRD) += initrd.o
+obj-$(CONFIG_INDIRECT_IOMEM_FALLBACK) += iomem.o
 obj-$(CONFIG_GPROF)	+= gprof_syms.o
 obj-$(CONFIG_OF) += dtb.o
 obj-$(CONFIG_EARLY_PRINTK) += early_printk.o
