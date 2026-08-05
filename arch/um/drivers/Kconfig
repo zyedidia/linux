@@ -215,3 +215,14 @@ config UMVIRTIO_BLK
 	  Export a block device that UML can see to the host as a
 	  virtio-blk device. The disk is named by major:minor, since this
 	  configuration normally has neither sysfs nor udev.
+
+config UMVIRTIO_NET
+	bool "virtio-net shim for UMVIRTIO"
+	depends on UMVIRTIO && NET
+	help
+	  Export a network interface that UML can see to the host as a
+	  virtio-net device. The shim acts like a bridge port: the
+	  interface is opened, put in promiscuous mode, and its frames
+	  are relayed verbatim in both directions. The interface is named
+	  by kernel name (eth0, ...), since this configuration normally
+	  has neither sysfs nor udev.

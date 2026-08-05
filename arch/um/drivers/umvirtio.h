@@ -93,6 +93,9 @@ int umv_register_device(const struct umv_device_ops *ops, void *priv);
  */
 void umv_request_complete(struct umv_request *req, u32 written);
 
+/* Queue a request was delivered on (0 .. num_queues - 1). */
+u32 umv_request_queue(const struct umv_request *req);
+
 /* Push a config-space change to the host. */
 int umv_notify_config(struct umv_dev *dev, u32 offset, u32 length);
 

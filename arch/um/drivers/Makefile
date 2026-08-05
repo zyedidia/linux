@@ -48,6 +48,7 @@ obj-$(CONFIG_UML_PCI_OVER_VIRTIO) += virtio_pcidev.o
 obj-$(CONFIG_UML_PCI_OVER_VFIO) += vfio_uml.o
 obj-$(CONFIG_UMVIRTIO) += umvirtio.o
 obj-$(CONFIG_UMVIRTIO_BLK) += umvirtio_blk.o
+obj-$(CONFIG_UMVIRTIO_NET) += umvirtio_net.o
 
 # pcap_user.o must be added explicitly.
 USER_OBJS := fd.o null.o pty.o tty.o xterm.o vector_user.o

@@ -18,6 +18,7 @@
 
 #define pr_fmt(fmt) "umvirtio: " fmt
 
+#include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/interrupt.h>
@@ -27,6 +28,7 @@
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/timer.h>
 #include <linux/virtio_ring.h>
 #include <linux/vringh.h>
 #include <linux/workqueue.h>
@@ -68,6 +70,13 @@ struct umv_queue {
 	int irq;
 
 	struct work_struct work;
+
+	/* Diagnostics, dumped by the umvirtio.stats_secs= timer. Plain
+	 * counters: this is UP and they only inform. */
+	u64 n_kicks;
+	u64 n_works;
+	u64 n_reqs;
+	u64 n_done;
 };
 
 /* Storage for one in-flight request, including its iov arrays. */
@@ -82,6 +91,9 @@ struct umv_request_priv {
 
 static char umv_sock_path[UMV_SOCK_PATH_MAX];
 static struct umv_dev *umv_the_dev;
+
+static unsigned int umv_stats_secs;
+static struct timer_list umv_stats_timer;
 
 /* ------------------------------------------------------------------ */
 /* Queue plumbing                                                      */
@@ -169,14 +181,23 @@ static void umv_queue_work(struct work_struct *work)
 	struct umv_queue *q = container_of(work, struct umv_queue, work);
 	struct umv_dev *dev = q->dev;
 
+	q->n_works++;
+
 	for (;;) {
 		struct umv_request_priv *p;
 		int err;
 
 		p = kzalloc(sizeof(*p), GFP_KERNEL);
 		if (!p) {
-			pr_err("queue %u: out of memory, stalling\n", q->index);
-			return;
+			/*
+			 * Do not return with requests still in the ring: the
+			 * host has already kicked for them, so giving up here
+			 * would strand them until an unrelated kick.
+			 */
+			pr_err_ratelimited("queue %u: out of memory\n",
+					   q->index);
+			msleep(10);
+			continue;
 		}
 
 		vringh_kiov_init(&p->pub.riov, p->riov_store, UMV_MAX_SEGS);
@@ -192,6 +213,7 @@ static void umv_queue_work(struct work_struct *work)
 			return;
 		}
 
+		q->n_reqs++;
 		p->pub.q = q;
 		dev->ops->handle(dev, &p->pub);
 	}
@@ -201,6 +223,7 @@ static irqreturn_t umv_kick_irq(int irq, void *data)
 {
 	struct umv_queue *q = data;
 
+	q->n_kicks++;
 	umv_user_eventfd_ack(q->kick_fd);
 
 	/*
@@ -224,6 +247,7 @@ void umv_request_complete(struct umv_request *req, u32 written)
 	err = vringh_complete_kern(&q->vrh, req->head, written);
 	if (err < 0)
 		pr_err("queue %u: complete failed: %d\n", q->index, err);
+	q->n_done++;
 
 	if (vringh_need_notify_kern(&q->vrh) > 0)
 		umv_user_eventfd_signal(q->call_fd);
@@ -231,6 +255,12 @@ void umv_request_complete(struct umv_request *req, u32 written)
 	kfree(p);
 }
 EXPORT_SYMBOL_GPL(umv_request_complete);
+
+u32 umv_request_queue(const struct umv_request *req)
+{
+	return req->q->index;
+}
+EXPORT_SYMBOL_GPL(umv_request_queue);
 
 /* ------------------------------------------------------------------ */
 /* Handshake                                                           */
@@ -332,6 +362,33 @@ int umv_notify_config(struct umv_dev *dev, u32 offset, u32 length)
 	return umv_user_send(dev->sock_fd, &msg, sizeof(msg));
 }
 EXPORT_SYMBOL_GPL(umv_notify_config);
+
+/* ------------------------------------------------------------------ */
+/* Diagnostics                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One line per queue on the console every stats_secs. `avail` is what the
+ * bridge has published, `seen` is what this side has consumed, `used` is
+ * what it has completed. avail ahead of seen while kicks stand still is a
+ * lost kick; seen ahead of used is requests stuck in the shim.
+ */
+static void umv_stats_fn(struct timer_list *t)
+{
+	struct umv_dev *dev = umv_the_dev;
+	u32 i;
+
+	for (i = 0; i < dev->num_queues; i++) {
+		struct umv_queue *q = &dev->queues[i];
+
+		pr_info("q%u: kicks %llu works %llu reqs %llu done %llu | avail %u seen %u used %u\n",
+			i, q->n_kicks, q->n_works, q->n_reqs, q->n_done,
+			le16_to_cpu(q->vr.avail->idx), q->vrh.last_avail_idx,
+			le16_to_cpu(q->vr.used->idx));
+	}
+
+	mod_timer(&umv_stats_timer, jiffies + umv_stats_secs * HZ);
+}
 
 /* ------------------------------------------------------------------ */
 /* Bring-up                                                            */
@@ -469,6 +526,11 @@ static int umv_bringup(struct umv_dev *dev)
 	for (i = 0; i < dev->num_queues; i++)
 		schedule_work(&dev->queues[i].work);
 
+	if (umv_stats_secs) {
+		timer_setup(&umv_stats_timer, umv_stats_fn, 0);
+		mod_timer(&umv_stats_timer, jiffies + umv_stats_secs * HZ);
+	}
+
 	pr_info("%s: ready, %u queue(s) of %u, %u byte slots\n",
 		dev->ops->name, dev->num_queues, dev->queue_size,
 		dev->slot_size);
@@ -532,4 +594,11 @@ __uml_help(umv_sock_param_ops,
 "    Unix socket the host bridge is listening on. The registered device\n"
 "    shim is exported to the host over this socket; without it the shim\n"
 "    stays idle.\n\n"
+);
+
+module_param_named(stats_secs, umv_stats_secs, uint, 0400);
+__uml_help(umv_stats_secs,
+"umvirtio.stats_secs=<n>\n"
+"    Print per-queue transport counters and ring indices to the console\n"
+"    every <n> seconds. 0 (default) disables.\n\n"
 );
