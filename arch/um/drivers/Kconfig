@@ -188,3 +188,25 @@ config UML_PCI_OVER_VFIO
 	  This driver provides support for VFIO-based PCI passthrough.
 	  Currently, only MSI-X capable devices are supported, and it
 	  is assumed that drivers will use MSI-X.
+
+config UMVIRTIO
+	bool "Export a device to the host over a shared virtqueue"
+	select VHOST_RING
+	help
+	  Generic transport that lets a UML device shim present itself to a
+	  host process as a virtio device. UML owns the shared memory and
+	  acts as the device side of each vring via vringh; the host maps
+	  UML's physmem fd and acts as the driver side.
+
+	  This is the counterpart to a host bridge that re-exports the
+	  device to the host kernel, so hardware UML drives directly (for
+	  example an NVMe passed through with UML_PCI_OVER_VFIO) can be
+	  used as an ordinary host block device.
+
+config UMVIRTIO_BLK
+	bool "virtio-blk shim for UMVIRTIO"
+	depends on UMVIRTIO && BLOCK
+	help
+	  Export a block device that UML can see to the host as a
+	  virtio-blk device. The disk is named by major:minor, since this
+	  configuration normally has neither sysfs nor udev.
