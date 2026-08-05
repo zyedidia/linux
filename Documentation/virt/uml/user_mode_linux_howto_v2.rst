@@ -1232,6 +1232,25 @@ worth doing if instances are started often::
 Take the value from the ``Calibrating delay loop...`` line of a normal boot on
 the same host.
 
+AArch64 hosts
+~~~~~~~~~~~~~
+
+Kernel-only UML also runs on AArch64 hosts (``arch/arm64/um``), including
+SMP.  Building is the same as on x86 - ``make ARCH=um`` on an arm64 machine
+picks the subarch up from ``uname -m`` - but only the kernel-only mode
+exists: ``CONFIG_UML_NO_USERSPACE`` is forced on, since the syscall and
+signal-frame layer needed to host guest processes has not been ported.
+
+Because every kernel mapping is a host ``mmap()`` of one UML page, the UML
+page size has to be at least the host's and a multiple of it.  AArch64 hosts
+run with 4K, 16K or 64K pages, so the matching ``CONFIG_PAGE_SIZE_4KB``,
+``16KB`` and ``64KB`` options are all available; a 64K-page build runs on
+any host, a 4K-page build only on a 4K-page host.  The kernel checks at
+startup and refuses to boot on a host with pages bigger than its own.
+
+Module loading is stubbed out (it would need an AArch64 relocator, and with
+no userspace nothing can call ``init_module()`` anyway).
+
 Using UML as a Test Platform
 ============================
 

@@ -22,10 +22,12 @@
 #include <linux/smp-internal.h>
 
 #include <asm/processor.h>
+#ifdef CONFIG_UML_X86
 #include <asm/cpufeature.h>
+#include <asm/text-patching.h>
+#endif
 #include <asm/sections.h>
 #include <asm/setup.h>
-#include <asm/text-patching.h>
 #include <as-layout.h>
 #include <arch.h>
 #include <init.h>
@@ -33,6 +35,7 @@
 #include <kern_util.h>
 #include <mem_user.h>
 #include <os.h>
+#include <skas.h>
 
 #include "um_arch.h"
 
@@ -59,7 +62,9 @@ static void __init add_arg(char *arg)
 struct cpuinfo_um boot_cpu_data = {
 	.loops_per_jiffy	= 0,
 	.cache_alignment	= L1_CACHE_BYTES,
+#ifdef CONFIG_UML_X86
 	.x86_capability		= { 0 }
+#endif
 };
 
 EXPORT_SYMBOL(boot_cpu_data);
@@ -83,12 +88,14 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 	seq_printf(m, "model name\t: UML\n");
 	seq_printf(m, "mode\t\t: skas\n");
 	seq_printf(m, "host\t\t: %s\n", host_info);
+#ifdef CONFIG_UML_X86
 	seq_printf(m, "fpu\t\t: %s\n", str_yes_no(cpu_has(&boot_cpu_data, X86_FEATURE_FPU)));
 	seq_printf(m, "flags\t\t:");
 	for (i = 0; i < 32*NCAPINTS; i++)
 		if (cpu_has(&boot_cpu_data, i) && (x86_cap_flags[i] != NULL))
 			seq_printf(m, " %s", x86_cap_flags[i]);
 	seq_printf(m, "\n");
+#endif
 	seq_printf(m, "cache_alignment\t: %d\n", boot_cpu_data.cache_alignment);
 	seq_printf(m, "bogomips\t: %lu.%02lu\n",
 		   loops_per_jiffy/(500000/HZ),
@@ -266,11 +273,13 @@ unsigned long brk_start;
 
 static void __init parse_host_cpu_flags(char *line)
 {
+#ifdef CONFIG_UML_X86
 	int i;
 	for (i = 0; i < 32*NCAPINTS; i++) {
 		if ((x86_cap_flags[i] != NULL) && strstr(line, x86_cap_flags[i]))
 			set_cpu_cap(&boot_cpu_data, i);
 	}
+#endif
 }
 
 static void __init parse_cache_line(char *line)
@@ -347,6 +356,17 @@ int __init linux_main(int argc, char **argv, char **envp)
 
 	/* OS sanity checks that need to happen before the kernel runs */
 	os_early_checks();
+
+	/*
+	 * Kernel mappings go through one host mmap per UML page, so the UML
+	 * page cannot be finer-grained than the host's.
+	 */
+	if (PAGE_SIZE % os_getpagesize() != 0) {
+		os_warn("A %lu kB page kernel cannot run on a %d kB page host.\n"
+			"Rebuild with CONFIG_PAGE_SIZE_* of at least the host page size.\n",
+			PAGE_SIZE / 1024, os_getpagesize() / 1024);
+		exit(1);
+	}
 
 	get_host_cpu_features(parse_host_cpu_flags, parse_cache_line);
 
@@ -433,6 +453,8 @@ void __init arch_cpu_finalize_init(void)
 	os_check_bugs();
 }
 
+#ifdef CONFIG_UML_X86
+
 void apply_seal_endbr(s32 *start, s32 *end)
 {
 }
@@ -486,6 +508,8 @@ void *text_poke_copy(void *addr, const void *opcode, size_t len)
 void smp_text_poke_sync_each_cpu(void)
 {
 }
+
+#endif /* CONFIG_UML_X86 */
 
 void uml_pm_wake(void)
 {

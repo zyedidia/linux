@@ -17,8 +17,11 @@ always-$(KBUILD_BUILTIN) := vmlinux.lds
 obj-y = config.o exitcode.o irq.o kthread.o ksyms.o mem.o \
 	physmem.o process.o ptrace.o reboot.o sigio.o \
 	signal.o sysrq.o time.o tlb.o trap.o \
-	um_arch.o umid.o kmsg_dump.o capflags.o
+	um_arch.o umid.o kmsg_dump.o
 obj-y += load_file.o
+
+# The named-CPU-flag table only exists for x86 hosts.
+obj-$(CONFIG_UML_X86) += capflags.o
 
 # Everything under skas/ exists only to host userspace processes.
 obj-$(CONFIG_UML_USERSPACE) += exec.o skas/
@@ -35,7 +38,10 @@ USER_OBJS := config.o
 
 include $(srctree)/arch/um/scripts/Makefile.rules
 
-targets := config.c config.tmp capflags.c
+targets := config.c config.tmp
+ifdef CONFIG_UML_X86
+targets += capflags.c
+endif
 
 # Be careful with the below Sed code - sed is pitfall-rich!
 # We use sed to lower build requirements, for "embedded" builders for instance.

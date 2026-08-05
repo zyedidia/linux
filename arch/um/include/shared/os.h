@@ -182,6 +182,9 @@ int os_poll(unsigned int n, const int *fds);
 void *os_mmap_rw_shared(int fd, size_t size);
 void *os_mremap_rw_shared(void *old_addr, size_t old_size, size_t new_size);
 
+/* util.c */
+extern int os_getpagesize(void);
+
 /* start_up.c */
 extern void os_early_checks(void);
 extern void os_check_bugs(void);

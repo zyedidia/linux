@@ -24,6 +24,11 @@ void stack_protections(unsigned long address)
 		panic("protecting stack failed, errno = %d", errno);
 }
 
+int os_getpagesize(void)
+{
+	return getpagesize();
+}
+
 int raw(int fd)
 {
 	struct termios tt;
