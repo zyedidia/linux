@@ -18,7 +18,9 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#ifdef CONFIG_UML_X86
 #include <asm/ldt.h>
+#endif
 #include <asm/unistd.h>
 #include <init.h>
 #include <os.h>
@@ -32,7 +34,9 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <sysdep/mcontext.h>
+#ifdef CONFIG_UML_USERSPACE
 #include <sysdep/stub.h>
+#endif
 #include <registers.h>
 #include <skas.h>
 #include "internal.h"

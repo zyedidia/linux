@@ -15,7 +15,9 @@ struct task_struct;
 
 #include <linux/prefetch.h>
 
+#ifdef CONFIG_UML_X86
 #include <asm/cpufeatures.h>
+#endif
 
 struct mm_struct;
 
@@ -72,10 +74,12 @@ extern void start_thread(struct pt_regs *regs, unsigned long entry,
 struct cpuinfo_um {
 	unsigned long loops_per_jiffy;
 	int cache_alignment;
+#ifdef CONFIG_UML_X86
 	union {
 		__u32		x86_capability[NCAPINTS + NBUGINTS];
 		unsigned long	x86_capability_alignment;
 	};
+#endif
 };
 
 extern struct cpuinfo_um boot_cpu_data;

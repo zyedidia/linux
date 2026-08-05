@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config UML_ARM64
+	def_bool y
+	select ARCH_SUPPORTS_ATOMIC_RMW
+	select ARCH_USE_QUEUED_RWLOCKS
+	select ARCH_USE_QUEUED_SPINLOCKS
+	select GENERIC_CSUM
+	select HAVE_EFFICIENT_UNALIGNED_ACCESS
+	select HAVE_PAGE_SIZE_16KB
+	select HAVE_PAGE_SIZE_64KB
+	select MODULES_USE_ELF_RELA
+	select UML_SUBARCH_SUPPORTS_SMP
+	# Hosting guest processes needs a subarch syscall/signal-frame layer
+	# that only exists on x86 so far; this port is kernel-only.
+	select UML_NO_USERSPACE
+
+config 64BIT
+	def_bool y
+
+config GENERIC_HWEIGHT
+	def_bool y

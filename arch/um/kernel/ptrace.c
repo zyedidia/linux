@@ -7,7 +7,10 @@
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
+#ifdef CONFIG_UML_X86
+/* PTRACE_SYSEMU and the thread-area requests are x86 ABI extensions. */
 #include <asm/ptrace-abi.h>
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/syscalls.h>
@@ -56,10 +59,12 @@ long arch_ptrace(struct task_struct *child, long request,
 		ret = poke_user(child, addr, data);
 		break;
 
+#ifdef PTRACE_SYSEMU
 	case PTRACE_SYSEMU:
 	case PTRACE_SYSEMU_SINGLESTEP:
 		ret = -EIO;
 		break;
+#endif
 
 #ifdef PTRACE_GETREGS
 	case PTRACE_GETREGS: { /* Get all gp regs from the child. */
@@ -91,6 +96,7 @@ long arch_ptrace(struct task_struct *child, long request,
 		break;
 	}
 #endif
+#ifdef PTRACE_GET_THREAD_AREA
 	case PTRACE_GET_THREAD_AREA:
 		ret = ptrace_get_thread_area(child, addr, vp);
 		break;
@@ -98,6 +104,7 @@ long arch_ptrace(struct task_struct *child, long request,
 	case PTRACE_SET_THREAD_AREA:
 		ret = ptrace_set_thread_area(child, addr, vp);
 		break;
+#endif
 
 	default:
 		ret = ptrace_request(child, request, addr, data);

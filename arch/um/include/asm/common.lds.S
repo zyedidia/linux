@@ -5,17 +5,17 @@
   _etext = .;
   PROVIDE (etext = .);
 
-  . = ALIGN(4096);
+  . = ALIGN(PAGE_SIZE);
   _sdata = .;
   PROVIDE (sdata = .);
 
-  RO_DATA(4096)
+  RO_DATA(PAGE_SIZE)
 
   .unprotected : { *(.unprotected) }
-  . = ALIGN(4096);
+  . = ALIGN(PAGE_SIZE);
   PROVIDE (_unprotected_end = .);
 
-  . = ALIGN(4096);
+  . = ALIGN(PAGE_SIZE);
   EXCEPTION_TABLE(0)
 
   BUG_TABLE
@@ -94,7 +94,7 @@
 	__fini_array_end = .;
   }
 
-   . = ALIGN(4096);
+   . = ALIGN(PAGE_SIZE);
   .init.ramfs : {
 	INIT_RAM_FS
   }

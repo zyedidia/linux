@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Flags for building UML on an AArch64 host.  Included by arch/um/Makefile
+# when HEADER_ARCH=arm64.
+
+# The kernel side never patches itself at runtime, so there is no way to
+# switch to LSE atomics after boot; the ll/sc forms the compiler emits for
+# __atomic builtins are what we run.  Outline atomics would route them
+# through libgcc's runtime-selected helpers instead, which buys nothing
+# here and adds an ifunc-style startup dependency, so keep them inline.
+KBUILD_CFLAGS += -fno-builtin $(call cc-option,-mno-outline-atomics)
+
+START := 0x60000000
+
+CHECKFLAGS	+= -D__aarch64__
+KBUILD_LDFLAGS	+= -m aarch64linux
+
+ELF_ARCH	:= aarch64
+ELF_FORMAT	:= elf64-littleaarch64
+
+LINK-$(CONFIG_LD_SCRIPT_DYN_RPATH) += -Wl,-rpath,/lib64

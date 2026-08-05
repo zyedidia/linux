@@ -17,6 +17,11 @@
 unsigned long exec_regs[MAX_REG_NR];
 unsigned long *exec_fp_regs;
 
+/*
+ * Only the userspace-hosting probe child is ever ptraced, and hosts like
+ * arm64 don't define the legacy PTRACE_GETREGS this uses.
+ */
+#ifdef CONFIG_UML_USERSPACE
 int init_pid_registers(int pid)
 {
 	int err;
@@ -33,6 +38,7 @@ int init_pid_registers(int pid)
 	get_fp_registers(pid, exec_fp_regs);
 	return 0;
 }
+#endif
 
 void get_safe_registers(unsigned long *regs, unsigned long *fp_regs)
 {
