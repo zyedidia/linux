@@ -185,6 +185,8 @@ config UML_PCI_OVER_VFIO
 	bool "Enable VFIO-based PCI passthrough"
 	select UML_PCI
 	select INDIRECT_IOMEM_FALLBACK
+	select ARCH_HAS_DMA_OPS
+	select IOMMU_IOVA
 	help
 	  This driver provides support for VFIO-based PCI passthrough.
 	  Currently, only MSI-X capable devices are supported, and it
@@ -193,3 +195,9 @@ config UML_PCI_OVER_VFIO
 	  BARs that the host allows to be mmap()ed are mapped into the
 	  UML process and accessed with plain loads and stores, so MMIO
 	  does not require a host syscall per access.
+
+	  DMA mappings are established on demand through the host's
+	  VFIO container, so only memory that is actually under DMA
+	  is pinned on the host, rather than all of physmem. Boot
+	  with vfio_uml.eager_dma=1 to instead map and pin all of
+	  physmem up front, as older kernels did.

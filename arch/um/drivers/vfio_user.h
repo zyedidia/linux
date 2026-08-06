@@ -17,8 +17,24 @@ struct uml_vfio_user_device {
 	int irq_count;
 };
 
+struct uml_vfio_iova_range {
+	uint64_t start;		/* first byte of the range */
+	uint64_t end;		/* last byte of the range (inclusive) */
+};
+
+struct uml_vfio_iommu_info {
+	uint64_t pgsizes;	/* bitmap of supported IOMMU page sizes */
+	int nranges;		/* number of valid IOVA ranges */
+	struct uml_vfio_iova_range *ranges;	/* kfree() when done */
+};
+
 int uml_vfio_user_open_container(void);
 int uml_vfio_user_setup_iommu(int container);
+int uml_vfio_user_map_physmem(int container);
+int uml_vfio_user_get_iommu_info(int container, struct uml_vfio_iommu_info *info);
+int uml_vfio_user_dma_map(int container, uint64_t iova, uint64_t vaddr,
+			  uint64_t size);
+int uml_vfio_user_dma_unmap(int container, uint64_t iova, uint64_t size);
 
 int uml_vfio_user_get_group_id(const char *device);
 int uml_vfio_user_open_group(int group_id);

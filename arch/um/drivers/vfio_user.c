@@ -50,6 +50,14 @@ error:
 
 int uml_vfio_user_setup_iommu(int container)
 {
+	if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0)
+		return -errno;
+
+	return 0;
+}
+
+int uml_vfio_user_map_physmem(int container)
+{
 	/*
 	 * This is a bit tricky. See the big comment in
 	 * vhost_user_set_mem_table() in virtio_uml.c.
@@ -63,10 +71,114 @@ int uml_vfio_user_setup_iommu(int container)
 		.size = physmem_size - reserved,
 	};
 
-	if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0)
+	if (ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map) < 0)
 		return -errno;
 
+	return 0;
+}
+
+int uml_vfio_user_get_iommu_info(int container, struct uml_vfio_iommu_info *info)
+{
+	struct vfio_iommu_type1_info *buf;
+	uint32_t argsz = sizeof(*buf);
+	uint32_t off;
+	int r;
+
+	info->pgsizes = 0;
+	info->nranges = 0;
+	info->ranges = NULL;
+
+again:
+	buf = uml_kmalloc(argsz, UM_GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	memset(buf, 0, argsz);
+	buf->argsz = argsz;
+
+	if (ioctl(container, VFIO_IOMMU_GET_INFO, buf) < 0) {
+		r = -errno;
+		goto free;
+	}
+
+	if (buf->argsz > argsz) {
+		argsz = buf->argsz;
+		kfree(buf);
+		goto again;
+	}
+
+	if (buf->flags & VFIO_IOMMU_INFO_PGSIZES)
+		info->pgsizes = buf->iova_pgsizes;
+
+	if (!(buf->flags & VFIO_IOMMU_INFO_CAPS))
+		goto done;
+
+	off = buf->cap_offset;
+	while (off && off <= argsz - sizeof(struct vfio_info_cap_header)) {
+		struct vfio_info_cap_header *hdr = (void *)((uint8_t *)buf + off);
+
+		if (hdr->id == VFIO_IOMMU_TYPE1_INFO_CAP_IOVA_RANGE) {
+			struct vfio_iommu_type1_info_cap_iova_range *cap = (void *)hdr;
+			uint32_t i;
+
+			if (off + sizeof(*cap) > argsz ||
+			    cap->nr_iovas > (argsz - off - sizeof(*cap)) /
+					    sizeof(cap->iova_ranges[0]))
+				break;
+			if (!cap->nr_iovas)
+				break;
+
+			info->ranges = uml_kmalloc(cap->nr_iovas * sizeof(*info->ranges),
+						   UM_GFP_KERNEL);
+			if (!info->ranges) {
+				r = -ENOMEM;
+				goto free;
+			}
+			info->nranges = cap->nr_iovas;
+			for (i = 0; i < cap->nr_iovas; i++) {
+				info->ranges[i].start = cap->iova_ranges[i].start;
+				info->ranges[i].end = cap->iova_ranges[i].end;
+			}
+			break;
+		}
+
+		if (hdr->next <= off)
+			break;
+		off = hdr->next;
+	}
+
+done:
+	r = 0;
+free:
+	kfree(buf);
+	return r;
+}
+
+int uml_vfio_user_dma_map(int container, uint64_t iova, uint64_t vaddr,
+			  uint64_t size)
+{
+	struct vfio_iommu_type1_dma_map dma_map = {
+		.argsz = sizeof(dma_map),
+		.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+		.vaddr = vaddr,
+		.iova = iova,
+		.size = size,
+	};
+
 	if (ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map) < 0)
+		return -errno;
+
+	return 0;
+}
+
+int uml_vfio_user_dma_unmap(int container, uint64_t iova, uint64_t size)
+{
+	struct vfio_iommu_type1_dma_unmap dma_unmap = {
+		.argsz = sizeof(dma_unmap),
+		.iova = iova,
+		.size = size,
+	};
+
+	if (ioctl(container, VFIO_IOMMU_UNMAP_DMA, &dma_unmap) < 0)
 		return -errno;
 
 	return 0;

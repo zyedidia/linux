@@ -4,8 +4,17 @@
 
 #include <linux/pci.h>
 
+struct dma_map_ops;
+
 struct um_pci_device {
 	const struct um_pci_ops *ops;
+
+	/*
+	 * Optional DMA ops the backend wants installed on the PCI
+	 * device (e.g. VFIO on-demand mapping).  NULL keeps the
+	 * default dma-direct path.
+	 */
+	const struct dma_map_ops *dma_ops;
 
 	/* for now just standard BARs */
 	u8 resptr[PCI_STD_NUM_BARS];

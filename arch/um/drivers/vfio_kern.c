@@ -20,6 +20,7 @@
 #include "mconsole_kern.h"
 #include "virt-pci.h"
 #include "vfio_user.h"
+#include "vfio_dma.h"
 
 #define to_vdev(_pdev) container_of(_pdev, struct uml_vfio_device, pdev)
 
@@ -58,6 +59,23 @@ static struct {
 } uml_vfio_container = { .fd = -1 };
 static DEFINE_MUTEX(uml_vfio_container_mtx);
 
+/*
+ * By default, DMA mappings are established on demand via dma_map_ops,
+ * so only memory that is actually under DMA is pinned on the host.
+ * Setting eager_dma restores the old behavior: all of physmem is
+ * mapped (and pinned) up front and devices use dma-direct.
+ */
+static bool uml_vfio_eager_dma;
+module_param_named(eager_dma, uml_vfio_eager_dma, bool, 0444);
+MODULE_PARM_DESC(eager_dma,
+		 "Map (and pin) all of physmem for DMA at startup instead of mapping on demand");
+__uml_help(uml_vfio_eager_dma,
+"vfio_uml.eager_dma=<0|1>\n"
+"    If set to 1, map (and pin) all of UML's physical memory into the\n"
+"    VFIO container at startup, as older kernels did, instead of\n"
+"    mapping DMA memory on demand. Default is 0.\n\n"
+);
+
 static LIST_HEAD(uml_vfio_groups);
 static DEFINE_MUTEX(uml_vfio_groups_mtx);
 
@@ -79,10 +97,21 @@ static int uml_vfio_set_container(int group_fd)
 		return 0;
 
 	err = uml_vfio_user_setup_iommu(uml_vfio_container.fd);
-	if (err) {
-		uml_vfio_user_unset_container(uml_vfio_container.fd, group_fd);
-		uml_vfio_container.users--;
-	}
+	if (err)
+		goto unset;
+
+	if (uml_vfio_eager_dma)
+		err = uml_vfio_user_map_physmem(uml_vfio_container.fd);
+	else
+		err = uml_vfio_dma_init(uml_vfio_container.fd);
+	if (err)
+		goto unset;
+
+	return 0;
+
+unset:
+	uml_vfio_user_unset_container(uml_vfio_container.fd, group_fd);
+	uml_vfio_container.users--;
 	return err;
 }
 
@@ -92,6 +121,8 @@ static void uml_vfio_unset_container(int group_fd)
 
 	uml_vfio_user_unset_container(uml_vfio_container.fd, group_fd);
 	uml_vfio_container.users--;
+	if (!uml_vfio_container.users)
+		uml_vfio_dma_exit();
 }
 
 static int uml_vfio_open_group(int group_id)
@@ -627,6 +658,8 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 	}
 
 	dev->pdev.ops = &uml_vfio_um_pci_ops;
+	if (!uml_vfio_eager_dma)
+		dev->pdev.dma_ops = &uml_vfio_dma_ops;
 
 	err = um_pci_device_register(&dev->pdev);
 	if (err) {
