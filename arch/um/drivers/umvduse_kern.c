@@ -102,6 +102,8 @@ static int umvd_ioctl(int fd, unsigned int cmd, void *arg)
 	return os_ioctl_generic(fd, cmd, (unsigned long)arg);
 }
 
+static void umvd_umem_register(struct umvd_dev *dev, bool quiet);
+
 /* ------------------------------------------------------------------ */
 /* IOVA -> VA table                                                    */
 /* ------------------------------------------------------------------ */
@@ -195,6 +197,13 @@ static void *umvd_iova_to_va(struct umvd_dev *dev, u64 iova, u64 len,
 
 	if (!len || iova + len - 1 < iova)
 		return NULL;
+
+	/*
+	 * A bounce-range IOVA implies the host has streaming DMA mappings,
+	 * which is exactly when a deferred umem registration can succeed.
+	 */
+	if (!dev->umem_live && dev->umem && iova < dev->umem_size)
+		umvd_umem_register(dev, false);
 
 	/* The bounce region is our own memory once umem is registered. */
 	if (dev->umem_live && len <= dev->umem_size &&
@@ -476,32 +485,55 @@ static int umvd_umem_ensure(struct umvd_dev *dev)
 
 /*
  * Register the umem buffer as the backing for the whole bounce domain.
- * The domain is created at `vdpa dev add` and replaced on every
- * del/add cycle, so this runs at each DRIVER_OK: a fresh domain accepts
- * the registration, a surviving one answers -EEXIST.
+ *
+ * Two host-side subtleties shape this:
+ *
+ * - The host initializes its bounce machinery on the first streaming
+ *   DMA map (vduse_domain_init_bounce_map() runs from
+ *   vduse_domain_map_page()), and registration is refused with -EINVAL
+ *   before that. At DRIVER_OK no request buffer has been mapped yet, so
+ *   the eager attempt there fails on a fresh device; the translation
+ *   path retries when the first request arrives, by which time the
+ *   host has mapped its buffers. Registering late is safe: the host
+ *   migrates in-use bounce pages into the new backing.
+ *
+ * - The device-level umem record survives a `vdpa dev del`/`add` cycle
+ *   even though that replaces the IOVA domain it was registered
+ *   against, so -EEXIST may name a registration that backs nothing.
+ *   Deregister and register again rather than trusting it.
  */
-static void umvd_umem_register(struct umvd_dev *dev)
+static void umvd_umem_register(struct umvd_dev *dev, bool quiet)
 {
 	struct vduse_iova_umem umem = {};
 	int err;
 
-	dev->umem_live = false;
-
+	mutex_lock(&dev->iotlb_lock);
+	if (dev->umem_live)
+		goto out;
 	if (umvd_umem_ensure(dev) < 0)
-		return;
+		goto out;
 
 	umem.uaddr = (u64)(uintptr_t)dev->umem;
 	umem.iova = 0;
 	umem.size = dev->umem_size;
 
 	err = umvd_ioctl(dev->dev_fd, VDUSE_IOTLB_REG_UMEM, &umem);
-	if (err < 0 && err != -EEXIST) {
-		pr_warn("umem registration failed: %d\n", err);
-		return;
+	if (err == -EEXIST) {
+		umvd_ioctl(dev->dev_fd, VDUSE_IOTLB_DEREG_UMEM, &umem);
+		err = umvd_ioctl(dev->dev_fd, VDUSE_IOTLB_REG_UMEM, &umem);
+	}
+	if (err < 0) {
+		if (!quiet || err != -EINVAL)
+			pr_warn_ratelimited("umem registration failed: %d\n",
+					    err);
+		goto out;
 	}
 
 	dev->umem_pinned = true;
 	dev->umem_live = true;
+	pr_info("umem registered (%zu MiB)\n", dev->umem_size >> 20);
+out:
+	mutex_unlock(&dev->iotlb_lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -526,12 +558,9 @@ static void umvd_start_dataplane(struct umvd_dev *dev)
 	}
 	dev->negotiated = features;
 
-	umvd_umem_register(dev);
-	if (dev->ops->need_umem && !dev->umem_live) {
-		pr_err("%s needs the umem region; not starting\n",
-		       dev->ops->name);
-		return;
-	}
+	umvd_umem_register(dev, true);
+	if (dev->ops->need_umem && !dev->umem_live)
+		pr_info("umem not registered yet; retrying at first request\n");
 
 	for (i = 0; i < dev->num_queues; i++) {
 		struct umvd_queue *q = &dev->queues[i];
@@ -633,13 +662,16 @@ static void umvd_reset(struct umvd_dev *dev)
 		dev->ops->reset(dev);
 
 	/*
-	 * Drop every cached IOTLB mapping: a vdpa del/add cycle replaces
-	 * the IOVA domain, and mappings cached across it would point at
-	 * the old domain's file. Remaps are lazy and reset is rare. The
-	 * umem region is our own memory and stays.
+	 * Drop every cached IOTLB mapping and mark the umem registration
+	 * stale: a vdpa del/add cycle replaces the IOVA domain, so
+	 * mappings cached across it would point at the old domain's file
+	 * and the old registration would back nothing. Remaps are lazy,
+	 * re-registration happens on the next start, and the umem buffer
+	 * itself is our own memory and stays.
 	 */
 	mutex_lock(&dev->iotlb_lock);
 	umvd_iotlb_drop_range(dev, 0, U64_MAX);
+	dev->umem_live = false;
 	mutex_unlock(&dev->iotlb_lock);
 
 	pr_info("reset\n");
@@ -994,12 +1026,12 @@ static int umvd_bringup(struct umvd_dev *dev)
 
 	/*
 	 * Allocate the umem region up front so a hopeless configuration
-	 * (mem= too small for the bounce size) fails at boot rather than
-	 * at first I/O. Registration itself has to wait for the IOVA
-	 * domain, which exists only once we are attached to the vDPA bus.
+	 * (mem= too small for the bounce size, umem=0 with a shim that
+	 * needs it) fails at boot rather than at first I/O. Registration
+	 * itself has to wait until the host's bounce machinery exists.
 	 */
 	err = umvd_umem_ensure(dev);
-	if (err == -ENOMEM && dev->ops->need_umem) {
+	if (err < 0 && dev->ops->need_umem) {
 		pr_err("%s needs the umem region\n", dev->ops->name);
 		return err;
 	}
