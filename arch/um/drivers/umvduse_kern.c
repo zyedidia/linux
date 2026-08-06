@@ -65,6 +65,7 @@ struct umvd_queue {
 
 	/* Dataplane state, valid while num != 0. */
 	bool live;
+	bool in_work;
 	u32 num;
 	u32 generation;
 	struct vringh vrh;
@@ -76,6 +77,8 @@ struct umvd_queue {
 	/* Serializes ring access: getdesc (work) vs complete (any ctx). */
 	spinlock_t lock;
 	struct timer_list watchdog;
+	bool wdog_stuck;
+	u16 wdog_avail, wdog_seen;
 
 	/* Diagnostics, dumped by the umvduse.stats_secs= timer. */
 	u64 n_kicks, n_works, n_reqs, n_done, n_notify;
@@ -310,6 +313,7 @@ static void umvd_vq_work(struct work_struct *work)
 	struct umvd_dev *dev = q->dev;
 
 	q->n_works++;
+	WRITE_ONCE(q->in_work, true);
 
 	while (READ_ONCE(q->live)) {
 		struct umvd_request_priv *p;
@@ -346,7 +350,7 @@ static void umvd_vq_work(struct work_struct *work)
 			if (err < 0)
 				pr_err("q%u: getdesc failed: %d\n", q->index,
 				       err);
-			return;
+			break;
 		}
 		p->generation = q->generation;
 		spin_unlock_irq(&q->lock);
@@ -366,6 +370,8 @@ static void umvd_vq_work(struct work_struct *work)
 		q->n_reqs++;
 		dev->ops->handle(dev, &p->pub);
 	}
+
+	WRITE_ONCE(q->in_work, false);
 }
 
 static irqreturn_t umvd_kick_irq(int irq, void *data)
@@ -385,20 +391,38 @@ static irqreturn_t umvd_kick_irq(int irq, void *data)
 /*
  * Backstop for the one lossy edge left in the system (host kick eventfd
  * -> UML IRQ): if avail has moved past what we have seen and no work is
- * queued, something dropped the kick. Re-kick and count it.
+ * queued, a kick may have been dropped. A single observation can also
+ * be an instruction-wide benign race (the workqueue clears PENDING just
+ * before the work function sets in_work), so only a state still stuck a
+ * full period later is counted and rescued -- that keeps n_watchdog a
+ * certain lost-kick verdict at the cost of a 2 s worst-case rescue on a
+ * path that must never fire at all.
  */
 static void umvd_watchdog_fn(struct timer_list *t)
 {
 	struct umvd_queue *q = timer_container_of(q, t, watchdog);
-	u16 avail;
+	u16 avail, seen;
 
 	if (!READ_ONCE(q->live))
 		return;
 
 	avail = le16_to_cpu((__force __le16)READ_ONCE(q->vrh.vring.avail->idx));
-	if (avail != q->vrh.last_avail_idx && !work_pending(&q->work)) {
-		q->n_watchdog++;
-		schedule_work(&q->work);
+	seen = q->vrh.last_avail_idx;
+
+	if (avail != seen && !work_pending(&q->work) &&
+	    !READ_ONCE(q->in_work)) {
+		if (q->wdog_stuck && avail == q->wdog_avail &&
+		    seen == q->wdog_seen) {
+			q->n_watchdog++;
+			q->wdog_stuck = false;
+			schedule_work(&q->work);
+		} else {
+			q->wdog_stuck = true;
+			q->wdog_avail = avail;
+			q->wdog_seen = seen;
+		}
+	} else {
+		q->wdog_stuck = false;
 	}
 
 	mod_timer(&q->watchdog, jiffies + HZ);
@@ -646,6 +670,7 @@ static void umvd_start_dataplane(struct umvd_dev *dev)
 		WRITE_ONCE(q->live, true);
 		/* Drain anything posted before we went live. */
 		schedule_work(&q->work);
+		q->wdog_stuck = false;
 		mod_timer(&q->watchdog, jiffies + HZ);
 	}
 
@@ -657,38 +682,39 @@ static void umvd_reset(struct umvd_dev *dev)
 {
 	u32 i;
 
-	if (!dev->started)
-		return;
-	dev->started = false;
+	if (dev->started) {
+		dev->started = false;
 
-	for (i = 0; i < dev->num_queues; i++)
-		WRITE_ONCE(dev->queues[i].live, false);
+		for (i = 0; i < dev->num_queues; i++)
+			WRITE_ONCE(dev->queues[i].live, false);
 
-	for (i = 0; i < dev->num_queues; i++) {
-		struct umvd_queue *q = &dev->queues[i];
+		for (i = 0; i < dev->num_queues; i++) {
+			struct umvd_queue *q = &dev->queues[i];
 
-		timer_delete_sync(&q->watchdog);
-		cancel_work_sync(&q->work);
+			timer_delete_sync(&q->watchdog);
+			cancel_work_sync(&q->work);
 
-		if (!q->num)
-			continue;
-		spin_lock_irq(&q->lock);
-		q->saved_avail = q->vrh.last_avail_idx;
-		q->generation++;
-		q->num = 0;
-		spin_unlock_irq(&q->lock);
+			if (!q->num)
+				continue;
+			spin_lock_irq(&q->lock);
+			q->saved_avail = q->vrh.last_avail_idx;
+			q->generation++;
+			q->num = 0;
+			spin_unlock_irq(&q->lock);
+		}
+
+		if (dev->ops->reset)
+			dev->ops->reset(dev);
 	}
-
-	if (dev->ops->reset)
-		dev->ops->reset(dev);
 
 	/*
 	 * Drop every cached IOTLB mapping and mark the umem registration
-	 * stale: a vdpa del/add cycle replaces the IOVA domain, so
-	 * mappings cached across it would point at the old domain's file
-	 * and the old registration would back nothing. Remaps are lazy,
-	 * re-registration happens on the next start, and the umem buffer
-	 * itself is our own memory and stays.
+	 * stale, even if the dataplane never started (a half-failed start
+	 * can leave mappings behind): a vdpa del/add cycle replaces the
+	 * IOVA domain, so anything cached across it would point at the
+	 * old domain's file and the old registration would back nothing.
+	 * Remaps are lazy, re-registration happens on the next start, and
+	 * the umem buffer itself is our own memory and stays.
 	 */
 	mutex_lock(&dev->iotlb_lock);
 	umvd_iotlb_drop_range(dev, 0, U64_MAX);
