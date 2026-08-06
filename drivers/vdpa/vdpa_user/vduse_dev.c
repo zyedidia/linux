@@ -2064,9 +2064,16 @@ static bool features_is_valid(struct vduse_dev_config *config)
 	if ((config->device_id == VIRTIO_ID_BLOCK) &&
 			(config->features & BIT_ULL(VIRTIO_BLK_F_CONFIG_WCE)))
 		return false;
-	else if ((config->device_id == VIRTIO_ID_NET) &&
-			(config->features & BIT_ULL(VIRTIO_NET_F_CTRL_VQ)))
-		return false;
+
+	/*
+	 * Local divergence from mainline: VIRTIO_NET_F_CTRL_VQ is allowed.
+	 * The control virtqueue is relayed to userspace like any other
+	 * queue, so the host driver's synchronous control commands now
+	 * depend on the daemon answering. Mainline rejects that because a
+	 * dead daemon would leave virtnet_send_command_reply() spinning
+	 * forever; this tree bounds that wait instead (see the timeout in
+	 * drivers/net/virtio_net.c).
+	 */
 
 	if ((config->device_id == VIRTIO_ID_NET) &&
 			!(config->features & BIT_ULL(VIRTIO_F_VERSION_1)))

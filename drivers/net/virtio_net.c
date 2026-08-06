@@ -3543,6 +3543,7 @@ static bool virtnet_send_command_reply(struct virtnet_info *vi, u8 class, u8 cmd
 {
 	struct scatterlist *sgs[5], hdr, stat;
 	u32 out_num = 0, tmp, in_num = 0;
+	unsigned long timeout;
 	bool ok;
 	int ret;
 
@@ -3581,9 +3582,20 @@ static bool virtnet_send_command_reply(struct virtnet_info *vi, u8 class, u8 cmd
 
 	/* Spin for a response, the kick causes an ioport write, trapping
 	 * into the hypervisor, so the request should be handled immediately.
+	 * With a userspace backend (VDUSE) "immediately" is a promise nobody
+	 * can keep, so bound the wait. A late reply after the timeout would
+	 * be mistaken for the ack of the next command, so the queue is
+	 * taken down with the failure; recovery requires a device reset.
 	 */
+	timeout = jiffies + 10 * HZ;
 	while (!virtqueue_get_buf(vi->cvq, &tmp) &&
 	       !virtqueue_is_broken(vi->cvq)) {
+		if (time_after(jiffies, timeout)) {
+			dev_warn(&vi->vdev->dev,
+				 "control command timed out, breaking cvq\n");
+			__virtqueue_break(vi->cvq);
+			break;
+		}
 		cond_resched();
 		cpu_relax();
 	}
