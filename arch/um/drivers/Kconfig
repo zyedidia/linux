@@ -201,3 +201,29 @@ config UML_PCI_OVER_VFIO
 	  is pinned on the host, rather than all of physmem. Boot
 	  with vfio_uml.eager_dma=1 to instead map and pin all of
 	  physmem up front, as older kernels did.
+
+config UMVDUSE
+	bool "Export a UML-driven device to the host over VDUSE"
+	select VHOST_RING
+	help
+	  Let this UML instance act as the userspace backend for a VDUSE
+	  device (vDPA Device in Userspace): it creates /dev/vduse/$NAME
+	  on the host, services its virtqueues from inside the UML
+	  kernel, and forwards requests to a registered device shim.
+	  Once the device is attached to the host's vDPA bus (vdpa dev
+	  add name $NAME mgmtdev vduse) and bound by virtio_vdpa, the
+	  host sees an ordinary virtio device backed by whatever the
+	  shim fronts -- typically real hardware driven by this UML via
+	  CONFIG_UML_PCI_OVER_VFIO.
+
+	  The host kernel needs the vduse and virtio_vdpa modules;
+	  nothing else runs on the data path.
+
+config UMVDUSE_BLK
+	bool "umvduse virtio-blk export"
+	depends on UMVDUSE && BLOCK
+	help
+	  Export a block device visible inside this UML instance (such
+	  as an NVMe namespace passed through with VFIO) to the host as
+	  a virtio-blk device. The disk is selected with
+	  umvduse_blk.disk=<major>:<minor>.
