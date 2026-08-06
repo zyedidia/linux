@@ -201,8 +201,11 @@ static void *umvd_iova_to_va(struct umvd_dev *dev, u64 iova, u64 len,
 	/*
 	 * A bounce-range IOVA implies the host has streaming DMA mappings,
 	 * which is exactly when a deferred umem registration can succeed.
+	 * A persistently failing registration (rlimit, size mismatch) is
+	 * retried at most once a second rather than per buffer.
 	 */
-	if (!dev->umem_live && dev->umem && iova < dev->umem_size)
+	if (!dev->umem_live && dev->umem && iova < dev->umem_size &&
+	    time_after_eq(jiffies, READ_ONCE(dev->umem_retry_at)))
 		umvd_umem_register(dev, false);
 
 	/* The bounce region is our own memory once umem is registered. */
@@ -526,6 +529,8 @@ static void umvd_umem_register(struct umvd_dev *dev, bool quiet)
 		if (!quiet || err != -EINVAL)
 			pr_warn_ratelimited("umem registration failed: %d\n",
 					    err);
+		if (!quiet)
+			WRITE_ONCE(dev->umem_retry_at, jiffies + HZ);
 		goto out;
 	}
 
@@ -565,6 +570,7 @@ static void umvd_start_dataplane(struct umvd_dev *dev)
 	for (i = 0; i < dev->num_queues; i++) {
 		struct umvd_queue *q = &dev->queues[i];
 		struct vduse_vq_info info = { .index = i };
+		struct vduse_vq_eventfd vq_efd = { .index = i };
 		bool event = features & BIT_ULL(VIRTIO_RING_F_EVENT_IDX);
 		void *desc, *avail, *used;
 
@@ -575,6 +581,21 @@ static void umvd_start_dataplane(struct umvd_dev *dev)
 		}
 		if (!info.ready || !info.num)
 			continue;
+
+		/*
+		 * The host drops kick eventfd registrations on every
+		 * device reset (vduse_dev_reset()), and the driver
+		 * resets the device on its way to DRIVER_OK, so this is
+		 * the only registration point that sticks. A kick that
+		 * arrived before we got here is replayed by the host on
+		 * registration (the vq->kicked flag).
+		 */
+		vq_efd.fd = q->kick_fd;
+		err = umvd_ioctl(dev->dev_fd, VDUSE_VQ_SETUP_KICKFD, &vq_efd);
+		if (err < 0) {
+			pr_err("q%u: kickfd setup failed: %d\n", i, err);
+			return;
+		}
 
 		desc = umvd_iova_to_va(dev, info.desc_addr,
 				       (u64)info.num * sizeof(struct vring_desc),
@@ -672,6 +693,7 @@ static void umvd_reset(struct umvd_dev *dev)
 	mutex_lock(&dev->iotlb_lock);
 	umvd_iotlb_drop_range(dev, 0, U64_MAX);
 	dev->umem_live = false;
+	WRITE_ONCE(dev->umem_retry_at, 0);
 	mutex_unlock(&dev->iotlb_lock);
 
 	pr_info("reset\n");
@@ -1010,6 +1032,18 @@ static int umvd_bringup(struct umvd_dev *dev)
 		strscpy(umvd_name, dev->ops->name, sizeof(umvd_name));
 	strscpy(dev->name, umvd_name, sizeof(dev->name));
 
+	/*
+	 * REG_UMEM checks the whole bounce-region pin against
+	 * RLIMIT_MEMLOCK and, unlike VFIO, grants no CAP_IPC_LOCK
+	 * exemption -- the inherited default (~8 MiB) is far below any
+	 * bounce size. We run with CAP_SYS_RESOURCE; lift the limit
+	 * rather than make every launcher remember to.
+	 */
+	err = umvd_user_raise_memlock();
+	if (err < 0)
+		pr_warn("cannot raise RLIMIT_MEMLOCK: %d; umem registration may fail\n",
+			err);
+
 	err = umvd_create_device(dev);
 	if (err < 0)
 		return err;
@@ -1047,7 +1081,6 @@ static int umvd_bringup(struct umvd_dev *dev)
 			.index = i,
 			.max_size = dev->queue_max[i],
 		};
-		struct vduse_vq_eventfd vq_efd;
 
 		q->dev = dev;
 		q->index = i;
@@ -1064,17 +1097,12 @@ static int umvd_bringup(struct umvd_dev *dev)
 			return err;
 		}
 
+		/* Registered with the host at DRIVER_OK, not here: reset
+		 * wipes kickfd registrations and the driver always resets
+		 * before it gets there. */
 		q->kick_fd = os_eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 		if (q->kick_fd < 0)
 			return q->kick_fd;
-
-		vq_efd.index = i;
-		vq_efd.fd = q->kick_fd;
-		err = umvd_ioctl(dev->dev_fd, VDUSE_VQ_SETUP_KICKFD, &vq_efd);
-		if (err < 0) {
-			pr_err("q%u: kickfd setup failed: %d\n", i, err);
-			return err;
-		}
 
 		q->irq = um_request_irq(UM_IRQ_ALLOC, q->kick_fd, IRQ_READ,
 					umvd_kick_irq, 0, "umvduse", q);

@@ -120,6 +120,7 @@ struct umvd_dev {
 	size_t umem_size;
 	bool umem_live;
 	bool umem_pinned;
+	unsigned long umem_retry_at;
 };
 
 /*

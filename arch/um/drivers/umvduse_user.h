@@ -11,5 +11,6 @@
 void *umvd_user_mmap(int fd, unsigned long long offset, unsigned long len,
 		     int writable);
 int umvd_user_munmap(void *addr, unsigned long len);
+int umvd_user_raise_memlock(void);
 
 #endif /* __UMVDUSE_USER_H__ */

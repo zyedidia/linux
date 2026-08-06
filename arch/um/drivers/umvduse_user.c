@@ -11,8 +11,22 @@
 
 #include <errno.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 #include "umvduse_user.h"
+
+int umvd_user_raise_memlock(void)
+{
+	struct rlimit lim = {
+		.rlim_cur = RLIM_INFINITY,
+		.rlim_max = RLIM_INFINITY,
+	};
+
+	if (setrlimit(RLIMIT_MEMLOCK, &lim) < 0)
+		return -errno;
+
+	return 0;
+}
 
 void *umvd_user_mmap(int fd, unsigned long long offset, unsigned long len,
 		     int writable)
