@@ -260,7 +260,14 @@ int uml_vfio_user_unset_container(int container, int group)
 	return 0;
 }
 
-static int vfio_set_irqs(int device, int start, int count, int *irqfd)
+static int uml_vfio_user_irq_index(struct uml_vfio_user_device *dev)
+{
+	return dev->irq_type == UML_VFIO_IRQ_MSI ?
+		VFIO_PCI_MSI_IRQ_INDEX : VFIO_PCI_MSIX_IRQ_INDEX;
+}
+
+static int vfio_set_irqs(int device, int index, int start, int count,
+			 int *irqfd)
 {
 	struct vfio_irq_set *irq_set;
 	int argsz = sizeof(*irq_set) + sizeof(*irqfd) * count;
@@ -272,7 +279,7 @@ static int vfio_set_irqs(int device, int start, int count, int *irqfd)
 
 	irq_set->argsz = argsz;
 	irq_set->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
-	irq_set->index = VFIO_PCI_MSIX_IRQ_INDEX;
+	irq_set->index = index;
 	irq_set->start = start;
 	irq_set->count = count;
 	memcpy(irq_set->data, irqfd, sizeof(*irqfd) * count);
@@ -370,14 +377,38 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 		vfio_map_region(dev, i, &region);
 	}
 
-	/* Only MSI-X is supported currently. */
+	/* Prefer MSI-X; fall back to plain MSI for devices without it. */
 	irq_info.index = VFIO_PCI_MSIX_IRQ_INDEX;
 	if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
 		err = -errno;
 		goto unmap_region;
 	}
+	dev->irq_type = UML_VFIO_IRQ_MSIX;
+
+	if (!irq_info.count) {
+		irq_info.index = VFIO_PCI_MSI_IRQ_INDEX;
+		if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
+			err = -errno;
+			goto unmap_region;
+		}
+		dev->irq_type = UML_VFIO_IRQ_MSI;
+	}
+
+	if (!irq_info.count) {
+		err = -EOPNOTSUPP;
+		goto unmap_region;
+	}
 
 	dev->irq_count = irq_info.count;
+
+	/*
+	 * Plain MSI is supported single-vector only; don't ask the host
+	 * to allocate vectors we will never wire up. Guests cannot
+	 * request more anyway: the UM PCI MSI domain does not advertise
+	 * MSI_FLAG_MULTI_PCI_MSI.
+	 */
+	if (dev->irq_type == UML_VFIO_IRQ_MSI)
+		dev->irq_count = 1;
 
 	dev->irqfd = uml_kmalloc(sizeof(int) * dev->irq_count, UM_GFP_KERNEL);
 	if (!dev->irqfd) {
@@ -387,7 +418,8 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 
 	memset(dev->irqfd, -1, sizeof(int) * dev->irq_count);
 
-	err = vfio_set_irqs(dev->device, 0, dev->irq_count, dev->irqfd);
+	err = vfio_set_irqs(dev->device, uml_vfio_user_irq_index(dev), 0,
+			    dev->irq_count, dev->irqfd);
 	if (err)
 		goto free_irqfd;
 
@@ -431,7 +463,8 @@ void uml_vfio_user_deactivate_irq(struct uml_vfio_user_device *dev, int index)
 
 int uml_vfio_user_update_irqs(struct uml_vfio_user_device *dev)
 {
-	return vfio_set_irqs(dev->device, 0, dev->irq_count, dev->irqfd);
+	return vfio_set_irqs(dev->device, uml_vfio_user_irq_index(dev), 0,
+			     dev->irq_count, dev->irqfd);
 }
 
 static int vfio_region_read(struct uml_vfio_user_device *dev, unsigned int index,

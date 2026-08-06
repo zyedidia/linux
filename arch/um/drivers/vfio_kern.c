@@ -37,11 +37,23 @@ struct uml_vfio_device {
 	struct uml_vfio_user_device udev;
 	struct uml_vfio_intr_ctx *intr_ctx;
 
+	/* Exactly one of msix_cap/msi_cap is nonzero, matching
+	 * udev.irq_type; the unused mode's intercepts stay dead.
+	 */
 	int msix_cap;
 	int msix_bar;
 	int msix_offset;
 	int msix_size;
-	u32 *msix_data;
+
+	int msi_cap;
+	int msi_cap_size;
+	int msi_data_off;
+
+	/* Guest-programmed message data per vector, i.e. the UML IRQ
+	 * number (see um_pci_compose_msi_msg()). Snooped from the MSI-X
+	 * table or the MSI capability, depending on the mode.
+	 */
+	u32 *vec_data;
 
 	struct list_head list;
 };
@@ -195,7 +207,7 @@ static irqreturn_t uml_vfio_interrupt(int unused, void *opaque)
 	struct uml_vfio_device *dev = ctx->dev;
 	int index = ctx - dev->intr_ctx;
 	int irqfd = dev->udev.irqfd[index];
-	int irq = dev->msix_data[index];
+	int irq = dev->vec_data[index];
 	uint64_t v;
 	int r;
 
@@ -293,10 +305,39 @@ static int uml_vfio_update_msix_table(struct uml_vfio_device *dev,
 	if (index >= dev->udev.irq_count)
 		return -EINVAL;
 
-	dev->msix_data[index] = val;
+	dev->vec_data[index] = val;
 
 	return val ? uml_vfio_activate_irq(dev, index) :
 		uml_vfio_deactivate_irq(dev, index);
+}
+
+static int uml_vfio_update_msi_cap(struct uml_vfio_device *dev,
+				   unsigned int offset, int size,
+				   unsigned long val)
+{
+	int err;
+
+	/*
+	 * Here, we handle only the operations we care about,
+	 * ignoring the rest.
+	 */
+	if (size == 2 && offset == dev->msi_data_off) {
+		dev->vec_data[0] = val;
+		return 0;
+	}
+
+	if (size == 2 && offset == dev->msi_cap + PCI_MSI_FLAGS) {
+		if (val & PCI_MSI_FLAGS_ENABLE) {
+			err = uml_vfio_activate_irq(dev, 0);
+			if (err)
+				return err;
+		} else {
+			uml_vfio_deactivate_irq(dev, 0);
+		}
+		return uml_vfio_user_update_irqs(&dev->udev);
+	}
+
+	return 0;
 }
 
 static unsigned long __uml_vfio_cfgspace_read(struct uml_vfio_device *dev,
@@ -365,9 +406,15 @@ static void uml_vfio_cfgspace_write(struct um_pci_device *pdev,
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
 
-	if (offset < dev->msix_cap + PCI_CAP_MSIX_SIZEOF &&
+	if (dev->msix_cap &&
+	    offset < dev->msix_cap + PCI_CAP_MSIX_SIZEOF &&
 	    offset + size > dev->msix_cap)
 		WARN_ON(uml_vfio_update_msix_cap(dev, offset, size, val));
+
+	if (dev->msi_cap &&
+	    offset < dev->msi_cap + dev->msi_cap_size &&
+	    offset + size > dev->msi_cap)
+		WARN_ON(uml_vfio_update_msi_cap(dev, offset, size, val));
 
 	__uml_vfio_cfgspace_write(dev, offset, size, val);
 }
@@ -603,11 +650,53 @@ static int uml_vfio_read_msix_table(struct uml_vfio_device *dev)
 	dev->msix_offset = tbl & PCI_MSIX_TABLE_OFFSET;
 	dev->msix_size = ((flags & PCI_MSIX_FLAGS_QSIZE) + 1) * PCI_MSIX_ENTRY_SIZE;
 
-	dev->msix_data = kzalloc(dev->msix_size, GFP_KERNEL);
-	if (!dev->msix_data)
+	dev->vec_data = kzalloc(dev->msix_size, GFP_KERNEL);
+	if (!dev->vec_data)
 		return -ENOMEM;
 
 	return 0;
+}
+
+static int uml_vfio_read_msi_cap(struct uml_vfio_device *dev)
+{
+	unsigned int off;
+	u16 flags;
+
+	off = uml_vfio_find_capability(dev, PCI_CAP_ID_MSI);
+	if (!off)
+		return -ENOTSUPP;
+
+	dev->msi_cap = off;
+
+	/*
+	 * The location of the data register and the size of the capability
+	 * depend on the 64-bit and per-vector-masking bits; the mask and
+	 * pending registers are one dword each.
+	 */
+	flags = __uml_vfio_cfgspace_read(dev, off + PCI_MSI_FLAGS, sizeof(flags));
+	if (flags & PCI_MSI_FLAGS_64BIT) {
+		dev->msi_data_off = off + PCI_MSI_DATA_64;
+		dev->msi_cap_size = (flags & PCI_MSI_FLAGS_MASKBIT) ?
+			PCI_MSI_MASK_64 + 8 : PCI_MSI_DATA_64 + 2;
+	} else {
+		dev->msi_data_off = off + PCI_MSI_DATA_32;
+		dev->msi_cap_size = (flags & PCI_MSI_FLAGS_MASKBIT) ?
+			PCI_MSI_MASK_32 + 8 : PCI_MSI_DATA_32 + 2;
+	}
+
+	dev->vec_data = kcalloc(dev->udev.irq_count, sizeof(*dev->vec_data),
+				GFP_KERNEL);
+	if (!dev->vec_data)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int uml_vfio_read_irq_cap(struct uml_vfio_device *dev)
+{
+	if (dev->udev.irq_type == UML_VFIO_IRQ_MSI)
+		return uml_vfio_read_msi_cap(dev);
+	return uml_vfio_read_msix_table(dev);
 }
 
 static void uml_vfio_open_device(struct uml_vfio_device *dev)
@@ -636,9 +725,9 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 		goto release_group;
 	}
 
-	err = uml_vfio_read_msix_table(dev);
+	err = uml_vfio_read_irq_cap(dev);
 	if (err) {
-		pr_err("Failed to read MSI-X table (%s), error %d\n",
+		pr_err("Failed to read MSI(-X) capability (%s), error %d\n",
 		       dev->name, err);
 		goto teardown_udev;
 	}
@@ -648,7 +737,7 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 	if (!dev->intr_ctx) {
 		pr_err("Failed to allocate interrupt context (%s)\n",
 		       dev->name);
-		goto free_msix;
+		goto free_vec_data;
 	}
 
 	for (i = 0; i < dev->udev.irq_count; i++) {
@@ -672,8 +761,8 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 
 free_intr_ctx:
 	kfree(dev->intr_ctx);
-free_msix:
-	kfree(dev->msix_data);
+free_vec_data:
+	kfree(dev->vec_data);
 teardown_udev:
 	uml_vfio_user_teardown_device(&dev->udev);
 release_group:
@@ -694,7 +783,7 @@ static void uml_vfio_release_device(struct uml_vfio_device *dev)
 
 	um_pci_device_unregister(&dev->pdev);
 	kfree(dev->intr_ctx);
-	kfree(dev->msix_data);
+	kfree(dev->vec_data);
 	uml_vfio_user_teardown_device(&dev->udev);
 	uml_vfio_release_group(dev->group);
 	list_del(&dev->list);
@@ -767,9 +856,10 @@ static const struct kernel_param_ops uml_vfio_cmdline_param_ops = {
 device_param_cb(device, &uml_vfio_cmdline_param_ops, NULL, 0400);
 __uml_help(uml_vfio_cmdline_param_ops,
 "vfio_uml.device=<domain:bus:slot.function>\n"
-"    Pass through a PCI device to UML via VFIO. Currently, only MSI-X\n"
-"    capable devices are supported, and it is assumed that drivers will\n"
-"    use MSI-X. This parameter can be specified multiple times to pass\n"
+"    Pass through a PCI device to UML via VFIO. MSI-X capable devices\n"
+"    are supported, as well as single-vector plain MSI; devices that\n"
+"    expose both capabilities are driven in MSI-X mode. INTx is not\n"
+"    supported. This parameter can be specified multiple times to pass\n"
 "    through multiple PCI devices to UML.\n\n"
 );
 

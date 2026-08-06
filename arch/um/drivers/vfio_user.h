@@ -2,6 +2,14 @@
 #ifndef __UM_VFIO_USER_H
 #define __UM_VFIO_USER_H
 
+/* Interrupt mode of the device, chosen at setup time. MSI-X is
+ * preferred; plain MSI is the fallback for devices without it.
+ */
+enum uml_vfio_irq_type {
+	UML_VFIO_IRQ_MSIX,
+	UML_VFIO_IRQ_MSI,
+};
+
 struct uml_vfio_user_device {
 	int device;
 
@@ -13,6 +21,7 @@ struct uml_vfio_user_device {
 	} *region;
 	int num_regions;
 
+	enum uml_vfio_irq_type irq_type;
 	int32_t *irqfd;
 	int irq_count;
 };
