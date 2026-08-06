@@ -40,6 +40,7 @@ extern void uml_pm_wake(void);
 extern int start_uml(void);
 
 extern void uml_cleanup(void);
+extern int uml_cleanup_safe(void);
 extern void do_uml_exitcalls(void);
 
 /*

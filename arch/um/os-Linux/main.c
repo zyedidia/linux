@@ -40,7 +40,14 @@ static void __init set_stklim(void)
 
 static void last_ditch_exit(int sig)
 {
-	uml_cleanup();
+	/*
+	 * Cleanup for a fatal signal is best effort by definition, and
+	 * cannot run at all from a context that must not sleep (see
+	 * uml_cleanup_safe()); the second signal falls through to the
+	 * default action either way, courtesy of SA_RESETHAND.
+	 */
+	if (uml_cleanup_safe())
+		uml_cleanup();
 	exit(1);
 }
 

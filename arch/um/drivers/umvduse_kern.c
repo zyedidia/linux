@@ -260,6 +260,17 @@ static int umvd_translate_kiov(struct umvd_dev *dev, struct vringh_kiov *kiov,
 /* Request path                                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Queue the drain work on the unbound workqueue: every host fd IRQ
+ * lands on CPU0, and schedule_work() would pin the work to CPU0's pool
+ * with it. Unbound, an SMP instance drains on an idle CPU while CPU0
+ * keeps taking interrupts.
+ */
+static void umvd_queue_vq_work(struct umvd_queue *q)
+{
+	queue_work(system_unbound_wq, &q->work);
+}
+
 void umvd_request_complete(struct umvd_request *req, u32 written)
 {
 	struct umvd_request_priv *p =
@@ -320,7 +331,11 @@ static void umvd_vq_work(struct work_struct *work)
 		u16 head;
 		int err;
 
-		p = kzalloc(struct_size(p, store, 2 * (size_t)q->num),
+		/* kmalloc, not kzalloc: the kiov arrays are written by
+		 * vringh before being read (it tracks `used`), and every
+		 * header field is assigned below - zeroing would memset
+		 * 2 * num kvecs per request for nothing. */
+		p = kmalloc(struct_size(p, store, 2 * (size_t)q->num),
 			    GFP_KERNEL);
 		if (!p) {
 			/* The host already kicked for whatever is in the
@@ -383,7 +398,7 @@ static irqreturn_t umvd_kick_irq(int irq, void *data)
 	os_read_file(q->kick_fd, &cnt, sizeof(cnt));
 
 	if (READ_ONCE(q->live))
-		schedule_work(&q->work);
+		umvd_queue_vq_work(q);
 
 	return IRQ_HANDLED;
 }
@@ -415,7 +430,7 @@ static void umvd_watchdog_fn(struct timer_list *t)
 		    seen == q->wdog_seen) {
 			q->n_watchdog++;
 			q->wdog_stuck = false;
-			schedule_work(&q->work);
+			umvd_queue_vq_work(q);
 		} else {
 			q->wdog_stuck = true;
 			q->wdog_avail = avail;
@@ -669,7 +684,7 @@ static void umvd_start_dataplane(struct umvd_dev *dev)
 			continue;
 		WRITE_ONCE(q->live, true);
 		/* Drain anything posted before we went live. */
-		schedule_work(&q->work);
+		umvd_queue_vq_work(q);
 		q->wdog_stuck = false;
 		mod_timer(&q->watchdog, jiffies + HZ);
 	}
@@ -781,7 +796,7 @@ static void umvd_handle_message(struct umvd_dev *dev,
 
 		for (i = 0; i < dev->num_queues; i++)
 			if (READ_ONCE(dev->queues[i].live))
-				schedule_work(&dev->queues[i].work);
+				umvd_queue_vq_work(&dev->queues[i]);
 
 		pr_info("iotlb update [%llx, %llx]\n", req->iova.start,
 			req->iova.last);
@@ -871,14 +886,26 @@ static void umvd_stats_fn(struct timer_list *t)
 
 	for (i = 0; i < dev->num_queues; i++) {
 		struct umvd_queue *q = &dev->queues[i];
+		bool active;
+		u16 avail = 0, seen = 0;
+		unsigned long flags;
 
-		if (q->num)
+		/* The ring pointers die on reset; sample them under the
+		 * queue lock, which reset takes before retiring them. */
+		spin_lock_irqsave(&q->lock, flags);
+		active = q->num != 0;
+		if (active) {
+			avail = le16_to_cpu((__force __le16)
+				READ_ONCE(q->vrh.vring.avail->idx));
+			seen = q->vrh.last_avail_idx;
+		}
+		spin_unlock_irqrestore(&q->lock, flags);
+
+		if (active)
 			pr_info("q%u: kicks %llu works %llu reqs %llu done %llu notify %llu bad %llu dropped %llu wdog %llu | avail %u seen %u\n",
 				i, q->n_kicks, q->n_works, q->n_reqs,
 				q->n_done, q->n_notify, q->n_bad,
-				q->n_dropped, q->n_watchdog,
-				le16_to_cpu((__force __le16)READ_ONCE(q->vrh.vring.avail->idx)),
-				q->vrh.last_avail_idx);
+				q->n_dropped, q->n_watchdog, avail, seen);
 		else
 			pr_info("q%u: kicks %llu works %llu reqs %llu done %llu notify %llu bad %llu dropped %llu wdog %llu | inactive\n",
 				i, q->n_kicks, q->n_works, q->n_reqs,
@@ -1084,18 +1111,6 @@ static int umvd_bringup(struct umvd_dev *dev)
 	if (err < 0)
 		return err;
 
-	/*
-	 * Allocate the umem region up front so a hopeless configuration
-	 * (mem= too small for the bounce size, umem=0 with a shim that
-	 * needs it) fails at boot rather than at first I/O. Registration
-	 * itself has to wait until the host's bounce machinery exists.
-	 */
-	err = umvd_umem_ensure(dev);
-	if (err < 0 && dev->ops->need_umem) {
-		pr_err("%s needs the umem region\n", dev->ops->name);
-		return err;
-	}
-
 	dev->queues = kcalloc(dev->num_queues, sizeof(*dev->queues),
 			      GFP_KERNEL);
 	if (!dev->queues)
@@ -1139,6 +1154,21 @@ static int umvd_bringup(struct umvd_dev *dev)
 		err = add_sigio_fd(q->kick_fd);
 		if (err < 0)
 			return err;
+	}
+
+	/*
+	 * After the VQ_SETUP loop, so the window between the device node
+	 * appearing and the device being attachable (vduse_dev_is_ready()
+	 * wants every vq configured) is not widened by the 64 MiB
+	 * allocate-and-touch. Allocating up front still means a hopeless
+	 * configuration (mem= too small for the bounce size, umem=0 with
+	 * a shim that needs it) fails at boot rather than at first I/O;
+	 * registration itself waits for the host's bounce machinery.
+	 */
+	err = umvd_umem_ensure(dev);
+	if (err < 0 && dev->ops->need_umem) {
+		pr_err("%s needs the umem region\n", dev->ops->name);
+		return err;
 	}
 
 	dev->dev_irq = um_request_irq(UM_IRQ_ALLOC, dev->dev_fd, IRQ_READ,

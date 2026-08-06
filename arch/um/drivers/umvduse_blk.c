@@ -48,10 +48,6 @@
 
 #include "umvduse.h"
 
-#define UMVD_BLK_QUEUE_MAX	128
-#define UMVD_BLK_SEG_MAX	(UMVD_BLK_QUEUE_MAX - 2)
-#define UMVD_BLK_SIZE_MAX	65536
-
 #define UMVD_BLK_ID_BYTES	20
 
 struct umvd_blk {
@@ -77,6 +73,8 @@ static int umvd_blk_minor;
 static char umvd_blk_serial[UMVD_BLK_ID_BYTES + 1] = "umvduse";
 static bool umvd_blk_readonly;
 static unsigned int umvd_blk_wait_ms = 10000;
+static unsigned int umvd_blk_queue_max = 256;
+static unsigned int umvd_blk_size_max = 131072;
 
 static struct umvd_blk umvd_blk_dev;
 
@@ -417,7 +415,7 @@ static int umvd_blk_setup(struct umvd_dev *dev)
 	dev->device_id = VIRTIO_ID_BLOCK;
 	dev->vendor_id = 0;
 	dev->num_queues = 1;
-	dev->queue_max[0] = UMVD_BLK_QUEUE_MAX;
+	dev->queue_max[0] = umvd_blk_queue_max;
 
 	/* CONFIG_WCE must not be offered: VDUSE rejects it (it would need
 	 * a writable config space). */
@@ -430,8 +428,9 @@ static int umvd_blk_setup(struct umvd_dev *dev)
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.capacity = (__force __virtio64)cpu_to_le64(sectors);
-	cfg.seg_max = (__force __virtio32)cpu_to_le32(UMVD_BLK_SEG_MAX);
-	cfg.size_max = (__force __virtio32)cpu_to_le32(UMVD_BLK_SIZE_MAX);
+	cfg.seg_max = (__force __virtio32)
+		cpu_to_le32(umvd_blk_queue_max - 2);
+	cfg.size_max = (__force __virtio32)cpu_to_le32(umvd_blk_size_max);
 	cfg.blk_size = (__force __virtio32)
 		cpu_to_le32(bdev_logical_block_size(blk->bdev));
 	cfg.num_queues = (__force __virtio16)cpu_to_le16(1);
@@ -539,4 +538,17 @@ __uml_help(umvd_blk_wait_ms,
 "    How long to wait for the exported disk to show up before giving\n"
 "    up, in milliseconds (default 10000). NVMe namespaces appear\n"
 "    asynchronously some time into boot.\n\n"
+);
+
+module_param_named(queue_max, umvd_blk_queue_max, uint, 0400);
+__uml_help(umvd_blk_queue_max,
+"umvduse_blk.queue_max=<n>\n"
+"    Virtqueue size to offer (default 256; power of two, 4..1024).\n"
+"    seg_max is derived as queue_max - 2.\n\n"
+);
+
+module_param_named(size_max, umvd_blk_size_max, uint, 0400);
+__uml_help(umvd_blk_size_max,
+"umvduse_blk.size_max=<bytes>\n"
+"    Maximum size of a single request segment (default 131072).\n\n"
 );

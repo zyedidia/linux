@@ -43,6 +43,19 @@ void uml_cleanup(void)
 	kill_off_processes();
 }
 
+/*
+ * Whether uml_cleanup() may run in the current context. The exitcalls
+ * can block - closing a console channel ends in free_irq() ->
+ * synchronize_rcu() - and a fatal signal usually interrupts the idle
+ * task, which must not sleep: on an SMP kernel the exit then wedges in
+ * a schedule-from-idle loop. Tiny RCU never blocks there, which is
+ * what kept the UP exit path working all along.
+ */
+int uml_cleanup_safe(void)
+{
+	return IS_ENABLED(CONFIG_TINY_RCU) || !is_idle_task(current);
+}
+
 void machine_restart(char * __unused)
 {
 	uml_cleanup();
