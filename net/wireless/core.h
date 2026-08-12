@@ -21,6 +21,26 @@
 
 #define WIPHY_IDX_INVALID	-1
 
+/* in-kernel consumer notifications (inkernel.c) */
+#ifdef CONFIG_CFG80211_INKERNEL
+void cfg80211_ik_notify_scan_done(struct wiphy *wiphy, bool aborted);
+void cfg80211_ik_notify_connect(struct net_device *dev,
+				struct cfg80211_connect_resp_params *params);
+void cfg80211_ik_notify_disconnect(struct net_device *dev, u16 reason,
+				   const u8 *ie, size_t ie_len,
+				   bool locally_generated);
+#else
+static inline void cfg80211_ik_notify_scan_done(struct wiphy *wiphy,
+						bool aborted) { }
+static inline void
+cfg80211_ik_notify_connect(struct net_device *dev,
+			   struct cfg80211_connect_resp_params *params) { }
+static inline void cfg80211_ik_notify_disconnect(struct net_device *dev,
+						 u16 reason, const u8 *ie,
+						 size_t ie_len,
+						 bool locally_generated) { }
+#endif
+
 struct cfg80211_scan_request_int {
 	struct cfg80211_scan_info info;
 	bool notified;

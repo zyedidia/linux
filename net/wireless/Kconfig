@@ -49,6 +49,18 @@ config NL80211_TESTMODE
 
 	  Say N.
 
+config CFG80211_INKERNEL
+	bool "cfg80211 in-kernel consumer API"
+	depends on CFG80211
+	help
+	  Allow kernel code to drive a wiphy the way nl80211 lets userspace
+	  drive one: submit scans, connects and key installs, and receive
+	  the results through callbacks.
+
+	  This exists for driver domains that have no userspace of their
+	  own and must re-export a wireless device by other means. If
+	  unsure, say N.
+
 config CFG80211_DEVELOPER_WARNINGS
 	bool "enable developer warnings"
 	default n

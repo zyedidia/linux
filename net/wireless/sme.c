@@ -842,6 +842,8 @@ void __cfg80211_connect_result(struct net_device *dev,
 		return;
 	}
 
+	cfg80211_ik_notify_connect(dev, cr);
+
 	if (WARN_ON(bss_not_found)) {
 		cfg80211_connect_result_release_bsses(wdev, cr);
 		return;
@@ -1349,6 +1351,9 @@ void __cfg80211_disconnected(struct net_device *dev, const u8 *ie,
 #ifdef CONFIG_CFG80211_WEXT
 	union iwreq_data wrqu;
 #endif
+	/* from_ap is the inverse of locally_generated. */
+	cfg80211_ik_notify_disconnect(dev, reason, ie, ie_len, !from_ap);
+
 
 	lockdep_assert_wiphy(wdev->wiphy);
 

@@ -15,16 +15,39 @@
 
 #include "umvduse_user.h"
 
-int umvd_user_raise_memlock(void)
+/*
+ * Raise the pinned-memory limit ourselves rather than depending on a
+ * launcher to have done it.
+ *
+ * Raising the hard limit needs CAP_SYS_RESOURCE, so try for infinity
+ * first; an unprivileged instance can still always raise the soft limit
+ * up to the inherited hard one, which beats leaving it at the ~8 MiB
+ * default. @effective reports what was achieved, ~0ULL meaning
+ * unlimited, so the caller can say something useful about it.
+ */
+int umvd_user_raise_memlock(unsigned long long *effective)
 {
-	struct rlimit lim = {
+	struct rlimit want = {
 		.rlim_cur = RLIM_INFINITY,
 		.rlim_max = RLIM_INFINITY,
 	};
+	struct rlimit lim;
 
-	if (setrlimit(RLIMIT_MEMLOCK, &lim) < 0)
+	if (setrlimit(RLIMIT_MEMLOCK, &want) == 0) {
+		*effective = ~0ULL;
+		return 0;
+	}
+
+	if (getrlimit(RLIMIT_MEMLOCK, &lim) < 0)
 		return -errno;
 
+	if (lim.rlim_cur != lim.rlim_max) {
+		lim.rlim_cur = lim.rlim_max;
+		if (setrlimit(RLIMIT_MEMLOCK, &lim) < 0)
+			return -errno;
+	}
+
+	*effective = lim.rlim_max == RLIM_INFINITY ? ~0ULL : lim.rlim_max;
 	return 0;
 }
 

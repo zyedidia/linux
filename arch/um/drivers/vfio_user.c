@@ -266,6 +266,29 @@ static int uml_vfio_user_irq_index(struct uml_vfio_user_device *dev)
 		VFIO_PCI_MSI_IRQ_INDEX : VFIO_PCI_MSIX_IRQ_INDEX;
 }
 
+/* Vectors programmed for the mode currently in use. */
+static int uml_vfio_user_irq_count(struct uml_vfio_user_device *dev)
+{
+	return dev->irq_type == UML_VFIO_IRQ_MSI ?
+		dev->msi_count : dev->msix_count;
+}
+
+static int vfio_disable_irqs(int device, int index)
+{
+	struct vfio_irq_set irq_set = {
+		.argsz = sizeof(irq_set),
+		.flags = VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+		.index = index,
+		.start = 0,
+		.count = 0,
+	};
+
+	if (ioctl(device, VFIO_DEVICE_SET_IRQS, &irq_set) < 0)
+		return -errno;
+
+	return 0;
+}
+
 static int vfio_set_irqs(int device, int index, int start, int count,
 			 int *irqfd)
 {
@@ -377,38 +400,41 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 		vfio_map_region(dev, i, &region);
 	}
 
-	/* Prefer MSI-X; fall back to plain MSI for devices without it. */
+	/*
+	 * Probe both: the guest decides which to use, and a driver that
+	 * tries MSI-X and falls back to MSI needs both to be available.
+	 */
 	irq_info.index = VFIO_PCI_MSIX_IRQ_INDEX;
 	if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
 		err = -errno;
 		goto unmap_region;
 	}
-	dev->irq_type = UML_VFIO_IRQ_MSIX;
+	dev->msix_count = irq_info.count;
 
-	if (!irq_info.count) {
-		irq_info.index = VFIO_PCI_MSI_IRQ_INDEX;
-		if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
-			err = -errno;
-			goto unmap_region;
-		}
-		dev->irq_type = UML_VFIO_IRQ_MSI;
+	memset(&irq_info, 0, sizeof(irq_info));
+	irq_info.argsz = sizeof(irq_info);
+	irq_info.index = VFIO_PCI_MSI_IRQ_INDEX;
+	if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
+		err = -errno;
+		goto unmap_region;
 	}
+	/*
+	 * Plain MSI is supported single-vector only; guests cannot ask
+	 * for more, as the UM PCI MSI domain does not advertise
+	 * MSI_FLAG_MULTI_PCI_MSI.
+	 */
+	dev->msi_count = irq_info.count ? 1 : 0;
 
-	if (!irq_info.count) {
+	if (!dev->msix_count && !dev->msi_count) {
 		err = -EOPNOTSUPP;
 		goto unmap_region;
 	}
 
-	dev->irq_count = irq_info.count;
-
-	/*
-	 * Plain MSI is supported single-vector only; don't ask the host
-	 * to allocate vectors we will never wire up. Guests cannot
-	 * request more anyway: the UM PCI MSI domain does not advertise
-	 * MSI_FLAG_MULTI_PCI_MSI.
-	 */
-	if (dev->irq_type == UML_VFIO_IRQ_MSI)
-		dev->irq_count = 1;
+	/* One array, large enough for whichever mode the guest picks. */
+	dev->irq_count = dev->msix_count > dev->msi_count ?
+			 dev->msix_count : dev->msi_count;
+	dev->irq_type = dev->msix_count ? UML_VFIO_IRQ_MSIX :
+					  UML_VFIO_IRQ_MSI;
 
 	dev->irqfd = uml_kmalloc(sizeof(int) * dev->irq_count, UM_GFP_KERNEL);
 	if (!dev->irqfd) {
@@ -419,7 +445,7 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 	memset(dev->irqfd, -1, sizeof(int) * dev->irq_count);
 
 	err = vfio_set_irqs(dev->device, uml_vfio_user_irq_index(dev), 0,
-			    dev->irq_count, dev->irqfd);
+			    uml_vfio_user_irq_count(dev), dev->irqfd);
 	if (err)
 		goto free_irqfd;
 
@@ -464,7 +490,25 @@ void uml_vfio_user_deactivate_irq(struct uml_vfio_user_device *dev, int index)
 int uml_vfio_user_update_irqs(struct uml_vfio_user_device *dev)
 {
 	return vfio_set_irqs(dev->device, uml_vfio_user_irq_index(dev), 0,
-			     dev->irq_count, dev->irqfd);
+			     uml_vfio_user_irq_count(dev), dev->irqfd);
+}
+
+int uml_vfio_user_set_irq_type(struct uml_vfio_user_device *dev,
+			       enum uml_vfio_irq_type type)
+{
+	if (dev->irq_type == type)
+		return 0;
+
+	if (type == UML_VFIO_IRQ_MSI && !dev->msi_count)
+		return -EOPNOTSUPP;
+	if (type == UML_VFIO_IRQ_MSIX && !dev->msix_count)
+		return -EOPNOTSUPP;
+
+	/* The host permits only one mode at a time. */
+	vfio_disable_irqs(dev->device, uml_vfio_user_irq_index(dev));
+	dev->irq_type = type;
+
+	return uml_vfio_user_update_irqs(dev);
 }
 
 static int vfio_region_read(struct uml_vfio_user_device *dev, unsigned int index,

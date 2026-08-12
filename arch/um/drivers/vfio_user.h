@@ -2,8 +2,11 @@
 #ifndef __UM_VFIO_USER_H
 #define __UM_VFIO_USER_H
 
-/* Interrupt mode of the device, chosen at setup time. MSI-X is
- * preferred; plain MSI is the fallback for devices without it.
+/*
+ * Interrupt mode currently programmed. Which one is used is the guest
+ * driver's choice, not a property of the device: a driver may probe
+ * MSI-X and fall back to MSI, so both are kept available and the mode
+ * follows whichever capability the guest enables.
  */
 enum uml_vfio_irq_type {
 	UML_VFIO_IRQ_MSIX,
@@ -22,8 +25,10 @@ struct uml_vfio_user_device {
 	int num_regions;
 
 	enum uml_vfio_irq_type irq_type;
+	int msix_count;			/* vectors the device offers, 0 if none */
+	int msi_count;			/* 1 if plain MSI is available */
 	int32_t *irqfd;
-	int irq_count;
+	int irq_count;			/* entries in irqfd[] */
 };
 
 struct uml_vfio_iova_range {
@@ -57,6 +62,9 @@ void uml_vfio_user_teardown_device(struct uml_vfio_user_device *dev);
 int uml_vfio_user_activate_irq(struct uml_vfio_user_device *dev, int index);
 void uml_vfio_user_deactivate_irq(struct uml_vfio_user_device *dev, int index);
 int uml_vfio_user_update_irqs(struct uml_vfio_user_device *dev);
+/* Program the device for @type, tearing down the other mode first. */
+int uml_vfio_user_set_irq_type(struct uml_vfio_user_device *dev,
+			       enum uml_vfio_irq_type type);
 
 int uml_vfio_user_cfgspace_read(struct uml_vfio_user_device *dev,
 				unsigned int offset, void *buf, int size);

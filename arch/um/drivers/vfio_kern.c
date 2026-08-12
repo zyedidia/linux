@@ -37,8 +37,9 @@ struct uml_vfio_device {
 	struct uml_vfio_user_device udev;
 	struct uml_vfio_intr_ctx *intr_ctx;
 
-	/* Exactly one of msix_cap/msi_cap is nonzero, matching
-	 * udev.irq_type; the unused mode's intercepts stay dead.
+	/* Either or both may be present. Both intercepts stay armed: the
+	 * guest picks the mode at run time, and drivers commonly probe
+	 * MSI-X and fall back to MSI.
 	 */
 	int msix_cap;
 	int msix_bar;
@@ -54,6 +55,7 @@ struct uml_vfio_device {
 	 * table or the MSI capability, depending on the mode.
 	 */
 	u32 *vec_data;
+	u64 intr_count;
 
 	struct list_head list;
 };
@@ -213,8 +215,12 @@ static irqreturn_t uml_vfio_interrupt(int unused, void *opaque)
 
 	do {
 		r = os_read_file(irqfd, &v, sizeof(v));
-		if (r == sizeof(v))
+		if (r == sizeof(v)) {
+			if (++dev->intr_count <= 5)
+				pr_info("%s: interrupt %llu delivered (vector %d, irq %d)\n",
+					dev->name, dev->intr_count, index, irq);
 			generic_handle_irq(irq);
+		}
 	} while (r == sizeof(v) || r == -EINTR);
 	WARN(r != -EAGAIN, "read returned %d\n", r);
 
@@ -279,6 +285,8 @@ static int uml_vfio_update_msix_cap(struct uml_vfio_device *dev,
 	if (size == 2 && offset == dev->msix_cap + PCI_MSIX_FLAGS) {
 		switch (val & ~PCI_MSIX_FLAGS_QSIZE) {
 		case PCI_MSIX_FLAGS_ENABLE:
+			return uml_vfio_user_set_irq_type(&dev->udev,
+							  UML_VFIO_IRQ_MSIX);
 		case 0:
 			return uml_vfio_user_update_irqs(&dev->udev);
 		}
@@ -329,11 +337,19 @@ static int uml_vfio_update_msi_cap(struct uml_vfio_device *dev,
 	if (size == 2 && offset == dev->msi_cap + PCI_MSI_FLAGS) {
 		if (val & PCI_MSI_FLAGS_ENABLE) {
 			err = uml_vfio_activate_irq(dev, 0);
-			if (err)
+			if (err) {
+				pr_err("%s: MSI activate failed: %d\n",
+				       dev->name, err);
 				return err;
-		} else {
-			uml_vfio_deactivate_irq(dev, 0);
+			}
+			err = uml_vfio_user_set_irq_type(&dev->udev,
+							 UML_VFIO_IRQ_MSI);
+			pr_info("%s: MSI enabled, vector data 0x%x, set_irqs %d\n",
+				dev->name, dev->vec_data[0], err);
+			return err;
 		}
+		uml_vfio_deactivate_irq(dev, 0);
+		pr_info("%s: MSI disabled\n", dev->name);
 		return uml_vfio_user_update_irqs(&dev->udev);
 	}
 
@@ -650,10 +666,6 @@ static int uml_vfio_read_msix_table(struct uml_vfio_device *dev)
 	dev->msix_offset = tbl & PCI_MSIX_TABLE_OFFSET;
 	dev->msix_size = ((flags & PCI_MSIX_FLAGS_QSIZE) + 1) * PCI_MSIX_ENTRY_SIZE;
 
-	dev->vec_data = kzalloc(dev->msix_size, GFP_KERNEL);
-	if (!dev->vec_data)
-		return -ENOMEM;
-
 	return 0;
 }
 
@@ -692,11 +704,29 @@ static int uml_vfio_read_msi_cap(struct uml_vfio_device *dev)
 	return 0;
 }
 
+/*
+ * Read both capabilities. Which one gets used is up to the guest -- a
+ * driver may probe MSI-X and fall back to MSI -- so both intercepts stay
+ * armed and one vector table serves whichever mode is enabled.
+ */
 static int uml_vfio_read_irq_cap(struct uml_vfio_device *dev)
 {
-	if (dev->udev.irq_type == UML_VFIO_IRQ_MSI)
-		return uml_vfio_read_msi_cap(dev);
-	return uml_vfio_read_msix_table(dev);
+	int nvec = dev->udev.irq_count;
+
+	if (dev->udev.msix_count)
+		uml_vfio_read_msix_table(dev);
+	if (dev->udev.msi_count)
+		uml_vfio_read_msi_cap(dev);
+
+	if (!dev->msix_cap && !dev->msi_cap)
+		return -ENOTSUPP;
+
+	dev->vec_data = kcalloc(nvec > 0 ? nvec : 1, sizeof(*dev->vec_data),
+				GFP_KERNEL);
+	if (!dev->vec_data)
+		return -ENOMEM;
+
+	return 0;
 }
 
 static void uml_vfio_open_device(struct uml_vfio_device *dev)
@@ -731,6 +761,10 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 		       dev->name, err);
 		goto teardown_udev;
 	}
+
+	pr_info("%s: MSI-X %d vector(s) (cap 0x%x), MSI %s (cap 0x%x); guest chooses\n",
+		dev->name, dev->udev.msix_count, dev->msix_cap,
+		dev->udev.msi_count ? "available" : "absent", dev->msi_cap);
 
 	dev->intr_ctx = kmalloc_objs(struct uml_vfio_intr_ctx,
 				     dev->udev.irq_count);

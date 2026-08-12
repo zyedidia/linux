@@ -1199,6 +1199,8 @@ void cfg80211_scan_done(struct cfg80211_scan_request *request,
 	struct cfg80211_scan_info old_info = intreq->info;
 
 	trace_cfg80211_scan_done(intreq, info);
+
+	cfg80211_ik_notify_scan_done(request->wiphy, info->aborted);
 	WARN_ON(intreq != rdev->scan_req &&
 		intreq != rdev->int_scan_req);
 

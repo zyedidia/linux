@@ -219,6 +219,16 @@ config UMVDUSE
 	  The host kernel needs the vduse and virtio_vdpa modules;
 	  nothing else runs on the data path.
 
+config UMVDUSE_WLAN
+	bool "umvduse virtio-wlan export"
+	depends on UMVDUSE && CFG80211_INKERNEL
+	help
+	  Export a wireless device driven inside this UML instance to the
+	  host as a virtio-wlan device. Scans, connects and key installs
+	  arrive as commands and are replayed against the local wiphy;
+	  frames cross the data queues as 802.3. The interface is chosen
+	  with umvduse_wlan.ifname=<name>.
+
 config UMVDUSE_BLK
 	bool "umvduse virtio-blk export"
 	depends on UMVDUSE && BLOCK

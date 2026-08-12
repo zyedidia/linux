@@ -58,6 +58,20 @@
 #define UMVD_VQ_ALIGN		4096
 #define UMVD_DEF_UMEM_SIZE	(64 << 20)	/* VDUSE default bounce size */
 
+/*
+ * Descriptors covered per direction without a second allocation. A chain
+ * may legally span the whole ring, but almost none do: a receive buffer
+ * is one descriptor, a command is two, and a transmitted skb is a
+ * handful. vringh grows the array itself when a chain overruns it (see
+ * resize_iovec()), and vringh_kiov_cleanup() frees what it allocated, so
+ * this is a fast-path size and not a limit.
+ *
+ * Sizing it by the ring instead would put an 8KiB allocation on every
+ * request at a 256-entry ring, and 32KiB at 1024 - per packet, on the
+ * receive path, for buffers of which one entry is ever used.
+ */
+#define UMVD_KIOV_INLINE	8
+
 struct umvd_queue {
 	struct umvd_dev *dev;
 	u32 index;
@@ -334,8 +348,8 @@ static void umvd_vq_work(struct work_struct *work)
 		/* kmalloc, not kzalloc: the kiov arrays are written by
 		 * vringh before being read (it tracks `used`), and every
 		 * header field is assigned below - zeroing would memset
-		 * 2 * num kvecs per request for nothing. */
-		p = kmalloc(struct_size(p, store, 2 * (size_t)q->num),
+		 * the whole inline area per request for nothing. */
+		p = kmalloc(struct_size(p, store, 2 * UMVD_KIOV_INLINE),
 			    GFP_KERNEL);
 		if (!p) {
 			/* The host already kicked for whatever is in the
@@ -346,8 +360,9 @@ static void umvd_vq_work(struct work_struct *work)
 			continue;
 		}
 
-		vringh_kiov_init(&p->pub.riov, &p->store[0], q->num);
-		vringh_kiov_init(&p->pub.wiov, &p->store[q->num], q->num);
+		vringh_kiov_init(&p->pub.riov, &p->store[0], UMVD_KIOV_INLINE);
+		vringh_kiov_init(&p->pub.wiov, &p->store[UMVD_KIOV_INLINE],
+				 UMVD_KIOV_INLINE);
 
 		spin_lock_irq(&q->lock);
 		err = vringh_getdesc_kern(&q->vrh, &p->pub.riov, &p->pub.wiov,
@@ -1052,6 +1067,7 @@ static int umvd_bringup(struct umvd_dev *dev)
 {
 	char path[UMVD_NAME_LEN + 16];
 	u32 i;
+	unsigned long long memlock = ~0ULL;
 	int err;
 
 	err = dev->ops->setup(dev);
@@ -1092,10 +1108,13 @@ static int umvd_bringup(struct umvd_dev *dev)
 	 * bounce size. We run with CAP_SYS_RESOURCE; lift the limit
 	 * rather than make every launcher remember to.
 	 */
-	err = umvd_user_raise_memlock();
+	err = umvd_user_raise_memlock(&memlock);
 	if (err < 0)
 		pr_warn("cannot raise RLIMIT_MEMLOCK: %d; umem registration may fail\n",
 			err);
+	else if (memlock != ~0ULL)
+		pr_info("RLIMIT_MEMLOCK raised to %llu MiB (the inherited hard limit); a larger bounce region will not register\n",
+			memlock >> 20);
 
 	err = umvd_create_device(dev);
 	if (err < 0)
