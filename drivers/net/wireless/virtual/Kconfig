@@ -18,3 +18,15 @@ config VIRT_WIFI
 	  This option adds support for ethernet connections to appear as if they
 	  are wifi connections through a special rtnetlink device.
 
+config VIRTIO_WLAN
+	tristate "Virtio WLAN driver"
+	depends on VIRTIO && CFG80211
+	help
+	  This option adds support for a virtio WLAN device, which implements
+	  association on the device side and exchanges 802.3 frames with this
+	  driver. It appears as an ordinary cfg80211 station interface, so the
+	  usual wireless tools and supplicants work unchanged.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called virtio_wlan. If unsure, say N.
+

@@ -171,6 +171,13 @@ static u32 allowed_device_id[] = {
 	VIRTIO_ID_BLOCK,
 	VIRTIO_ID_NET,
 	VIRTIO_ID_FS,
+	/*
+	 * Local divergence from mainline: allow the (long-reserved but
+	 * never specified) WLAN device id for the virtio-wlan prototype.
+	 * Its control path rides ordinary virtqueues and its config
+	 * space is read-only, so no further VDUSE changes are needed.
+	 */
+	VIRTIO_ID_MAC80211_WLAN,
 };
 
 static inline struct vduse_dev *vdpa_to_vduse(struct vdpa_device *vdpa)
@@ -1149,15 +1156,20 @@ static void vduse_dev_irq_inject(struct work_struct *work)
 	spin_unlock_bh(&dev->irq_lock);
 }
 
+static void vduse_vq_irq(struct vduse_virtqueue *vq)
+{
+	spin_lock_bh(&vq->irq_lock);
+	if (vq->ready && vq->cb.callback)
+		vq->cb.callback(vq->cb.private);
+	spin_unlock_bh(&vq->irq_lock);
+}
+
 static void vduse_vq_irq_inject(struct work_struct *work)
 {
 	struct vduse_virtqueue *vq = container_of(work,
 					struct vduse_virtqueue, inject);
 
-	spin_lock_bh(&vq->irq_lock);
-	if (vq->ready && vq->cb.callback)
-		vq->cb.callback(vq->cb.private);
-	spin_unlock_bh(&vq->irq_lock);
+	vduse_vq_irq(vq);
 }
 
 static bool vduse_vq_signal_irqfd(struct vduse_virtqueue *vq)
@@ -1193,6 +1205,36 @@ static int vduse_dev_queue_irq_work(struct vduse_dev *dev,
 	else
 		queue_work_on(irq_effective_cpu,
 			      vduse_irq_bound_wq, irq_work);
+unlock:
+	up_read(&dev->rwsem);
+
+	return ret;
+}
+
+/*
+ * Local divergence from mainline: opt-in inline interrupt injection
+ * (VDUSE_VQ_INJECT_IRQ2 + VDUSE_VQ_IRQ_INLINE). Without an irq trigger
+ * (virtio_vdpa: the host itself is the driver), every injection above
+ * bounces through a workqueue, so the cheapest possible completion
+ * costs a kworker wakeup. Running the callback here instead trades
+ * that wakeup for the caller spending its own CPU time on the virtio
+ * driver's completion work, including the softirqs it raises (run at
+ * the _bh unlock in vduse_vq_irq()). The callback must not sleep — the
+ * same contract the workqueue path's spin_lock_bh already imposes.
+ * Holding rwsem across the callback follows the rwsem -> irq_lock
+ * order established by vduse_dev_reset().
+ */
+static int vduse_dev_inject_vq_irq_inline(struct vduse_dev *dev,
+					  struct vduse_virtqueue *vq)
+{
+	int ret = -EINVAL;
+
+	down_read(&dev->rwsem);
+	if (!(dev->status & VIRTIO_CONFIG_S_DRIVER_OK))
+		goto unlock;
+
+	ret = 0;
+	vduse_vq_irq(vq);
 unlock:
 	up_read(&dev->rwsem);
 
@@ -1547,6 +1589,35 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 			ret = vduse_dev_queue_irq_work(dev,
 						&dev->vqs[index]->inject,
 						dev->vqs[index]->irq_effective_cpu);
+		}
+		break;
+	}
+	case VDUSE_VQ_INJECT_IRQ2: {
+		struct vduse_vq_irq irq;
+		struct vduse_virtqueue *vq;
+
+		ret = -EFAULT;
+		if (copy_from_user(&irq, argp, sizeof(irq)))
+			break;
+
+		ret = -EINVAL;
+		if (irq.flags & ~VDUSE_VQ_IRQ_INLINE)
+			break;
+		if (irq.index >= dev->vq_num)
+			break;
+
+		vq = dev->vqs[array_index_nospec(irq.index, dev->vq_num)];
+
+		ret = 0;
+		if (vduse_vq_signal_irqfd(vq))
+			break;
+
+		if (irq.flags & VDUSE_VQ_IRQ_INLINE) {
+			ret = vduse_dev_inject_vq_irq_inline(dev, vq);
+		} else {
+			vduse_vq_update_effective_cpu(vq);
+			ret = vduse_dev_queue_irq_work(dev, &vq->inject,
+						       vq->irq_effective_cpu);
 		}
 		break;
 	}
@@ -2200,8 +2271,15 @@ static int vduse_create_dev(struct vduse_dev_config *config,
 	int ret;
 	struct vduse_dev *dev;
 
+	/*
+	 * A WLAN device registers a wiphy and a netdev in the host, so it
+	 * needs the same privilege as a net device. (Local divergence,
+	 * alongside the WLAN entry in allowed_device_id above.)
+	 */
 	ret = -EPERM;
-	if ((config->device_id == VIRTIO_ID_NET) && !capable(CAP_NET_ADMIN))
+	if ((config->device_id == VIRTIO_ID_NET ||
+	     config->device_id == VIRTIO_ID_MAC80211_WLAN) &&
+	    !capable(CAP_NET_ADMIN))
 		goto err;
 
 	ret = -EEXIST;

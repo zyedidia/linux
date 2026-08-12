@@ -308,6 +308,32 @@ struct vduse_iotlb_entry_v2 {
  */
 #define VDUSE_IOTLB_GET_FD2	_IOWR(VDUSE_BASE, 0x1b, struct vduse_iotlb_entry_v2)
 
+/**
+ * struct vduse_vq_irq - virtqueue interrupt injection
+ * @index: virtqueue index
+ * @flags: VDUSE_VQ_IRQ_* flags
+ *
+ * Structure used by VDUSE_VQ_INJECT_IRQ2 ioctl to inject an interrupt
+ * for a specific virtqueue.
+ */
+struct vduse_vq_irq {
+	__u32 index;
+#define VDUSE_VQ_IRQ_INLINE	0x1
+	__u32 flags;
+};
+
+/*
+ * Same as VDUSE_VQ_INJECT_IRQ but with flags. VDUSE_VQ_IRQ_INLINE runs
+ * the virtio driver's interrupt callback (and any softirq work it
+ * raises) in the calling context before returning, instead of on a
+ * workqueue: the interrupt costs no wakeup, but the ioctl does not
+ * return until completion processing is done and that work is spent
+ * from the caller's CPU time. The flag has no effect when an irq
+ * trigger (eventfd) is assigned; the trigger is signalled as usual.
+ * Unknown flags fail with EINVAL.
+ */
+#define VDUSE_VQ_INJECT_IRQ2	_IOW(VDUSE_BASE, 0x1c, struct vduse_vq_irq)
+
 
 /* The control messages definition for read(2)/write(2) on /dev/vduse/$NAME */
 
