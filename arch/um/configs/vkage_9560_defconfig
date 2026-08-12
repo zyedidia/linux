@@ -1,0 +1,98 @@
+#
+# Driver domain for an Intel Wireless-AC 9560, exported to the host as a
+# virtio-wlan device. A kernel-only build: no userspace, no filesystem,
+# iwlwifi and mac80211 driving a real card over VFIO, with the cfg80211
+# in-kernel consumer feeding the umvduse-wlan shim.
+#
+# CONFIG_EXTRA_FIRMWARE below is card-specific and has to be built in,
+# because a domain with no userspace has nothing to load firmware from at
+# runtime. The "9000-pu-b0-jf-b0-46" ucode is what a 9560 asks for; a
+# different Intel card, or a different firmware revision of the same one,
+# needs that string changed to match what the driver requests. The
+# regulatory database is built in for the same reason.
+#
+# CONFIG_LOCALVERSION_AUTO is not set
+# CONFIG_CROSS_MEMORY_ATTACH is not set
+CONFIG_LOG_BUF_SHIFT=14
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y
+CONFIG_EXPERT=y
+# CONFIG_MULTIUSER is not set
+# CONFIG_FUTEX is not set
+# CONFIG_EPOLL is not set
+# CONFIG_SIGNALFD is not set
+# CONFIG_TIMERFD is not set
+# CONFIG_EVENTFD is not set
+# CONFIG_SHMEM is not set
+# CONFIG_AIO is not set
+# CONFIG_IO_URING is not set
+CONFIG_UML_NO_USERSPACE=y
+CONFIG_SMP=y
+CONFIG_NR_CPUS=8
+# CONFIG_STDERR_CONSOLE is not set
+CONFIG_CON_CHAN="none"
+CONFIG_UML_PCI_OVER_VFIO=y
+CONFIG_UMVDUSE=y
+CONFIG_UMVDUSE_WLAN=y
+# CONFIG_SECCOMP is not set
+# CONFIG_VMAP_STACK is not set
+# CONFIG_BLOCK_LEGACY_AUTOLOAD is not set
+# CONFIG_BLK_DEV_WRITE_MOUNTED is not set
+# CONFIG_MQ_IOSCHED_DEADLINE is not set
+# CONFIG_MQ_IOSCHED_KYBER is not set
+# CONFIG_BINFMT_ELF is not set
+# CONFIG_BINFMT_SCRIPT is not set
+# CONFIG_COREDUMP is not set
+# CONFIG_SWAP is not set
+# CONFIG_SLAB_MERGE_DEFAULT is not set
+# CONFIG_COMPAT_BRK is not set
+# CONFIG_COMPACTION is not set
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_CFG80211=y
+CONFIG_CFG80211_INKERNEL=y
+CONFIG_CFG80211_CERTIFICATION_ONUS=y
+# CONFIG_CFG80211_REQUIRE_SIGNED_REGDB is not set
+# CONFIG_CFG80211_DEFAULT_PS is not set
+CONFIG_MAC80211=y
+# CONFIG_PCIEASPM is not set
+# CONFIG_VGA_ARB is not set
+# CONFIG_STANDALONE is not set
+# CONFIG_PREVENT_FIRMWARE_BUILD is not set
+CONFIG_EXTRA_FIRMWARE="iwlwifi-9000-pu-b0-jf-b0-46.ucode regulatory.db regulatory.db.p7s"
+CONFIG_BLK_DEV_UBD=y
+CONFIG_BLK_DEV_NVME=y
+CONFIG_IWLWIFI=y
+CONFIG_IWLMVM=y
+# CONFIG_INPUT_KEYBOARD is not set
+# CONFIG_INPUT_MOUSE is not set
+# CONFIG_SERIO is not set
+# CONFIG_LEGACY_PTYS is not set
+# CONFIG_LEGACY_TIOCSTI is not set
+# CONFIG_LDISC_AUTOLOAD is not set
+# CONFIG_HW_RANDOM is not set
+# CONFIG_DEVMEM is not set
+# CONFIG_HID_SUPPORT is not set
+# CONFIG_VIRTIO_MENU is not set
+# CONFIG_VHOST_MENU is not set
+# CONFIG_IOMMU_SUPPORT is not set
+# CONFIG_DNOTIFY is not set
+# CONFIG_INOTIFY_USER is not set
+# CONFIG_PROC_FS is not set
+# CONFIG_SYSFS is not set
+# CONFIG_MISC_FILESYSTEMS is not set
+CONFIG_KEYS=y
+CONFIG_CRYPTO_RSA=y
+CONFIG_CRYPTO_SHA256=y
+CONFIG_ASYMMETRIC_KEY_TYPE=y
+CONFIG_ASYMMETRIC_PUBLIC_KEY_SUBTYPE=y
+CONFIG_X509_CERTIFICATE_PARSER=y
+CONFIG_PKCS7_MESSAGE_PARSER=y
+CONFIG_SYSTEM_TRUSTED_KEYRING=y
+CONFIG_PRINTK_TIME=y
+# CONFIG_SYMBOLIC_ERRNAME is not set
+CONFIG_FRAME_WARN=1280
+# CONFIG_SECTION_MISMATCH_WARN_ONLY is not set
+CONFIG_DEBUG_MEMORY_INIT=y
+# CONFIG_RCU_TRACE is not set
+# CONFIG_FTRACE is not set
+# CONFIG_RUNTIME_TESTING_MENU is not set

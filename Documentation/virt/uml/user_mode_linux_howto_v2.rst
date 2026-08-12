@@ -1215,7 +1215,7 @@ friends have to be off too. It also makes the userspace-facing subsystems
 (``CONFIG_FUTEX``, ``CONFIG_EPOLL``, ``CONFIG_AIO``, ``CONFIG_IO_URING`` and
 so on) pure dead weight, which is worth turning off as well.
 
-``arch/um/configs/nvme_defconfig`` is a worked example: a kernel-only build
+``arch/um/configs/vkage_nvme_defconfig`` is a worked example: a kernel-only build
 carrying the NVMe driver and VFIO-based PCI passthrough and very little else.
 Combined with ``CONFIG_UML_PCI_OVER_VFIO`` it lets a real NVMe device be
 driven from a UML kernel with no guest userspace underneath it::
