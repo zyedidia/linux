@@ -57,6 +57,11 @@
 #define UMVD_WLAN_FRAME_MAX	2048
 #define UMVD_WLAN_RESP_MAX	4096
 #define UMVD_WLAN_MAX_SCAN_BSS	32
+/*
+ * Events the host has not yet posted buffers for wait here. A scan
+ * report is the largest burst: MAX_SCAN_BSS results plus SCAN_DONE.
+ */
+#define UMVD_WLAN_PENDING_EV_MAX	64
 /* Long enough for a firmware load; ~15 s total. */
 #define UMVD_WLAN_ATTACH_TRIES		150
 #define UMVD_WLAN_ATTACH_DELAY_MS	100
@@ -80,6 +85,14 @@ struct umvd_wlan_parked {
 	struct umvd_request *req;
 };
 
+/* An event formatted while the host had no buffer to receive it. */
+struct umvd_wlan_pending_ev {
+	struct list_head list;
+	u16 type;
+	u16 len;
+	u8 payload[];
+};
+
 struct umvd_wlan {
 	struct umvd_dev *dev;
 	struct cfg80211_ik *ik;
@@ -88,6 +101,10 @@ struct umvd_wlan {
 	spinlock_t lock;
 	struct list_head event_reqs;
 	struct list_head rx_reqs;
+	struct list_head pending_evs;
+	unsigned int pending_ev_count;
+	/* Serialises drains of pending_evs so events stay in order. */
+	spinlock_t flush_lock;
 	bool running;
 	bool rx_handler_set;
 
@@ -213,27 +230,12 @@ static void drain_parked(struct umvd_wlan *w, struct list_head *head)
 
 /* Events */
 
-static void wlan_emit_event(struct umvd_wlan *w, u16 type,
-			    const void *payload, size_t len)
+/* Write one event into a host buffer and complete it. */
+static void wlan_event_to_req(struct umvd_wlan *w, struct umvd_request *req,
+			      u16 type, const void *payload, size_t len)
 {
 	struct virtio_wlan_event_hdr hdr;
-	struct umvd_request *req;
 	size_t written;
-
-	if (sizeof(hdr) + len > UMVD_WLAN_EVENT_MAX) {
-		w->events_dropped++;
-		pr_warn_ratelimited("umvduse-wlan: event %u too large (%zu)\n",
-				    type, len);
-		return;
-	}
-
-	req = take_request(w, &w->event_reqs);
-	if (!req) {
-		w->events_dropped++;
-		pr_warn_ratelimited("umvduse-wlan: no event buffer, dropped event %u (total %llu)\n",
-				    type, w->events_dropped);
-		return;
-	}
 
 	if (kiov_len(&req->wiov) < sizeof(hdr) + len) {
 		/* hdr.len must never describe more than was written. */
@@ -275,6 +277,145 @@ static void wlan_emit_event(struct umvd_wlan *w, u16 type,
 	}
 
 	umvd_request_complete(req, written);
+}
+
+/*
+ * The host replenishes event buffers only after consuming some, so a
+ * burst larger than what it has posted (a scan report) cannot be
+ * emitted in one go. Rather than dropping the tail - which loses
+ * SCAN_DONE and strands the host's scan until its timer aborts it -
+ * the overflow waits on pending_evs and drains as buffers come back.
+ */
+static void wlan_queue_event(struct umvd_wlan *w, u16 type,
+			     const void *payload, size_t len)
+{
+	struct umvd_wlan_pending_ev *ev, *victim = NULL;
+
+	ev = kmalloc(sizeof(*ev) + len, GFP_ATOMIC);
+	if (!ev) {
+		w->events_dropped++;
+		return;
+	}
+	ev->type = type;
+	ev->len = (u16)len;
+	memcpy(ev->payload, payload, len);
+
+	scoped_guard(spinlock_irqsave, &w->lock) {
+		if (w->pending_ev_count >= UMVD_WLAN_PENDING_EV_MAX) {
+			struct umvd_wlan_pending_ev *p;
+
+			/*
+			 * Evict a scan result before anything else: the
+			 * other event types carry connection state the
+			 * host cannot recover on its own.
+			 */
+			list_for_each_entry(p, &w->pending_evs, list) {
+				if (p->type == VIRTIO_WLAN_EV_SCAN_RESULT) {
+					victim = p;
+					break;
+				}
+			}
+			if (!victim)
+				victim = list_first_entry(&w->pending_evs,
+						struct umvd_wlan_pending_ev,
+						list);
+			list_del(&victim->list);
+			w->pending_ev_count--;
+			w->events_dropped++;
+		}
+		list_add_tail(&ev->list, &w->pending_evs);
+		w->pending_ev_count++;
+	}
+
+	if (victim) {
+		pr_warn_ratelimited("umvduse-wlan: pending events full, dropped event %u (total %llu)\n",
+				    victim->type, w->events_dropped);
+		kfree(victim);
+	}
+}
+
+static void wlan_flush_events(struct umvd_wlan *w)
+{
+	unsigned long flags;
+
+	/* One drainer at a time keeps the events in order. */
+	if (!spin_trylock_irqsave(&w->flush_lock, flags))
+		return;
+
+	for (;;) {
+		struct umvd_wlan_pending_ev *ev;
+		struct umvd_request *req;
+
+		scoped_guard(spinlock_irqsave, &w->lock) {
+			ev = list_first_entry_or_null(&w->pending_evs,
+					struct umvd_wlan_pending_ev, list);
+			if (ev) {
+				list_del(&ev->list);
+				w->pending_ev_count--;
+			}
+		}
+		if (!ev)
+			break;
+
+		req = take_request(w, &w->event_reqs);
+		if (!req) {
+			/* Put it back at the head; order is preserved. */
+			scoped_guard(spinlock_irqsave, &w->lock) {
+				list_add(&ev->list, &w->pending_evs);
+				w->pending_ev_count++;
+			}
+			break;
+		}
+
+		wlan_event_to_req(w, req, ev->type, ev->payload, ev->len);
+		kfree(ev);
+	}
+
+	spin_unlock_irqrestore(&w->flush_lock, flags);
+}
+
+static void drain_pending_events(struct umvd_wlan *w)
+{
+	struct umvd_wlan_pending_ev *ev, *n;
+	LIST_HEAD(dead);
+
+	scoped_guard(spinlock_irqsave, &w->lock) {
+		list_splice_init(&w->pending_evs, &dead);
+		w->pending_ev_count = 0;
+	}
+
+	list_for_each_entry_safe(ev, n, &dead, list) {
+		list_del(&ev->list);
+		kfree(ev);
+	}
+}
+
+static void wlan_emit_event(struct umvd_wlan *w, u16 type,
+			    const void *payload, size_t len)
+{
+	struct umvd_request *req;
+	bool behind;
+
+	if (sizeof(struct virtio_wlan_event_hdr) + len > UMVD_WLAN_EVENT_MAX) {
+		w->events_dropped++;
+		pr_warn_ratelimited("umvduse-wlan: event %u too large (%zu)\n",
+				    type, len);
+		return;
+	}
+
+	/* Queued events must go out ahead of new ones. */
+	scoped_guard(spinlock_irqsave, &w->lock)
+		behind = !list_empty(&w->pending_evs);
+
+	req = behind ? NULL : take_request(w, &w->event_reqs);
+	if (!req) {
+		wlan_queue_event(w, type, payload, len);
+		/* Buffers may have been parked since the check above. */
+		wlan_flush_events(w);
+		return;
+	}
+
+	wlan_event_to_req(w, req, type, payload, len);
 }
 
 /*
@@ -1037,6 +1178,7 @@ static void wlan_handle(struct umvd_dev *dev, struct umvd_request *req)
 		break;
 	case VIRTIO_WLAN_VQ_EVENT:
 		park_request(w, &w->event_reqs, req);
+		wlan_flush_events(w);
 		break;
 	default:
 		umvd_request_complete(req, 0);
@@ -1157,6 +1299,7 @@ static void wlan_reset(struct umvd_dev *dev)
 	/* Hand every parked buffer back; the transport discards them. */
 	drain_parked(w, &w->rx_reqs);
 	drain_parked(w, &w->event_reqs);
+	drain_pending_events(w);
 }
 
 static void wlan_remove(struct umvd_dev *dev)
@@ -1187,8 +1330,10 @@ static int __init umvduse_wlan_init(void)
 		return -ENOMEM;
 
 	spin_lock_init(&w->lock);
+	spin_lock_init(&w->flush_lock);
 	INIT_LIST_HEAD(&w->event_reqs);
 	INIT_LIST_HEAD(&w->rx_reqs);
+	INIT_LIST_HEAD(&w->pending_evs);
 	INIT_WORK(&w->scan_work, wlan_scan_work);
 	atomic_set(&w->scan_pending, 0);
 
