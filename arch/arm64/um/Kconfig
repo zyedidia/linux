@@ -5,7 +5,6 @@ config UML_ARM64
 	select ARCH_SUPPORTS_ATOMIC_RMW
 	select ARCH_USE_QUEUED_RWLOCKS
 	select ARCH_USE_QUEUED_SPINLOCKS
-	select GENERIC_CSUM
 	select HAVE_EFFICIENT_UNALIGNED_ACCESS
 	select HAVE_PAGE_SIZE_16KB
 	select HAVE_PAGE_SIZE_64KB
@@ -16,6 +15,11 @@ config UML_ARM64
 	select UML_NO_USERSPACE
 
 config 64BIT
+	def_bool y
+
+# The symbol has no central definition; every arch that uses the plain C
+# checksums from lib/checksum.c defines it for itself.
+config GENERIC_CSUM
 	def_bool y
 
 config GENERIC_HWEIGHT
