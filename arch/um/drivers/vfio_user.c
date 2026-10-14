@@ -496,18 +496,25 @@ int uml_vfio_user_update_irqs(struct uml_vfio_user_device *dev)
 int uml_vfio_user_set_irq_type(struct uml_vfio_user_device *dev,
 			       enum uml_vfio_irq_type type)
 {
-	if (dev->irq_type == type)
-		return 0;
+	if (dev->irq_type != type) {
+		if (type == UML_VFIO_IRQ_MSI && !dev->msi_count)
+			return -EOPNOTSUPP;
+		if (type == UML_VFIO_IRQ_MSIX && !dev->msix_count)
+			return -EOPNOTSUPP;
 
-	if (type == UML_VFIO_IRQ_MSI && !dev->msi_count)
-		return -EOPNOTSUPP;
-	if (type == UML_VFIO_IRQ_MSIX && !dev->msix_count)
-		return -EOPNOTSUPP;
+		/* The host permits only one mode at a time. */
+		vfio_disable_irqs(dev->device, uml_vfio_user_irq_index(dev));
+		dev->irq_type = type;
+	}
 
-	/* The host permits only one mode at a time. */
-	vfio_disable_irqs(dev->device, uml_vfio_user_irq_index(dev));
-	dev->irq_type = type;
-
+	/*
+	 * Push the current eventfd set even when the mode is unchanged:
+	 * enabling is the guest's signal that the vectors it activated
+	 * should start firing, and until now the host may only have seen
+	 * the empty trigger set from setup time. Without this, a device
+	 * whose mode matches the setup-time default (e.g. MSI-only) gets
+	 * its interrupts dropped on the host with no trigger assigned.
+	 */
 	return uml_vfio_user_update_irqs(dev);
 }
 
