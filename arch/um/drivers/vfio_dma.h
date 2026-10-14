@@ -7,6 +7,7 @@ struct dma_map_ops;
 extern const struct dma_map_ops uml_vfio_dma_ops;
 
 int uml_vfio_dma_init(int container_fd);
+bool uml_vfio_dma_initialized(void);
 void uml_vfio_dma_exit(void);
 
 #endif /* __UM_VFIO_DMA_H */

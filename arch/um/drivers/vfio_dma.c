@@ -79,6 +79,17 @@ static void uml_vfio_dma_unmap_range(dma_addr_t addr, size_t size)
 	free_iova_fast(&uml_vfio_iovad, iova >> shift, len >> shift);
 }
 
+/*
+ * Highest IOVA a mapping for @dev may get. Like dma-direct, honour an
+ * upstream bus limit as well as the driver's mask: on some hosts the
+ * IOMMU translates 48 bits but the device's interconnect only carries
+ * 40, so a 64-bit mask alone would hand out IOVAs the device can't emit.
+ */
+static u64 uml_vfio_dma_limit(struct device *dev, u64 mask)
+{
+	return min_not_zero(mask, dev->bus_dma_limit);
+}
+
 static dma_addr_t uml_vfio_dma_map_phys(struct device *dev, phys_addr_t phys,
 					size_t size,
 					enum dma_data_direction dir,
@@ -91,7 +102,8 @@ static dma_addr_t uml_vfio_dma_map_phys(struct device *dev, phys_addr_t phys,
 	if (attrs & DMA_ATTR_MMIO)
 		return DMA_MAPPING_ERROR;
 
-	return uml_vfio_dma_map_range(dma_get_mask(dev), phys, size);
+	return uml_vfio_dma_map_range(uml_vfio_dma_limit(dev, dma_get_mask(dev)),
+				      phys, size);
 }
 
 static void uml_vfio_dma_unmap_phys(struct device *dev, dma_addr_t addr,
@@ -113,8 +125,8 @@ static int uml_vfio_dma_map_sg(struct device *dev, struct scatterlist *sgl,
 	int i, j;
 
 	for_each_sg(sgl, sg, nents, i) {
-		addr = uml_vfio_dma_map_range(dma_get_mask(dev), sg_phys(sg),
-					      sg->length);
+		addr = uml_vfio_dma_map_range(uml_vfio_dma_limit(dev, dma_get_mask(dev)),
+					      sg_phys(sg), sg->length);
 		if (addr == DMA_MAPPING_ERROR)
 			goto unwind;
 		sg->dma_address = addr;
@@ -152,8 +164,8 @@ static void *uml_vfio_dma_alloc(struct device *dev, size_t size,
 	if (!vaddr)
 		return NULL;
 
-	addr = uml_vfio_dma_map_range(dev->coherent_dma_mask, __pa(vaddr),
-				      size);
+	addr = uml_vfio_dma_map_range(uml_vfio_dma_limit(dev, dev->coherent_dma_mask),
+				      __pa(vaddr), size);
 	if (addr == DMA_MAPPING_ERROR) {
 		free_pages_exact(vaddr, size);
 		return NULL;
@@ -183,7 +195,7 @@ static struct page *uml_vfio_dma_alloc_pages(struct device *dev, size_t size,
 	if (!page)
 		return NULL;
 
-	addr = uml_vfio_dma_map_range(dev->coherent_dma_mask,
+	addr = uml_vfio_dma_map_range(uml_vfio_dma_limit(dev, dev->coherent_dma_mask),
 				      page_to_phys(page), size);
 	if (addr == DMA_MAPPING_ERROR) {
 		__free_pages(page, get_order(size));
@@ -365,6 +377,11 @@ int uml_vfio_dma_init(int container_fd)
 put_cache:
 	iova_cache_put();
 	return err;
+}
+
+bool uml_vfio_dma_initialized(void)
+{
+	return uml_vfio_dma_fd >= 0;
 }
 
 void uml_vfio_dma_exit(void)

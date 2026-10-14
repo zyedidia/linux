@@ -114,12 +114,12 @@ static int uml_vfio_set_container(int group_fd)
 	if (err)
 		goto unset;
 
-	if (uml_vfio_eager_dma)
+	/* On-demand DMA is set up later, see uml_vfio_dma_ready(). */
+	if (uml_vfio_eager_dma) {
 		err = uml_vfio_user_map_physmem(uml_vfio_container.fd);
-	else
-		err = uml_vfio_dma_init(uml_vfio_container.fd);
-	if (err)
-		goto unset;
+		if (err)
+			goto unset;
+	}
 
 	return 0;
 
@@ -137,6 +137,25 @@ static void uml_vfio_unset_container(int group_fd)
 	uml_vfio_container.users--;
 	if (!uml_vfio_container.users)
 		uml_vfio_dma_exit();
+}
+
+/*
+ * Seed the on-demand DMA allocator from the host's usable IOVA ranges.
+ * Those are only right once a device is attached: with iommufd's VFIO
+ * compat container the IOMMU domain, and with it the aperture, arrives
+ * with the first device fd rather than with VFIO_SET_IOMMU, and until
+ * then the whole 64-bit space is reported. So this runs after a device
+ * is opened and before its driver can map anything. Later devices are
+ * assumed to share the first one's aperture.
+ */
+static int uml_vfio_dma_ready(void)
+{
+	guard(mutex)(&uml_vfio_container_mtx);
+
+	if (uml_vfio_eager_dma || uml_vfio_dma_initialized())
+		return 0;
+
+	return uml_vfio_dma_init(uml_vfio_container.fd);
 }
 
 static int uml_vfio_open_group(int group_id)
@@ -732,7 +751,7 @@ static int uml_vfio_read_irq_cap(struct uml_vfio_device *dev)
 static void uml_vfio_open_device(struct uml_vfio_device *dev)
 {
 	struct uml_vfio_intr_ctx *ctx;
-	int err, group_id, i;
+	int err, group_id, dma_bits, i;
 
 	group_id = uml_vfio_user_get_group_id(dev->name);
 	if (group_id < 0) {
@@ -753,6 +772,20 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 		pr_err("Failed to setup device (%s), error %d\n",
 		       dev->name, err);
 		goto release_group;
+	}
+
+	err = uml_vfio_dma_ready();
+	if (err) {
+		pr_err("Failed to set up DMA (%s), error %d\n",
+		       dev->name, err);
+		goto teardown_udev;
+	}
+
+	dma_bits = uml_vfio_user_iort_dma_bits("pci", dev->name);
+	if (dma_bits) {
+		dev->pdev.dma_limit = DMA_BIT_MASK(dma_bits);
+		pr_info("%s: DMA limited to %d bits by the host's IORT\n",
+			dev->name, dma_bits);
 	}
 
 	err = uml_vfio_read_irq_cap(dev);

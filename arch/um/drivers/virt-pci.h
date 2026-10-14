@@ -16,6 +16,9 @@ struct um_pci_device {
 	 */
 	const struct dma_map_ops *dma_ops;
 
+	/* Optional bus_dma_limit for the PCI device, 0 for none. */
+	u64 dma_limit;
+
 	/* for now just standard BARs */
 	u8 resptr[PCI_STD_NUM_BARS];
 

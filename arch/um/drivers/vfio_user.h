@@ -76,4 +76,12 @@ int uml_vfio_user_bar_read(struct uml_vfio_user_device *dev, int bar,
 int uml_vfio_user_bar_write(struct uml_vfio_user_device *dev, int bar,
 			    unsigned int offset, const void *buf, int size);
 
+/*
+ * DMA address width the firmware gives @device, in bits, from the host's
+ * ACPI IORT; 0 if there is no IORT or it does not limit the device. The
+ * host kernel applies this as the device's bus_dma_limit, and a device
+ * handed IOVAs above it faults.
+ */
+int uml_vfio_user_iort_dma_bits(const char *bus, const char *device);
+
 #endif /* __UM_VFIO_USER_H */

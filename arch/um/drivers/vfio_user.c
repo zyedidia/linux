@@ -567,3 +567,152 @@ int uml_vfio_user_bar_write(struct uml_vfio_user_device *dev, int bar,
 {
 	return vfio_region_write(dev, bar, offset, buf, size);
 }
+
+/* ---- ACPI IORT ---------------------------------------------------- */
+
+#define IORT_NODE_NAMED_COMPONENT	1
+#define IORT_NODE_PCI_ROOT_COMPLEX	2
+
+static void *read_whole_file(const char *path, int *len)
+{
+	int fd, n, size = 0, cap = 4096;
+	char *buf = NULL, *nbuf;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return NULL;
+
+	for (;;) {
+		nbuf = uml_kmalloc(cap, UM_GFP_KERNEL);
+		if (!nbuf)
+			goto fail;
+		if (buf) {
+			memcpy(nbuf, buf, size);
+			kfree(buf);
+		}
+		buf = nbuf;
+
+		while (size < cap) {
+			n = read(fd, buf + size, cap - size);
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n < 0)
+				goto fail;
+			if (n == 0)
+				goto done;
+			size += n;
+		}
+		if (cap >= 1 << 20)
+			goto fail;
+		cap *= 2;
+	}
+
+done:
+	close(fd);
+	*len = size;
+	return buf;
+
+fail:
+	kfree(buf);
+	close(fd);
+	return NULL;
+}
+
+/*
+ * Walk the IORT for the node describing a device: a named component
+ * whose object name is @acpi_path, or the root complex for PCI segment
+ * @segment (when @acpi_path is NULL). Returns its memory address size
+ * limit in bits, or 0.
+ */
+static int iort_dma_bits(const char *acpi_path, unsigned int segment)
+{
+	const uint8_t *t, *node;
+	uint32_t nnodes, off, len, i;
+	int file_len, bits = 0;
+
+	t = read_whole_file("/sys/firmware/acpi/tables/IORT", &file_len);
+	if (!t)
+		return 0;
+	if (file_len < 48)
+		goto out;
+	len = file_len;
+
+	memcpy(&nnodes, t + 36, 4);
+	memcpy(&off, t + 40, 4);
+
+	for (i = 0; i < nnodes; i++) {
+		uint16_t node_len;
+
+		if (off > len - 4)
+			break;
+		node = t + off;
+		memcpy(&node_len, node + 1, 2);
+		if (node_len < 4 || node_len > len - off)
+			break;
+
+		if (acpi_path && node[0] == IORT_NODE_NAMED_COMPONENT &&
+		    node_len > 0x1d) {
+			/* limit at 0x1c, NUL-terminated object name at 0x1d */
+			int name_len = strnlen((const char *)node + 0x1d,
+					       node_len - 0x1d);
+
+			if (name_len < node_len - 0x1d &&
+			    !strcmp((const char *)node + 0x1d, acpi_path)) {
+				bits = node[0x1c];
+				break;
+			}
+		}
+
+		if (!acpi_path && node[0] == IORT_NODE_PCI_ROOT_COMPLEX &&
+		    node[3] >= 1 && node_len > 0x20) {
+			/* segment at 0x1c, limit at 0x20 since revision 1 */
+			uint32_t seg;
+
+			memcpy(&seg, node + 0x1c, 4);
+			if (seg == segment) {
+				bits = node[0x20];
+				break;
+			}
+		}
+
+		off += node_len;
+	}
+
+out:
+	kfree((void *)t);
+	return bits;
+}
+
+int uml_vfio_user_iort_dma_bits(const char *bus, const char *device)
+{
+	char *path, *acpi_path;
+	int bits = 0, n, fd;
+
+	if (!strcmp(bus, "pci"))
+		return iort_dma_bits(NULL, strtoul(device, NULL, 16));
+
+	path = uml_kmalloc(PATH_MAX, UM_GFP_KERNEL);
+	acpi_path = uml_kmalloc(256, UM_GFP_KERNEL);
+	if (!path || !acpi_path)
+		goto out;
+
+	snprintf(path, PATH_MAX, "/sys/bus/%s/devices/%s/firmware_node/path",
+		 bus, device);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		goto out;
+	n = read(fd, acpi_path, 255);
+	close(fd);
+	if (n <= 0)
+		goto out;
+	acpi_path[n] = '\0';
+	if (acpi_path[n - 1] == '\n')
+		acpi_path[n - 1] = '\0';
+
+	bits = iort_dma_bits(acpi_path, 0);
+
+out:
+	kfree(acpi_path);
+	kfree(path);
+	return bits;
+}

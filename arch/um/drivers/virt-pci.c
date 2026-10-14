@@ -468,6 +468,8 @@ void pcibios_bus_add_device(struct pci_dev *pdev)
 	reg = &um_pci_devices[pdev->devfn / 8];
 	if (reg->dev && reg->dev->dma_ops)
 		set_dma_ops(&pdev->dev, reg->dev->dma_ops);
+	if (reg->dev && reg->dev->dma_limit)
+		pdev->dev.bus_dma_limit = reg->dev->dma_limit;
 }
 
 void *pci_root_bus_fwnode(struct pci_bus *bus)
