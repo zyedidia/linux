@@ -25,7 +25,7 @@ obj-$(CONFIG_UML_X86) += capflags.o
 
 # Everything under skas/ exists only to host userspace processes.
 obj-$(CONFIG_UML_USERSPACE) += exec.o skas/
-obj-$(CONFIG_UML_NO_USERSPACE) += nouser.o
+obj-$(CONFIG_UML_NO_USERSPACE) += nouser.o sigpower.o
 
 obj-$(CONFIG_BLK_DEV_INITRD) += initrd.o
 obj-$(CONFIG_INDIRECT_IOMEM_FALLBACK) += iomem.o

@@ -271,6 +271,7 @@ extern void os_info(const char *fmt, ...)
 	__attribute__ ((format (printf, 1, 2)));
 extern void os_warn(const char *fmt, ...)
 	__attribute__ ((format (printf, 1, 2)));
+extern void os_arm_graceful_exit(int fd);
 
 /* time.c */
 void os_idle_prepare(void);

@@ -74,6 +74,40 @@ static void __init install_fatal_handler(int sig)
 	}
 }
 
+static int graceful_exit_fd = -1;
+
+static void graceful_exit(int sig)
+{
+	char c = 1;
+
+	/*
+	 * Ask the kernel side for an orderly power-off, so that every
+	 * driver's .shutdown runs before the process exits. If the
+	 * request cannot be delivered, fall back to the immediate exit.
+	 * Either way SA_RESETHAND has already re-armed the default
+	 * action: a second signal kills the process on the spot.
+	 */
+	if (graceful_exit_fd < 0 ||
+	    write(graceful_exit_fd, &c, sizeof(c)) != sizeof(c))
+		last_ditch_exit(sig);
+}
+
+void os_arm_graceful_exit(int fd)
+{
+	struct sigaction action;
+
+	graceful_exit_fd = fd;
+
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = SA_RESETHAND | SA_NODEFER;
+	action.sa_restorer = NULL;
+	action.sa_handler = graceful_exit;
+	if (sigaction(SIGINT, &action, NULL) < 0 ||
+	    sigaction(SIGTERM, &action, NULL) < 0)
+		os_warn("failed to install graceful exit handler "
+			"- errno = %d\n", errno);
+}
+
 #define UML_LIB_PATH	":" OS_LIB_PATH "/uml"
 
 static void __init setup_env_path(void)
