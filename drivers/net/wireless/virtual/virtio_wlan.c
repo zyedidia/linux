@@ -65,7 +65,7 @@ static_assert(offsetof(struct virtio_wlan_station_info, rx_packets) % 8 == 0);
 #define VWLAN_CMD_BUF_SIZE	4096
 #define VWLAN_RESP_BUF_SIZE	8192
 #define VWLAN_EVENT_BUF_SIZE	2048
-#define VWLAN_NUM_EVENT_BUFS	16
+#define VWLAN_NUM_EVENT_BUFS	64
 #define VWLAN_RX_BUF_SIZE	2048
 #define VWLAN_CMD_TIMEOUT	msecs_to_jiffies(5000)
 #define VWLAN_SCAN_TIMEOUT	msecs_to_jiffies(15000)
