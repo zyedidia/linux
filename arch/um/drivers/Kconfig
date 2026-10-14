@@ -202,6 +202,21 @@ config UML_PCI_OVER_VFIO
 	  with vfio_uml.eager_dma=1 to instead map and pin all of
 	  physmem up front, as older kernels did.
 
+config UML_PLATFORM_OVER_VFIO
+	bool "Enable VFIO-based platform device passthrough"
+	depends on UML_PCI_OVER_VFIO
+	help
+	  Pass through host platform devices bound to vfio-platform,
+	  e.g. ACPI xHCI controllers on arm64 systems where USB is not
+	  behind PCI. Each one is recreated as a UML platform device with
+	  the same MMIO regions and interrupts and bound to an ordinary
+	  platform driver (vfio_uml.platform=<device>[,<driver>]).
+
+	  The host's level-triggered interrupts are automasked by
+	  vfio-platform and unmasked once the UML handler has run. A
+	  platform device has no MSI domain, so the host has to allow it
+	  with iommufd's (or vfio_iommu_type1's) allow_unsafe_interrupts.
+
 config UMVDUSE
 	bool "Export a UML-driven device to the host over VDUSE"
 	select VHOST_RING

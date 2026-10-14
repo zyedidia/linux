@@ -21,6 +21,7 @@
 #include "virt-pci.h"
 #include "vfio_user.h"
 #include "vfio_dma.h"
+#include "vfio_kern.h"
 
 #define to_vdev(_pdev) container_of(_pdev, struct uml_vfio_device, pdev)
 
@@ -79,7 +80,7 @@ static DEFINE_MUTEX(uml_vfio_container_mtx);
  * Setting eager_dma restores the old behavior: all of physmem is
  * mapped (and pinned) up front and devices use dma-direct.
  */
-static bool uml_vfio_eager_dma;
+bool uml_vfio_eager_dma;
 module_param_named(eager_dma, uml_vfio_eager_dma, bool, 0444);
 MODULE_PARM_DESC(eager_dma,
 		 "Map (and pin) all of physmem for DMA at startup instead of mapping on demand");
@@ -148,7 +149,7 @@ static void uml_vfio_unset_container(int group_fd)
  * is opened and before its driver can map anything. Later devices are
  * assumed to share the first one's aperture.
  */
-static int uml_vfio_dma_ready(void)
+int uml_vfio_dma_ready(void)
 {
 	guard(mutex)(&uml_vfio_container_mtx);
 
@@ -158,7 +159,24 @@ static int uml_vfio_dma_ready(void)
 	return uml_vfio_dma_init(uml_vfio_container.fd);
 }
 
-static int uml_vfio_open_group(int group_id)
+/* Open the container all groups share, on first use. */
+int uml_vfio_open_container(void)
+{
+	int fd;
+
+	guard(mutex)(&uml_vfio_container_mtx);
+
+	if (uml_vfio_container.fd >= 0)
+		return 0;
+
+	fd = uml_vfio_user_open_container();
+	if (fd < 0)
+		return fd;
+	uml_vfio_container.fd = fd;
+	return 0;
+}
+
+int uml_vfio_open_group(int group_id)
 {
 	struct uml_vfio_group *group;
 	int err;
@@ -200,7 +218,7 @@ free_group:
 	return err;
 }
 
-static int uml_vfio_release_group(int group_fd)
+int uml_vfio_release_group(int group_fd)
 {
 	struct uml_vfio_group *group;
 
@@ -753,7 +771,7 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 	struct uml_vfio_intr_ctx *ctx;
 	int err, group_id, dma_bits, i;
 
-	group_id = uml_vfio_user_get_group_id(dev->name);
+	group_id = uml_vfio_user_get_group_id("pci", dev->name);
 	if (group_id < 0) {
 		pr_err("Failed to get group id (%s), error %d\n",
 		       dev->name, group_id);
@@ -872,16 +890,13 @@ static struct uml_vfio_device *uml_vfio_find_device(const char *device)
 static struct uml_vfio_device *uml_vfio_add_device(const char *device)
 {
 	struct uml_vfio_device *dev;
-	int fd;
+	int err;
 
 	guard(mutex)(&uml_vfio_devices_mtx);
 
-	if (uml_vfio_container.fd < 0) {
-		fd = uml_vfio_user_open_container();
-		if (fd < 0)
-			return ERR_PTR(fd);
-		uml_vfio_container.fd = fd;
-	}
+	err = uml_vfio_open_container();
+	if (err)
+		return ERR_PTR(err);
 
 	if (uml_vfio_find_device(device))
 		return ERR_PTR(-EEXIST);
@@ -976,6 +991,8 @@ static int __init uml_vfio_init(void)
 	list_for_each_entry_safe(dev, n, &uml_vfio_devices, list)
 		uml_vfio_open_device(dev);
 
+	uml_vfio_platform_init();
+
 	mconsole_register_dev(&uml_vfio_mc);
 
 	return 0;
@@ -988,6 +1005,8 @@ static void __exit uml_vfio_exit(void)
 
 	list_for_each_entry_safe(dev, n, &uml_vfio_devices, list)
 		uml_vfio_release_device(dev);
+
+	uml_vfio_platform_exit();
 
 	if (uml_vfio_container.fd >= 0)
 		os_close_file(uml_vfio_container.fd);

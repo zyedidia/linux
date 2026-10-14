@@ -184,7 +184,7 @@ int uml_vfio_user_dma_unmap(int container, uint64_t iova, uint64_t size)
 	return 0;
 }
 
-int uml_vfio_user_get_group_id(const char *device)
+int uml_vfio_user_get_group_id(const char *bus, const char *device)
 {
 	char *path, *buf, *end;
 	const char *name;
@@ -194,7 +194,7 @@ int uml_vfio_user_get_group_id(const char *device)
 	if (!path)
 		return -ENOMEM;
 
-	sprintf(path, "/sys/bus/pci/devices/%s/iommu_group", device);
+	sprintf(path, "/sys/bus/%s/devices/%s/iommu_group", bus, device);
 
 	buf = uml_kmalloc(PATH_MAX + 1, UM_GFP_KERNEL);
 	if (!buf) {
@@ -317,11 +317,39 @@ out:
 	return err;
 }
 
-static void vfio_map_region(struct uml_vfio_user_device *dev, int index,
-			    const struct vfio_region_info *region)
+/*
+ * mmap() a region the host allows to be mapped. Returns NULL if it may
+ * not be, or -errno encoded in *err if the mmap() itself failed.
+ */
+static void *vfio_mmap_region(int device, const struct vfio_region_info *region,
+			      int *err)
 {
 	int prot = 0;
 	void *map;
+
+	*err = 0;
+
+	if (!(region->flags & VFIO_REGION_INFO_FLAG_MMAP) || !region->size)
+		return NULL;
+
+	if (region->flags & VFIO_REGION_INFO_FLAG_READ)
+		prot |= PROT_READ;
+	if (region->flags & VFIO_REGION_INFO_FLAG_WRITE)
+		prot |= PROT_WRITE;
+
+	map = mmap(NULL, region->size, prot, MAP_SHARED, device, region->offset);
+	if (map == MAP_FAILED) {
+		*err = -errno;
+		return NULL;
+	}
+
+	return map;
+}
+
+static void vfio_map_region(struct uml_vfio_user_device *dev, int index,
+			    const struct vfio_region_info *region)
+{
+	int err;
 
 	dev->region[index].map = NULL;
 
@@ -329,33 +357,26 @@ static void vfio_map_region(struct uml_vfio_user_device *dev, int index,
 	if (index > VFIO_PCI_BAR5_REGION_INDEX)
 		return;
 
-	if (!(region->flags & VFIO_REGION_INFO_FLAG_MMAP) || !region->size)
-		return;
-
-	if (region->flags & VFIO_REGION_INFO_FLAG_READ)
-		prot |= PROT_READ;
-	if (region->flags & VFIO_REGION_INFO_FLAG_WRITE)
-		prot |= PROT_WRITE;
-
-	map = mmap(NULL, region->size, prot, MAP_SHARED,
-		   dev->device, region->offset);
-	if (map == MAP_FAILED) {
+	dev->region[index].map = vfio_mmap_region(dev->device, region, &err);
+	if (err)
 		printk(UM_KERN_INFO "vfio-uml: cannot mmap BAR%d (error %d), using pread/pwrite\n",
-		       index, errno);
-		return;
-	}
+		       index, -err);
+}
 
-	dev->region[index].map = map;
+static void vfio_unmap_region_array(struct uml_vfio_user_region *region,
+				    int num_regions)
+{
+	int i;
+
+	for (i = 0; i < num_regions; i++) {
+		if (region[i].map)
+			munmap(region[i].map, region[i].size);
+	}
 }
 
 static void vfio_unmap_regions(struct uml_vfio_user_device *dev)
 {
-	int i;
-
-	for (i = 0; i < dev->num_regions; i++) {
-		if (dev->region[i].map)
-			munmap(dev->region[i].map, dev->region[i].size);
-	}
+	vfio_unmap_region_array(dev->region, dev->num_regions);
 }
 
 int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
@@ -518,28 +539,44 @@ int uml_vfio_user_set_irq_type(struct uml_vfio_user_device *dev,
 	return uml_vfio_user_update_irqs(dev);
 }
 
-static int vfio_region_read(struct uml_vfio_user_device *dev, unsigned int index,
-			    uint64_t offset, void *buf, uint64_t size)
+static int __vfio_region_read(int device, const struct uml_vfio_user_region *region,
+			      int num_regions, unsigned int index,
+			      uint64_t offset, void *buf, uint64_t size)
 {
-	if (index >= dev->num_regions || offset + size > dev->region[index].size)
+	if (index >= num_regions || offset + size > region[index].size)
 		return -EINVAL;
 
-	if (pread(dev->device, buf, size, dev->region[index].offset + offset) < 0)
+	if (pread(device, buf, size, region[index].offset + offset) < 0)
 		return -errno;
 
 	return 0;
 }
 
-static int vfio_region_write(struct uml_vfio_user_device *dev, unsigned int index,
-			     uint64_t offset, const void *buf, uint64_t size)
+static int __vfio_region_write(int device, const struct uml_vfio_user_region *region,
+			       int num_regions, unsigned int index,
+			       uint64_t offset, const void *buf, uint64_t size)
 {
-	if (index >= dev->num_regions || offset + size > dev->region[index].size)
+	if (index >= num_regions || offset + size > region[index].size)
 		return -EINVAL;
 
-	if (pwrite(dev->device, buf, size, dev->region[index].offset + offset) < 0)
+	if (pwrite(device, buf, size, region[index].offset + offset) < 0)
 		return -errno;
 
 	return 0;
+}
+
+static int vfio_region_read(struct uml_vfio_user_device *dev, unsigned int index,
+			    uint64_t offset, void *buf, uint64_t size)
+{
+	return __vfio_region_read(dev->device, dev->region, dev->num_regions,
+				  index, offset, buf, size);
+}
+
+static int vfio_region_write(struct uml_vfio_user_device *dev, unsigned int index,
+			     uint64_t offset, const void *buf, uint64_t size)
+{
+	return __vfio_region_write(dev->device, dev->region, dev->num_regions,
+				   index, offset, buf, size);
 }
 
 int uml_vfio_user_cfgspace_read(struct uml_vfio_user_device *dev,
@@ -566,6 +603,193 @@ int uml_vfio_user_bar_write(struct uml_vfio_user_device *dev, int bar,
 			    unsigned int offset, const void *buf, int size)
 {
 	return vfio_region_write(dev, bar, offset, buf, size);
+}
+
+int uml_vfio_user_platform_modalias(const char *device, char *buf, int len)
+{
+	char *path;
+	int fd, r;
+
+	if (len < 2)
+		return -EINVAL;
+
+	path = uml_kmalloc(PATH_MAX, UM_GFP_KERNEL);
+	if (!path)
+		return -ENOMEM;
+
+	snprintf(path, PATH_MAX, "/sys/bus/platform/devices/%s/modalias", device);
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		r = -errno;
+		goto free_path;
+	}
+
+	r = read(fd, buf, len - 1);
+	if (r < 0) {
+		r = -errno;
+		goto close_fd;
+	}
+	buf[r] = '\0';
+	if (r > 0 && buf[r - 1] == '\n')
+		buf[--r] = '\0';
+
+close_fd:
+	close(fd);
+free_path:
+	kfree(path);
+	return r;
+}
+
+int uml_vfio_user_setup_platform(struct uml_vfio_user_platform *dev,
+				 int group, const char *device)
+{
+	struct vfio_device_info device_info = { .argsz = sizeof(device_info) };
+	int err, i;
+
+	dev->device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, device);
+	if (dev->device < 0)
+		return -errno;
+
+	if (ioctl(dev->device, VFIO_DEVICE_GET_INFO, &device_info) < 0) {
+		err = -errno;
+		goto close_device;
+	}
+
+	if (!(device_info.flags & VFIO_DEVICE_FLAGS_PLATFORM)) {
+		err = -ENODEV;
+		goto close_device;
+	}
+
+	dev->num_regions = device_info.num_regions;
+	dev->num_irqs = device_info.num_irqs;
+
+	dev->region = uml_kmalloc(sizeof(*dev->region) * (dev->num_regions + 1),
+				  UM_GFP_KERNEL);
+	dev->irq_flags = uml_kmalloc(sizeof(*dev->irq_flags) * (dev->num_irqs + 1),
+				     UM_GFP_KERNEL);
+	if (!dev->region || !dev->irq_flags) {
+		err = -ENOMEM;
+		goto free;
+	}
+	memset(dev->region, 0, sizeof(*dev->region) * dev->num_regions);
+
+	for (i = 0; i < dev->num_regions; i++) {
+		struct vfio_region_info region = {
+			.argsz = sizeof(region),
+			.index = i,
+		};
+
+		if (ioctl(dev->device, VFIO_DEVICE_GET_REGION_INFO, &region) < 0) {
+			err = -errno;
+			goto unmap_region;
+		}
+		dev->region[i].size = region.size;
+		dev->region[i].offset = region.offset;
+		/*
+		 * vfio-platform offers mmap only for page-aligned regions;
+		 * the rest go through pread/pwrite, which is fine.
+		 */
+		dev->region[i].map = vfio_mmap_region(dev->device, &region, &err);
+		if (err)
+			printk(UM_KERN_INFO "vfio-uml: %s: cannot mmap region %d (error %d), using pread/pwrite\n",
+			       device, i, -err);
+	}
+
+	for (i = 0; i < dev->num_irqs; i++) {
+		struct vfio_irq_info irq_info = {
+			.argsz = sizeof(irq_info),
+			.index = i,
+		};
+
+		if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
+			err = -errno;
+			goto unmap_region;
+		}
+		if (irq_info.count != 1 ||
+		    !(irq_info.flags & VFIO_IRQ_INFO_EVENTFD)) {
+			err = -EOPNOTSUPP;
+			goto unmap_region;
+		}
+		dev->irq_flags[i] = irq_info.flags;
+	}
+
+	return 0;
+
+unmap_region:
+	vfio_unmap_region_array(dev->region, dev->num_regions);
+free:
+	kfree(dev->irq_flags);
+	kfree(dev->region);
+close_device:
+	close(dev->device);
+	return err;
+}
+
+void uml_vfio_user_teardown_platform(struct uml_vfio_user_platform *dev)
+{
+	vfio_unmap_region_array(dev->region, dev->num_regions);
+	kfree(dev->irq_flags);
+	kfree(dev->region);
+	close(dev->device);
+}
+
+int uml_vfio_user_platform_activate_irq(struct uml_vfio_user_platform *dev,
+					int index)
+{
+	int fd, err;
+
+	fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	err = vfio_set_irqs(dev->device, index, 0, 1, &fd);
+	if (err) {
+		close(fd);
+		return err;
+	}
+
+	return fd;
+}
+
+void uml_vfio_user_platform_deactivate_irq(struct uml_vfio_user_platform *dev,
+					   int index, int fd)
+{
+	vfio_disable_irqs(dev->device, index);
+	close(fd);
+}
+
+int uml_vfio_user_platform_mask_irq(struct uml_vfio_user_platform *dev,
+				    int index, int mask)
+{
+	struct vfio_irq_set irq_set = {
+		.argsz = sizeof(irq_set),
+		.flags = VFIO_IRQ_SET_DATA_NONE |
+			 (mask ? VFIO_IRQ_SET_ACTION_MASK :
+				 VFIO_IRQ_SET_ACTION_UNMASK),
+		.index = index,
+		.start = 0,
+		.count = 1,
+	};
+
+	if (ioctl(dev->device, VFIO_DEVICE_SET_IRQS, &irq_set) < 0)
+		return -errno;
+
+	return 0;
+}
+
+int uml_vfio_user_platform_read(struct uml_vfio_user_platform *dev, int index,
+				unsigned int offset, void *buf, int size)
+{
+	return __vfio_region_read(dev->device, dev->region, dev->num_regions,
+				  index, offset, buf, size);
+}
+
+int uml_vfio_user_platform_write(struct uml_vfio_user_platform *dev, int index,
+				 unsigned int offset, const void *buf, int size)
+{
+	return __vfio_region_write(dev->device, dev->region, dev->num_regions,
+				   index, offset, buf, size);
 }
 
 /* ---- ACPI IORT ---------------------------------------------------- */

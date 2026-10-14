@@ -15,6 +15,7 @@ harddog-objs := harddog_kern.o
 harddog-builtin-$(CONFIG_UML_WATCHDOG) := harddog_user.o harddog_user_exp.o
 rtc-objs := rtc_kern.o rtc_user.o
 vfio_uml-objs := vfio_kern.o vfio_dma.o vfio_user.o
+vfio_uml-$(CONFIG_UML_PLATFORM_OVER_VFIO) += vfio_platform.o
 umvduse-objs := umvduse_kern.o umvduse_user.o
 
 #XXX: The call below does not work because the flags are added before the
