@@ -77,6 +77,17 @@ struct umvd_device_ops {
 	 */
 	void (*reset)(struct umvd_dev *dev);
 
+	/*
+	 * The host driver wrote @len bytes at @offset of config space; they
+	 * are already in dev->config. Update whatever depends on them in
+	 * dev->config, which the transport then pushes back before the
+	 * host's write returns, so the driver's next read sees it. Only
+	 * delivered for device types the host relays config writes for
+	 * (virtio-input). Called from process context; may sleep.
+	 * Optional: without it, such writes fail.
+	 */
+	int (*config_write)(struct umvd_dev *dev, u32 offset, u32 len);
+
 	void (*remove)(struct umvd_dev *dev);
 };
 

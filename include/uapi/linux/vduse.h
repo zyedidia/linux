@@ -319,12 +319,21 @@ struct vduse_iotlb_entry_v2 {
  *                      specified IOVA range via VDUSE_IOTLB_GET_FD ioctl
  * @VDUSE_SET_VQ_GROUP_ASID: Notify userspace to update the address space of a
  *                           virtqueue group.
+ * @VDUSE_SET_CONFIG: the driver wrote config space (vkage extension, sent
+ *                    only for device types whose config space is
+ *                    writable, currently virtio-input). The written bytes
+ *                    are already in the kernel's copy; userspace updates
+ *                    whatever depends on them with VDUSE_DEV_SET_CONFIG
+ *                    before replying, and the driver's next config read
+ *                    sees the result.
  */
 enum vduse_req_type {
 	VDUSE_GET_VQ_STATE,
 	VDUSE_SET_STATUS,
 	VDUSE_UPDATE_IOTLB,
 	VDUSE_SET_VQ_GROUP_ASID,
+	/* Not a mainline request type: numbered well clear of mainline's. */
+	VDUSE_SET_CONFIG = 0x100,
 };
 
 /**
@@ -373,6 +382,19 @@ struct vduse_iova_range_v2 {
 };
 
 /**
+ * struct vduse_config_write - config space write by the driver
+ * @offset: offset of the write in config space
+ * @length: number of bytes written
+ * @data: the bytes written
+ */
+struct vduse_config_write {
+	__u32 offset;
+	__u32 length;
+#define VDUSE_CONFIG_WRITE_MAX	64
+	__u8 data[VDUSE_CONFIG_WRITE_MAX];
+};
+
+/**
  * struct vduse_dev_request - control request
  * @type: request type
  * @request_id: request id
@@ -382,6 +404,7 @@ struct vduse_iova_range_v2 {
  * @iova: IOVA range for updating
  * @iova_v2: IOVA range for updating if API_VERSION >= 1
  * @vq_group_asid: ASID of a virtqueue group
+ * @config: config space write (VDUSE_SET_CONFIG)
  * @padding: padding
  *
  * Structure used by read(2) on /dev/vduse/$NAME.
@@ -399,6 +422,7 @@ struct vduse_dev_request {
 		 */
 		struct vduse_iova_range_v2 iova_v2;
 		struct vduse_vq_group_asid vq_group_asid;
+		struct vduse_config_write config;
 		__u32 padding[32];
 	};
 };

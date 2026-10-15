@@ -759,6 +759,8 @@ static void umvd_reset(struct umvd_dev *dev)
 /* Message loop                                                        */
 /* ------------------------------------------------------------------ */
 
+static int umvd_push_config(struct umvd_dev *dev, u32 offset, u32 length);
+
 static void umvd_handle_message(struct umvd_dev *dev,
 				struct vduse_dev_request *req,
 				struct vduse_dev_response *resp)
@@ -817,6 +819,21 @@ static void umvd_handle_message(struct umvd_dev *dev,
 			req->iova.last);
 		break;
 	}
+	case VDUSE_SET_CONFIG: {
+		u32 off = req->config.offset, len = req->config.length;
+
+		if (!dev->ops->config_write || len > VDUSE_CONFIG_WRITE_MAX ||
+		    off > dev->config_size || len > dev->config_size - off) {
+			resp->result = VDUSE_REQ_RESULT_FAILED;
+			break;
+		}
+
+		memcpy(dev->config + off, req->config.data, len);
+		if (dev->ops->config_write(dev, off, len) < 0 ||
+		    umvd_push_config(dev, 0, dev->config_size) < 0)
+			resp->result = VDUSE_REQ_RESULT_FAILED;
+		break;
+	}
 	default:
 		pr_warn("unknown message type %u\n", req->type);
 		resp->result = VDUSE_REQ_RESULT_FAILED;
@@ -865,7 +882,8 @@ static irqreturn_t umvd_msg_irq(int irq, void *data)
 /* Config updates                                                      */
 /* ------------------------------------------------------------------ */
 
-int umvd_notify_config(struct umvd_dev *dev, u32 offset, u32 length)
+/* Copy dev->config[offset, offset + length) into the host's config space. */
+static int umvd_push_config(struct umvd_dev *dev, u32 offset, u32 length)
 {
 	struct vduse_config_data *data;
 	int err;
@@ -883,6 +901,14 @@ int umvd_notify_config(struct umvd_dev *dev, u32 offset, u32 length)
 
 	err = umvd_ioctl(dev->dev_fd, VDUSE_DEV_SET_CONFIG, data);
 	kfree(data);
+	return err < 0 ? err : 0;
+}
+
+int umvd_notify_config(struct umvd_dev *dev, u32 offset, u32 length)
+{
+	int err;
+
+	err = umvd_push_config(dev, offset, length);
 	if (err < 0)
 		return err;
 
