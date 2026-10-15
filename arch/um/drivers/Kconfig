@@ -244,6 +244,20 @@ config UMVDUSE_WLAN
 	  frames cross the data queues as 802.3. The interface is chosen
 	  with umvduse_wlan.ifname=<name>.
 
+config UMVDUSE_INPUT
+	bool "umvduse virtio-input export"
+	depends on UMVDUSE && INPUT
+	help
+	  Export an input device driven inside this UML instance (such as
+	  a USB mouse or keyboard behind a passed-through xHCI controller)
+	  to the host as a virtio-input device. The first input device to
+	  appear is exported, or the first whose name contains
+	  umvduse_input.name=<substring>.
+
+	  The host's virtio-input driver selects what to read by writing
+	  config space, so the host needs a vduse module that relays
+	  config writes (VDUSE_SET_CONFIG) and allows the input device id.
+
 config UMVDUSE_BLK
 	bool "umvduse virtio-blk export"
 	depends on UMVDUSE && BLOCK

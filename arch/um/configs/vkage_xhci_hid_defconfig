@@ -4,8 +4,9 @@
 # A kernel-only build: no userspace, no filesystem. SYSFS stays on even so:
 # USB core needs a sysfs node for every hub port and fails without one.
 #
-# There is no egress yet; a working device shows up as the controller,
-# USB enumeration and hid-generic's "input: ..." line on the console.
+# The first input device to appear (umvduse_input.name= picks another) is
+# exported to the host as virtio-input over VDUSE; that needs the vkage
+# vduse module, which relays the driver's config writes.
 #
 # CONFIG_LOCALVERSION_AUTO is not set
 # CONFIG_CROSS_MEMORY_ATTACH is not set
@@ -28,6 +29,8 @@ CONFIG_NR_CPUS=8
 CONFIG_CON_CHAN="none"
 CONFIG_UML_PCI_OVER_VFIO=y
 CONFIG_UML_PLATFORM_OVER_VFIO=y
+CONFIG_UMVDUSE=y
+CONFIG_UMVDUSE_INPUT=y
 # CONFIG_SECCOMP is not set
 # CONFIG_VMAP_STACK is not set
 # CONFIG_BLOCK is not set
