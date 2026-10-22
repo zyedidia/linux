@@ -492,7 +492,14 @@ static int umvd_umem_ensure(struct umvd_dev *dev)
 {
 	long long size;
 
-	if (umvd_umem_param[0] && !strcmp(umvd_umem_param, "0"))
+	/*
+	 * Registration pins the whole bounce region at once, whereas the
+	 * host's own bounce pages are allocated as mappings need them, so
+	 * only back it with our memory when the shim needs the zero-copy
+	 * path (or umvduse.umem=1 asks for it).
+	 */
+	if (strcmp(umvd_umem_param, "1") &&
+	    (!dev->ops->need_umem || !strcmp(umvd_umem_param, "0")))
 		return -EPERM;
 
 	size = umvd_read_bounce_size(dev);
@@ -1277,12 +1284,14 @@ __uml_help(umvd_name,
 
 module_param_string(umem, umvd_umem_param, sizeof(umvd_umem_param), 0400);
 __uml_help(umvd_umem_param,
-"umvduse.umem=0\n"
-"    Do not register UML memory as the backing for the VDUSE bounce\n"
-"    domain. Devices that need zero-copy I/O (umvduse-blk) will refuse\n"
-"    to start. By default the region is sized to the device's\n"
-"    bounce_size (64 MiB unless tuned via sysfs) and comes out of\n"
-"    UML's memory, so mem= must have room for it.\n\n"
+"umvduse.umem=0|1\n"
+"    Whether to register UML memory as the backing for the VDUSE\n"
+"    bounce domain. By default only devices that need zero-copy I/O\n"
+"    (umvduse-blk) do; others leave the bounce pages to the host,\n"
+"    which allocates them on demand. 0 makes umvduse-blk refuse to\n"
+"    start; 1 forces it for every device. The region is sized to the\n"
+"    device's bounce_size (64 MiB unless tuned via sysfs), comes out\n"
+"    of UML's memory and is pinned on the host in full.\n\n"
 );
 
 module_param_named(stats_secs, umvd_stats_secs, uint, 0400);
