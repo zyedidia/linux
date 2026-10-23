@@ -13,6 +13,7 @@
 #include <irq_user.h>
 #include <os.h>
 #include <um_malloc.h>
+#include "internal.h"
 
 /* Epoll support */
 
@@ -60,6 +61,11 @@ int os_event_mask(enum um_irq_type irq_type)
 int os_setup_epoll(void)
 {
 	epollfd = epoll_create(MAX_EPOLL_EVENTS);
+	return epollfd;
+}
+
+int os_epoll_fd(void)
+{
 	return epollfd;
 }
 
@@ -113,7 +119,7 @@ int os_mod_epoll_fd(int events, int fd, void *data)
 	int result;
 
 	event.data.ptr = data;
-	event.events = events;
+	event.events = events | EPOLLET;
 	result = epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
 	if (result)
 		printk(UM_KERN_ERR

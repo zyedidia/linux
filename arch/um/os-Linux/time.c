@@ -7,12 +7,15 @@
  */
 
 #include <stddef.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/signalfd.h>
 #include <sys/time.h>
+#include <init.h>
 #include <kern_util.h>
 #include <os.h>
 #include <smp.h>
@@ -129,29 +132,94 @@ void os_idle_prepare(void)
 		panic("Failed to create signal FD, errno = %d", errno);
 }
 
+static unsigned long long idle_poll_ns;
+
+static int __init idle_poll_setup(char *str, int *add)
+{
+	idle_poll_ns = strtoull(str, NULL, 0) * 1000;
+	return 0;
+}
+
+__uml_setup("idle_poll=", idle_poll_setup,
+"idle_poll=<usecs>\n"
+"    Poll for interrupts for up to this many microseconds before the idle\n"
+"    CPU that handles them sleeps, which lowers the latency of interrupts\n"
+"    that arrive soon after the CPU goes idle at the cost of host CPU time.\n"
+"    The default is 0.\n\n"
+);
+
+/*
+ * Wait until one of the fds is ready or a signal that mask does not block
+ * arrives. The IRQ epoll fd is polled only when it is the second fd.
+ */
+static void idle_wait(struct pollfd *fds, int n, const sigset_t *mask)
+{
+	struct timespec zero = {};
+	long long end;
+
+	if (idle_poll_ns && n == 2) {
+		end = os_nsecs() + idle_poll_ns;
+		do {
+			if (ppoll(fds, n, &zero, mask) != 0 ||
+			    uml_need_resched())
+				return;
+		} while (os_nsecs() < end);
+	}
+
+	ppoll(fds, n, NULL, mask);
+}
+
 /**
  * os_idle_sleep() - sleep until interrupted
+ * @wait_irqs: whether this CPU handles SIGIO and should also wake up when an
+ *	fd in the IRQ epoll set becomes ready
+ *
+ * Waiting on the IRQ epoll set directly wakes the CPU with one host wakeup
+ * and no signal. The IRQs are then handled as a pending SIGIO when IRQs are
+ * enabled again.
  */
-void os_idle_sleep(void)
+void os_idle_sleep(int wait_irqs)
 {
-	sigset_t set;
+	struct pollfd fds[2] = {
+		{ .fd = wake_signals, .events = POLLIN },
+		{ .fd = os_epoll_fd(), .events = POLLIN },
+	};
+	int n = wait_irqs && fds[1].fd >= 0 ? 2 : 1;
+	sigset_t set, old, wait;
 
 	/*
-	 * Block SIGALRM while performing the need_resched check.
+	 * Block SIGALRM and SIGIO while performing the need_resched check.
 	 * Note that, because IRQs are disabled, the IPI signal is
-	 * already blocked.
+	 * already blocked. The wait unblocks SIGIO again atomically, so a
+	 * SIGIO that arrives after the check still interrupts it. SIGALRM
+	 * stays blocked because the signalfd reports it.
 	 */
 	sigemptyset(&set);
 	sigaddset(&set, SIGALRM);
-	sigprocmask(SIG_BLOCK, &set, NULL);
+	sigaddset(&set, SIGIO);
+	sigprocmask(SIG_BLOCK, &set, &old);
+	wait = old;
+	sigaddset(&wait, SIGALRM);
 
 	/*
-	 * Because disabling IRQs does not block SIGALRM, it is also
-	 * necessary to check for any pending timer alarms.
+	 * Because disabling IRQs does not block SIGALRM or SIGIO, it is
+	 * also necessary to check for any pending timer alarms or SIGIO.
 	 */
-	if (!uml_need_resched() && !timer_alarm_pending())
-		os_poll(1, &wake_signals);
+	if (!uml_need_resched() && !timer_alarm_pending() && !sigio_pending()) {
+		if (n == 2)
+			sigio_idle_enter();
+
+		idle_wait(fds, n, &wait);
+
+		/*
+		 * The helper thread does not signal the CPU while it is idle,
+		 * so an event that it saw has to be handled here even if the
+		 * poll returned for another reason.
+		 */
+		if (n == 2 && (sigio_idle_exit() || (fds[1].revents & POLLIN)))
+			mark_sigio_pending();
+	}
 
 	/* Restore the signal mask. */
-	sigprocmask(SIG_UNBLOCK, &set, NULL);
+	sigprocmask(SIG_SETMASK, &old, NULL);
 }

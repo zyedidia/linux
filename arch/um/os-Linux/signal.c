@@ -163,6 +163,11 @@ int timer_alarm_pending(void)
 	return !!(signals_pending & SIGALRM_MASK);
 }
 
+int sigio_pending(void)
+{
+	return !!(signals_pending & SIGIO_MASK);
+}
+
 void set_sigstack(void *sig_stack, int size)
 {
 	stack_t stack = {
@@ -406,24 +411,16 @@ int um_set_signals_trace(int enable)
 	return ret;
 }
 
-#if IS_ENABLED(CONFIG_UML_TIME_TRAVEL_SUPPORT)
 void mark_sigio_pending(void)
 {
 	/*
-	 * It would seem that this should be atomic so
-	 * it isn't a read-modify-write with a signal
-	 * that could happen in the middle, losing the
-	 * value set by the signal.
-	 *
-	 * However, this function is only called when in
-	 * time-travel=ext simulation mode, in which case
-	 * the only signal ever pending is SIGIO, which
-	 * is blocked while this can be called, and the
-	 * timer signal (SIGALRM) cannot happen.
+	 * A single atomic instruction, so that a signal handler that updates
+	 * signals_pending on this thread runs either before or after it.
 	 */
-	signals_pending |= SIGIO_MASK;
+	__atomic_fetch_or(&signals_pending, SIGIO_MASK, __ATOMIC_RELAXED);
 }
 
+#if IS_ENABLED(CONFIG_UML_TIME_TRAVEL_SUPPORT)
 void block_signals_hard(void)
 {
 	signals_blocked++;

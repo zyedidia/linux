@@ -271,7 +271,7 @@ extern void os_warn(const char *fmt, ...)
 
 /* time.c */
 void os_idle_prepare(void);
-extern void os_idle_sleep(void);
+extern void os_idle_sleep(int wait_irqs);
 extern int os_timer_create(void);
 extern int os_timer_set_interval(int cpu, unsigned long long nsecs);
 extern int os_timer_one_shot(int cpu, unsigned long long nsecs);

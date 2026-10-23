@@ -7,6 +7,17 @@
 #include <signal.h>
 
 /*
+ * irq.c
+ */
+int os_epoll_fd(void);
+
+/*
+ * sigio.c
+ */
+void sigio_idle_enter(void);
+int sigio_idle_exit(void);
+
+/*
  * elf_aux.c
  */
 void scan_elf_aux(char **envp);
@@ -21,6 +32,7 @@ void check_tmpexec(void);
  */
 extern __thread int signals_enabled;
 int timer_alarm_pending(void);
+int sigio_pending(void);
 
 /*
  * skas/process.c

@@ -31,6 +31,7 @@
 #include <asm/exec.h>
 #include <linux/uaccess.h>
 #include <as-layout.h>
+#include <irq_kern.h>
 #include <kern_util.h>
 #include <os.h>
 #include <skas.h>
@@ -210,7 +211,7 @@ void um_idle_sleep(void)
 	if (time_travel_mode != TT_MODE_OFF)
 		time_travel_sleep();
 	else
-		os_idle_sleep();
+		os_idle_sleep(um_idle_waits_for_irqs());
 }
 
 void arch_cpu_idle(void)

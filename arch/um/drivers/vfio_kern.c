@@ -262,11 +262,16 @@ static irqreturn_t uml_vfio_interrupt(int unused, void *opaque)
 	uint64_t v;
 	int r;
 
+	/*
+	 * A read returns and clears the whole count. The eventfd is
+	 * edge-triggered in the IRQ epoll set, so a signal after the read
+	 * raises a new event, and a second read would only fail.
+	 */
 	do {
 		r = os_read_file(irqfd, &v, sizeof(v));
-		if (r != sizeof(v))
-			continue;
+	} while (r == -EINTR);
 
+	if (r == sizeof(v)) {
 		raw_spin_lock_irqsave(&dev->irq_lock, flags);
 		masked = uml_vfio_irq_masked(ctx);
 		if (masked)
@@ -280,8 +285,9 @@ static irqreturn_t uml_vfio_interrupt(int unused, void *opaque)
 
 		if (!masked)
 			generic_handle_irq(ctx->virq);
-	} while (r == sizeof(v) || r == -EINTR);
-	WARN(r != -EAGAIN, "read returned %d\n", r);
+	} else {
+		WARN(r != -EAGAIN, "read returned %d\n", r);
+	}
 
 	return IRQ_HANDLED;
 }

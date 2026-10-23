@@ -18,6 +18,7 @@
 #include <os.h>
 #include <sigio.h>
 #include <um_malloc.h>
+#include "internal.h"
 
 /*
  * Protected by sigio_lock(), also used by sigio_cleanup, which is an
@@ -30,6 +31,44 @@ static int epollfd = -1;
 #define MAX_EPOLL_EVENTS 64
 
 static struct epoll_event epoll_events[MAX_EPOLL_EVENTS];
+
+/*
+ * State of the CPU that handles SIGIO, shared with the helper thread. While
+ * that CPU is idle, it waits on the IRQ epoll set itself, which holds every
+ * fd that the helper watches, so the helper does not signal it and marks the
+ * state KICKED instead.
+ */
+enum {
+	SIGIO_CPU_BUSY,
+	SIGIO_CPU_IDLE,
+	SIGIO_CPU_KICKED,
+};
+
+static int sigio_cpu_state = SIGIO_CPU_BUSY;
+
+void sigio_idle_enter(void)
+{
+	__atomic_store_n(&sigio_cpu_state, SIGIO_CPU_IDLE, __ATOMIC_SEQ_CST);
+}
+
+/* Return whether the helper saw an event while the CPU was idle. */
+int sigio_idle_exit(void)
+{
+	return __atomic_exchange_n(&sigio_cpu_state, SIGIO_CPU_BUSY,
+				   __ATOMIC_SEQ_CST) == SIGIO_CPU_KICKED;
+}
+
+/* Return whether the CPU still has to be signalled for an event. */
+static int sigio_cpu_needs_signal(void)
+{
+	int state = SIGIO_CPU_IDLE;
+
+	if (__atomic_compare_exchange_n(&sigio_cpu_state, &state,
+					SIGIO_CPU_KICKED, 0, __ATOMIC_SEQ_CST,
+					__ATOMIC_SEQ_CST))
+		return 0;
+	return state == SIGIO_CPU_BUSY;
+}
 
 static void *write_sigio_thread(void *unused)
 {
@@ -46,6 +85,9 @@ static void *write_sigio_thread(void *unused)
 			printk(UM_KERN_ERR "%s: epoll_wait failed, errno = %d\n",
 			       __func__, errno);
 		}
+
+		if (!sigio_cpu_needs_signal())
+			continue;
 
 		CATCH_EINTR(r = syscall(__NR_tgkill, pid, pid, SIGIO));
 		if (r < 0)

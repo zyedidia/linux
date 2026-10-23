@@ -479,6 +479,16 @@ unsigned int do_IRQ(int irq, struct uml_pt_regs *regs)
 	return 1;
 }
 
+/*
+ * Whether the idle loop of this CPU should wake up when an fd in the IRQ epoll
+ * set becomes ready. Only CPU 0 handles SIGIO, and suspended IRQs must not
+ * wake the idle loop.
+ */
+bool um_idle_waits_for_irqs(void)
+{
+	return raw_smp_processor_id() == 0 && !irqs_suspended;
+}
+
 void um_free_irq(int irq, void *dev)
 {
 	if (WARN(irq < 0 || irq > UM_LAST_SIGNAL_IRQ,
