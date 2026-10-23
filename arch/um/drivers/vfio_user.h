@@ -7,6 +7,12 @@ struct uml_vfio_user_range {
 	uint64_t size;
 };
 
+/* An inclusive range of IOVAs that the host IOMMU can map. */
+struct uml_vfio_user_iova_range {
+	uint64_t start;
+	uint64_t end;
+};
+
 struct uml_vfio_user_device {
 	int device;
 
@@ -22,6 +28,11 @@ struct uml_vfio_user_device {
 
 int uml_vfio_user_open_container(void);
 int uml_vfio_user_setup_iommu(int container);
+int uml_vfio_user_get_iova_ranges(int container,
+				  struct uml_vfio_user_iova_range **ranges);
+int uml_vfio_user_dma_map(int container, unsigned long vaddr, uint64_t iova,
+			  uint64_t size, int read, int write);
+int64_t uml_vfio_user_dma_unmap(int container, uint64_t iova, uint64_t size);
 
 int uml_vfio_user_get_group_id(const char *device);
 int uml_vfio_user_open_group(int group_id);

@@ -6,6 +6,8 @@
 
 struct um_pci_device {
 	const struct um_pci_ops *ops;
+	/* Optional DMA ops for the device, dma-direct is used if NULL. */
+	const struct dma_map_ops *dma_ops;
 
 	/* for now just standard BARs */
 	u8 resptr[PCI_STD_NUM_BARS];

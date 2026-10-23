@@ -185,6 +185,8 @@ config UML_PCI_OVER_VFIO
 	bool "Enable VFIO-based PCI passthrough"
 	select UML_PCI
 	select INDIRECT_IOMEM_FALLBACK if 64BIT
+	select ARCH_HAS_DMA_OPS
+	select IOMMU_IOVA
 	help
 	  This driver provides support for VFIO-based PCI passthrough.
 	  Currently, only MSI-X capable devices are supported, and it

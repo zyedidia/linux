@@ -18,6 +18,7 @@
 
 #include "mconsole_kern.h"
 #include "virt-pci.h"
+#include "vfio_dma.h"
 #include "vfio_user.h"
 
 #define to_vdev(_pdev) container_of(_pdev, struct uml_vfio_device, pdev)
@@ -97,13 +98,15 @@ static int uml_vfio_set_container(int group_fd)
 		return err;
 
 	uml_vfio_container.users++;
-	if (uml_vfio_container.users > 1)
-		return 0;
-
-	err = uml_vfio_user_setup_iommu(uml_vfio_container.fd);
+	if (uml_vfio_container.users == 1)
+		err = uml_vfio_user_setup_iommu(uml_vfio_container.fd);
+	if (!err)
+		err = uml_vfio_dma_add_group(uml_vfio_container.fd);
 	if (err) {
 		uml_vfio_user_unset_container(uml_vfio_container.fd, group_fd);
 		uml_vfio_container.users--;
+		if (!uml_vfio_container.users)
+			uml_vfio_dma_release();
 	}
 	return err;
 }
@@ -114,6 +117,8 @@ static void uml_vfio_unset_container(int group_fd)
 
 	uml_vfio_user_unset_container(uml_vfio_container.fd, group_fd);
 	uml_vfio_container.users--;
+	if (!uml_vfio_container.users)
+		uml_vfio_dma_release();
 }
 
 static int uml_vfio_open_group(int group_id)
@@ -814,6 +819,7 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 	}
 
 	dev->pdev.ops = &uml_vfio_um_pci_ops;
+	dev->pdev.dma_ops = &uml_vfio_dma_ops;
 
 	err = um_pci_device_register(&dev->pdev);
 	if (err) {

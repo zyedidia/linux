@@ -50,26 +50,131 @@ error:
 
 int uml_vfio_user_setup_iommu(int container)
 {
-	/*
-	 * This is a bit tricky. See the big comment in
-	 * vhost_user_set_mem_table() in virtio_uml.c.
-	 */
-	unsigned long reserved = uml_reserved - uml_physmem;
-	struct vfio_iommu_type1_dma_map dma_map = {
-		.argsz = sizeof(dma_map),
-		.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
-		.vaddr = uml_reserved,
-		.iova = reserved,
-		.size = physmem_size - reserved,
-	};
-
 	if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0)
 		return -errno;
-
-	if (ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map) < 0)
-		return -errno;
-
 	return 0;
+}
+
+static int vfio_get_iommu_info(int container,
+			       struct vfio_iommu_type1_info **infop)
+{
+	struct vfio_iommu_type1_info *info;
+	uint32_t argsz = sizeof(*info);
+	int err;
+
+	for (;;) {
+		info = uml_kmalloc(argsz, UM_GFP_KERNEL);
+		if (!info)
+			return -ENOMEM;
+
+		memset(info, 0, argsz);
+		info->argsz = argsz;
+
+		if (ioctl(container, VFIO_IOMMU_GET_INFO, info) < 0) {
+			err = -errno;
+			kfree(info);
+			return err;
+		}
+		if (info->argsz <= argsz) {
+			*infop = info;
+			return 0;
+		}
+
+		argsz = info->argsz;
+		kfree(info);
+	}
+}
+
+/*
+ * Return the number of usable IOVA ranges and store them, sorted by address,
+ * in a newly allocated array.
+ */
+int uml_vfio_user_get_iova_ranges(int container,
+				  struct uml_vfio_user_iova_range **ranges)
+{
+	struct vfio_iommu_type1_info_cap_iova_range *cap = NULL;
+	struct vfio_iommu_type1_info *info;
+	struct vfio_info_cap_header *hdr;
+	uint32_t off;
+	int i, n;
+
+	n = vfio_get_iommu_info(container, &info);
+	if (n)
+		return n;
+
+	if (!(info->flags & VFIO_IOMMU_INFO_PGSIZES) ||
+	    !(info->iova_pgsizes & UM_KERN_PAGE_SIZE)) {
+		n = -EINVAL;
+		goto out;
+	}
+
+	if (info->flags & VFIO_IOMMU_INFO_CAPS) {
+		for (off = info->cap_offset; off; off = hdr->next) {
+			if (off + sizeof(*hdr) > info->argsz)
+				break;
+			hdr = (void *)info + off;
+			if (hdr->id == VFIO_IOMMU_TYPE1_INFO_CAP_IOVA_RANGE) {
+				cap = (void *)hdr;
+				break;
+			}
+		}
+	}
+
+	n = cap ? cap->nr_iovas : 1;
+	*ranges = uml_kmalloc(sizeof(**ranges) * n, UM_GFP_KERNEL);
+	if (!*ranges) {
+		n = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < n; i++) {
+		(*ranges)[i].start = cap ? cap->iova_ranges[i].start : 0;
+		(*ranges)[i].end = cap ? cap->iova_ranges[i].end : UINT64_MAX;
+	}
+
+out:
+	kfree(info);
+	return n;
+}
+
+int uml_vfio_user_dma_map(int container, unsigned long vaddr, uint64_t iova,
+			  uint64_t size, int read, int write)
+{
+	struct vfio_iommu_type1_dma_map map = {
+		.argsz = sizeof(map),
+		.vaddr = vaddr,
+		.iova = iova,
+		.size = size,
+	};
+	int r;
+
+	if (read)
+		map.flags |= VFIO_DMA_MAP_FLAG_READ;
+	if (write)
+		map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
+
+	do {
+		r = ioctl(container, VFIO_IOMMU_MAP_DMA, &map);
+	} while (r < 0 && errno == EINTR);
+
+	return r < 0 ? -errno : 0;
+}
+
+/* Return the number of bytes unmapped. */
+int64_t uml_vfio_user_dma_unmap(int container, uint64_t iova, uint64_t size)
+{
+	struct vfio_iommu_type1_dma_unmap unmap = {
+		.argsz = sizeof(unmap),
+		.iova = iova,
+		.size = size,
+	};
+	int r;
+
+	do {
+		r = ioctl(container, VFIO_IOMMU_UNMAP_DMA, &unmap);
+	} while (r < 0 && errno == EINTR);
+
+	return r < 0 ? -errno : (int64_t)unmap.size;
 }
 
 int uml_vfio_user_get_group_id(const char *device)

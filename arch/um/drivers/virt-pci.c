@@ -5,6 +5,7 @@
  */
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/dma-map-ops.h>
 #include <linux/logic_iomem.h>
 #include <linux/of_platform.h>
 #include <linux/irqchip/irq-msi-lib.h>
@@ -534,6 +535,18 @@ static int um_pci_map_irq(const struct pci_dev *pdev, u8 slot, u8 pin)
 
 	/* Yes, we map all pins to the same IRQ ... doesn't matter for now. */
 	return reg->dev->irq;
+}
+
+void pcibios_bus_add_device(struct pci_dev *pdev)
+{
+	struct um_pci_device *dev;
+
+	if (pdev->bus != bridge->bus)
+		return;
+
+	dev = um_pci_devices[pdev->devfn / 8].dev;
+	if (dev && dev->dma_ops)
+		set_dma_ops(&pdev->dev, dev->dma_ops);
 }
 
 void *pci_root_bus_fwnode(struct pci_bus *bus)
