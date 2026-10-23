@@ -272,25 +272,24 @@ static struct resource virt_iomem_resource = {
 	.flags = IORESOURCE_MEM,
 };
 
-struct um_pci_map_iomem_data {
-	unsigned long offset;
+struct um_pci_find_bar_data {
+	unsigned long addr;
 	size_t size;
-	const struct logic_iomem_ops **ops;
-	void **priv;
-	long ret;
+	struct um_pci_device *dev;
+	int bar;
+	unsigned long offset;
 };
 
-static int um_pci_map_iomem_walk(struct pci_dev *pdev, void *_data)
+static int um_pci_find_bar_walk(struct pci_dev *pdev, void *_data)
 {
-	struct um_pci_map_iomem_data *data = _data;
+	struct um_pci_find_bar_data *data = _data;
 	struct um_pci_device_reg *reg = &um_pci_devices[pdev->devfn / 8];
-	struct um_pci_device *dev;
 	int i;
 
 	if (!reg->dev)
 		return 0;
 
-	for (i = 0; i < ARRAY_SIZE(dev->resptr); i++) {
+	for (i = 0; i < ARRAY_SIZE(reg->dev->resptr); i++) {
 		struct resource *r = &pdev->resource[i];
 
 		if ((r->flags & IORESOURCE_TYPE_BITS) != IORESOURCE_MEM)
@@ -300,16 +299,14 @@ static int um_pci_map_iomem_walk(struct pci_dev *pdev, void *_data)
 		 * must be the whole or part of the resource,
 		 * not allowed to only overlap
 		 */
-		if (data->offset < r->start || data->offset > r->end)
+		if (data->addr < r->start || data->addr > r->end)
 			continue;
-		if (data->offset + data->size - 1 > r->end)
+		if (data->addr + data->size - 1 > r->end)
 			continue;
 
-		dev = reg->dev;
-		*data->ops = &um_pci_device_bar_ops;
-		dev->resptr[i] = i;
-		*data->priv = &dev->resptr[i];
-		data->ret = data->offset - r->start;
+		data->dev = reg->dev;
+		data->bar = i;
+		data->offset = data->addr - r->start;
 
 		/* no need to continue */
 		return 1;
@@ -318,25 +315,52 @@ static int um_pci_map_iomem_walk(struct pci_dev *pdev, void *_data)
 	return 0;
 }
 
+static bool um_pci_find_bar(unsigned long offset, size_t size,
+			    struct um_pci_find_bar_data *data)
+{
+	*data = (struct um_pci_find_bar_data) {
+		/* we want the full address here */
+		.addr = offset + virt_iomem_resource.start,
+		.size = size,
+	};
+
+	pci_walk_bus(bridge->bus, um_pci_find_bar_walk, data);
+	return data->dev;
+}
+
 static long um_pci_map_iomem(unsigned long offset, size_t size,
 			     const struct logic_iomem_ops **ops,
 			     void **priv)
 {
-	struct um_pci_map_iomem_data data = {
-		/* we want the full address here */
-		.offset = offset + virt_iomem_resource.start,
-		.size = size,
-		.ops = ops,
-		.priv = priv,
-		.ret = -ENOENT,
-	};
+	struct um_pci_find_bar_data data;
 
-	pci_walk_bus(bridge->bus, um_pci_map_iomem_walk, &data);
-	return data.ret;
+	if (!um_pci_find_bar(offset, size, &data))
+		return -ENOENT;
+
+	*ops = &um_pci_device_bar_ops;
+	data.dev->resptr[data.bar] = data.bar;
+	*priv = &data.dev->resptr[data.bar];
+	return data.offset;
+}
+
+static void __iomem *um_pci_map_iomem_direct(unsigned long offset,
+					     size_t size)
+{
+	struct um_pci_find_bar_data data;
+	void __iomem *base;
+
+	if (!um_pci_find_bar(offset, size, &data) || !data.dev->ops->bar_map)
+		return NULL;
+
+	base = data.dev->ops->bar_map(data.dev, data.bar);
+	if (!base)
+		return NULL;
+	return base + data.offset;
 }
 
 static const struct logic_iomem_region_ops um_pci_iomem_ops = {
 	.map = um_pci_map_iomem,
+	.map_direct = um_pci_map_iomem_direct,
 };
 
 static void um_pci_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
@@ -354,9 +378,57 @@ static void um_pci_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 	msg->data = data->irq;
 }
 
+static struct um_pci_device *um_pci_msi_device(struct irq_data *data,
+					       unsigned int *index)
+{
+	struct msi_desc *desc = irq_data_get_msi_desc(data);
+	struct pci_dev *pdev;
+
+	if (!desc)
+		return NULL;
+
+	pdev = to_pci_dev(msi_desc_to_dev(desc));
+	*index = desc->msi_index + data->irq - desc->irq;
+	return um_pci_devices[pdev->devfn / 8].dev;
+}
+
+static void um_pci_msi_set_masked(struct irq_data *data, bool masked)
+{
+	struct um_pci_device *dev;
+	unsigned int index;
+
+	dev = um_pci_msi_device(data, &index);
+	if (dev && dev->ops->msi_mask)
+		dev->ops->msi_mask(dev, index, masked);
+}
+
+static void um_pci_msi_mask(struct irq_data *data)
+{
+	um_pci_msi_set_masked(data, true);
+}
+
+static void um_pci_msi_unmask(struct irq_data *data)
+{
+	um_pci_msi_set_masked(data, false);
+}
+
+static int um_pci_msi_retrigger(struct irq_data *data)
+{
+	struct um_pci_device *dev;
+	unsigned int index;
+
+	dev = um_pci_msi_device(data, &index);
+	if (!dev || !dev->ops->msi_retrigger)
+		return 0;
+	return dev->ops->msi_retrigger(dev, index);
+}
+
 static struct irq_chip um_pci_msi_bottom_irq_chip = {
 	.name = "UM virtual MSI",
 	.irq_compose_msi_msg = um_pci_compose_msi_msg,
+	.irq_mask = um_pci_msi_mask,
+	.irq_unmask = um_pci_msi_unmask,
+	.irq_retrigger = um_pci_msi_retrigger,
 };
 
 static int um_pci_inner_domain_alloc(struct irq_domain *domain,
@@ -399,14 +471,40 @@ static void um_pci_inner_domain_free(struct irq_domain *domain,
 	mutex_unlock(&um_pci_mtx);
 }
 
+static int um_pci_inner_domain_activate(struct irq_domain *domain,
+					struct irq_data *data, bool reserve)
+{
+	struct um_pci_device *dev;
+	unsigned int index;
+
+	dev = um_pci_msi_device(data, &index);
+	if (!dev || !dev->ops->msi_activate)
+		return 0;
+	return dev->ops->msi_activate(dev, index, data->irq);
+}
+
+static void um_pci_inner_domain_deactivate(struct irq_domain *domain,
+					   struct irq_data *data)
+{
+	struct um_pci_device *dev;
+	unsigned int index;
+
+	dev = um_pci_msi_device(data, &index);
+	if (dev && dev->ops->msi_deactivate)
+		dev->ops->msi_deactivate(dev, index);
+}
+
 static const struct irq_domain_ops um_pci_inner_domain_ops = {
 	.select = msi_lib_irq_domain_select,
 	.alloc = um_pci_inner_domain_alloc,
 	.free = um_pci_inner_domain_free,
+	.activate = um_pci_inner_domain_activate,
+	.deactivate = um_pci_inner_domain_deactivate,
 };
 
 #define UM_PCI_MSI_FLAGS_REQUIRED (MSI_FLAG_USE_DEF_DOM_OPS		| \
 				   MSI_FLAG_USE_DEF_CHIP_OPS		| \
+				   MSI_FLAG_PCI_MSI_MASK_PARENT		| \
 				   MSI_FLAG_NO_AFFINITY)
 #define UM_PCI_MSI_FLAGS_SUPPORTED (MSI_GENERIC_FLAGS_MASK		| \
 				    MSI_FLAG_PCI_MSIX)

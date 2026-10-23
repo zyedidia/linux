@@ -2,6 +2,11 @@
 #ifndef __UM_VFIO_USER_H
 #define __UM_VFIO_USER_H
 
+struct uml_vfio_user_range {
+	uint64_t offset;
+	uint64_t size;
+};
+
 struct uml_vfio_user_device {
 	int device;
 
@@ -40,5 +45,11 @@ int uml_vfio_user_bar_read(struct uml_vfio_user_device *dev, int bar,
 			   unsigned int offset, void *buf, int size);
 int uml_vfio_user_bar_write(struct uml_vfio_user_device *dev, int bar,
 			    unsigned int offset, const void *buf, int size);
+
+void *uml_vfio_user_map_bar(struct uml_vfio_user_device *dev, int bar,
+			    const struct uml_vfio_user_range *shadow,
+			    int nr_shadow);
+void uml_vfio_user_unmap_bar(struct uml_vfio_user_device *dev, int bar,
+			     void *addr);
 
 #endif /* __UM_VFIO_USER_H */

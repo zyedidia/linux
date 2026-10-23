@@ -44,11 +44,16 @@ struct logic_iomem_ops {
  *	The return value is negative for errors, or >= 0 for
  *	success. On success, the return value is added to the
  *	offset for later ops, to allow for partial mappings.
+ * @map_direct: optional, return a pointer through which the range can be
+ *	accessed directly, or %NULL to use @map instead. The pointer is
+ *	accessed with the real_* accessors, so this is only used with
+ *	CONFIG_INDIRECT_IOMEM_FALLBACK.
  */
 struct logic_iomem_region_ops {
 	long (*map)(unsigned long offset, size_t size,
 		    const struct logic_iomem_ops **ops,
 		    void **priv);
+	void __iomem *(*map_direct)(unsigned long offset, size_t size);
 };
 
 /**

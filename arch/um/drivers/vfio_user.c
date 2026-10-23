@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <linux/limits.h>
 #include <linux/vfio.h>
 #include <linux/pci_regs.h>
@@ -324,4 +325,171 @@ int uml_vfio_user_bar_write(struct uml_vfio_user_device *dev, int bar,
 			    unsigned int offset, const void *buf, int size)
 {
 	return vfio_region_write(dev, bar, offset, buf, size);
+}
+
+#define PAGE_ALIGN_DOWN(x) ((x) & ~((uint64_t)UM_KERN_PAGE_SIZE - 1))
+#define PAGE_ALIGN_UP(x) PAGE_ALIGN_DOWN((x) + UM_KERN_PAGE_SIZE - 1)
+
+static struct vfio_region_info *vfio_get_region_info(int device,
+						     unsigned int index)
+{
+	struct vfio_region_info *info;
+	uint32_t argsz = sizeof(*info);
+
+	for (;;) {
+		info = uml_kmalloc(argsz, UM_GFP_KERNEL);
+		if (!info)
+			return NULL;
+
+		memset(info, 0, argsz);
+		info->argsz = argsz;
+		info->index = index;
+
+		if (ioctl(device, VFIO_DEVICE_GET_REGION_INFO, info) < 0) {
+			kfree(info);
+			return NULL;
+		}
+		if (info->argsz <= argsz)
+			return info;
+
+		argsz = info->argsz;
+		kfree(info);
+	}
+}
+
+static struct vfio_region_info_cap_sparse_mmap *
+vfio_find_sparse_mmap(struct vfio_region_info *info)
+{
+	struct vfio_info_cap_header *hdr;
+	uint32_t off;
+
+	if (!(info->flags & VFIO_REGION_INFO_FLAG_CAPS))
+		return NULL;
+
+	for (off = info->cap_offset; off; off = hdr->next) {
+		if (off + sizeof(*hdr) > info->argsz)
+			return NULL;
+		hdr = (void *)info + off;
+		if (hdr->id == VFIO_REGION_INFO_CAP_SPARSE_MMAP)
+			return (void *)hdr;
+	}
+
+	return NULL;
+}
+
+static int vfio_range_contains(const struct uml_vfio_user_range *range,
+			       uint64_t offset)
+{
+	return offset >= PAGE_ALIGN_DOWN(range->offset) &&
+	       offset < PAGE_ALIGN_UP(range->offset + range->size);
+}
+
+/*
+ * Each page of the BAR must be backed by either the device or a shadow
+ * range, otherwise accesses to it cannot be handled.
+ */
+static int vfio_bar_covered(uint64_t size,
+			    const struct vfio_region_sparse_mmap_area *areas,
+			    int nr_areas,
+			    const struct uml_vfio_user_range *shadow,
+			    int nr_shadow)
+{
+	uint64_t off;
+	int i, found;
+
+	for (off = 0; off < size; off += UM_KERN_PAGE_SIZE) {
+		found = 0;
+		for (i = 0; i < nr_areas && !found; i++)
+			found = off >= areas[i].offset &&
+				off < areas[i].offset + areas[i].size;
+		for (i = 0; i < nr_shadow && !found; i++)
+			found = vfio_range_contains(&shadow[i], off);
+		if (!found)
+			return 0;
+	}
+
+	return 1;
+}
+
+void *uml_vfio_user_map_bar(struct uml_vfio_user_device *dev, int bar,
+			    const struct uml_vfio_user_range *shadow,
+			    int nr_shadow)
+{
+	struct vfio_region_info_cap_sparse_mmap *sparse;
+	struct vfio_region_sparse_mmap_area whole, *areas;
+	struct vfio_region_info *info;
+	void *base = NULL, *p;
+	uint64_t size, start;
+	int i, nr_areas;
+
+	info = vfio_get_region_info(dev->device, bar);
+	if (!info)
+		return NULL;
+
+	if (!(info->flags & VFIO_REGION_INFO_FLAG_MMAP) || !info->size)
+		goto out;
+
+	size = PAGE_ALIGN_UP(info->size);
+
+	for (i = 0; i < nr_shadow; i++) {
+		if (shadow[i].offset > info->size ||
+		    shadow[i].size > info->size - shadow[i].offset)
+			goto out;
+	}
+
+	sparse = vfio_find_sparse_mmap(info);
+	if (sparse) {
+		areas = sparse->areas;
+		nr_areas = sparse->nr_areas;
+	} else {
+		whole.offset = 0;
+		whole.size = size;
+		areas = &whole;
+		nr_areas = 1;
+	}
+
+	if (!vfio_bar_covered(size, areas, nr_areas, shadow, nr_shadow))
+		goto out;
+
+	base = mmap(NULL, size, PROT_NONE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	if (base == MAP_FAILED) {
+		base = NULL;
+		goto out;
+	}
+
+	for (i = 0; i < nr_areas; i++) {
+		if (!areas[i].size)
+			continue;
+		p = mmap(base + areas[i].offset, areas[i].size,
+			 PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+			 dev->device, info->offset + areas[i].offset);
+		if (p == MAP_FAILED)
+			goto unmap;
+	}
+
+	for (i = 0; i < nr_shadow; i++) {
+		start = PAGE_ALIGN_DOWN(shadow[i].offset);
+		p = mmap(base + start,
+			 PAGE_ALIGN_UP(shadow[i].offset + shadow[i].size) - start,
+			 PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+		if (p == MAP_FAILED)
+			goto unmap;
+	}
+
+	goto out;
+
+unmap:
+	munmap(base, size);
+	base = NULL;
+out:
+	kfree(info);
+	return base;
+}
+
+void uml_vfio_user_unmap_bar(struct uml_vfio_user_device *dev, int bar,
+			     void *addr)
+{
+	munmap(addr, PAGE_ALIGN_UP(dev->region[bar].size));
 }

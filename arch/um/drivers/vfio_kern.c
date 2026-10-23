@@ -25,6 +25,26 @@
 struct uml_vfio_intr_ctx {
 	struct uml_vfio_device *dev;
 	int irq;
+	int virq;
+	bool masked;
+	bool pending;
+};
+
+/*
+ * Guest memory that stands in for a part of a BAR, used for the MSI-X table
+ * and PBA so that the driver never writes the device's real table.
+ */
+struct uml_vfio_shadow {
+	int bar;
+	unsigned int offset;
+	unsigned int size;
+	void *mem;
+};
+
+enum {
+	UML_VFIO_SHADOW_TABLE,
+	UML_VFIO_SHADOW_PBA,
+	UML_VFIO_NR_SHADOWS,
 };
 
 struct uml_vfio_device {
@@ -35,11 +55,14 @@ struct uml_vfio_device {
 	struct uml_vfio_user_device udev;
 	struct uml_vfio_intr_ctx *intr_ctx;
 
+	void *bar_map[PCI_STD_NUM_BARS];
+	struct uml_vfio_shadow shadow[UML_VFIO_NR_SHADOWS];
+
 	int msix_cap;
-	int msix_bar;
-	int msix_offset;
-	int msix_size;
-	u32 *msix_data;
+	int msix_entries;
+	bool msix_maskall;
+	/* Protects the mask state of the device and its vectors. */
+	raw_spinlock_t irq_lock;
 
 	struct list_head list;
 };
@@ -157,20 +180,52 @@ static int uml_vfio_release_group(int group_fd)
 	return -ENOENT;
 }
 
+static bool uml_vfio_irq_masked(struct uml_vfio_intr_ctx *ctx)
+{
+	return ctx->masked || ctx->dev->msix_maskall;
+}
+
+/*
+ * Replay an interrupt by writing to the eventfd, so that it is delivered
+ * through the usual path.
+ */
+static void uml_vfio_retrigger_irq(struct uml_vfio_intr_ctx *ctx)
+{
+	struct uml_vfio_device *dev = ctx->dev;
+	int irqfd = dev->udev.irqfd[ctx - dev->intr_ctx];
+	uint64_t v = 1;
+
+	lockdep_assert_held(&dev->irq_lock);
+
+	ctx->pending = false;
+	if (ctx->irq >= 0)
+		WARN_ON(os_write_file(irqfd, &v, sizeof(v)) != sizeof(v));
+}
+
 static irqreturn_t uml_vfio_interrupt(int unused, void *opaque)
 {
 	struct uml_vfio_intr_ctx *ctx = opaque;
 	struct uml_vfio_device *dev = ctx->dev;
 	int index = ctx - dev->intr_ctx;
 	int irqfd = dev->udev.irqfd[index];
-	int irq = dev->msix_data[index];
+	unsigned long flags;
+	bool masked;
 	uint64_t v;
 	int r;
 
 	do {
 		r = os_read_file(irqfd, &v, sizeof(v));
-		if (r == sizeof(v))
-			generic_handle_irq(irq);
+		if (r != sizeof(v))
+			continue;
+
+		raw_spin_lock_irqsave(&dev->irq_lock, flags);
+		masked = uml_vfio_irq_masked(ctx);
+		if (masked)
+			ctx->pending = true;
+		raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
+
+		if (!masked)
+			generic_handle_irq(ctx->virq);
 	} while (r == sizeof(v) || r == -EINTR);
 	WARN(r != -EAGAIN, "read returned %d\n", r);
 
@@ -224,47 +279,44 @@ static int uml_vfio_deactivate_irq(struct uml_vfio_device *dev, int index)
 	return 0;
 }
 
+static void uml_vfio_set_maskall(struct uml_vfio_device *dev, bool maskall)
+{
+	unsigned long flags;
+	int i;
+
+	raw_spin_lock_irqsave(&dev->irq_lock, flags);
+	dev->msix_maskall = maskall;
+	for (i = 0; i < dev->udev.irq_count; i++) {
+		struct uml_vfio_intr_ctx *ctx = &dev->intr_ctx[i];
+
+		if (ctx->pending && !uml_vfio_irq_masked(ctx))
+			uml_vfio_retrigger_irq(ctx);
+	}
+	raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
+}
+
 static int uml_vfio_update_msix_cap(struct uml_vfio_device *dev,
 				    unsigned int offset, int size,
 				    unsigned long val)
 {
-	/*
-	 * Here, we handle only the operations we care about,
-	 * ignoring the rest.
-	 */
-	if (size == 2 && offset == dev->msix_cap + PCI_MSIX_FLAGS) {
-		switch (val & ~PCI_MSIX_FLAGS_QSIZE) {
-		case PCI_MSIX_FLAGS_ENABLE:
-		case 0:
-			return uml_vfio_user_update_irqs(&dev->udev);
-		}
-	}
-	return 0;
-}
-
-static int uml_vfio_update_msix_table(struct uml_vfio_device *dev,
-				      unsigned int offset, int size,
-				      unsigned long val)
-{
-	int index;
+	int err = 0;
 
 	/*
 	 * Here, we handle only the operations we care about,
 	 * ignoring the rest.
 	 */
-	offset -= dev->msix_offset + PCI_MSIX_ENTRY_DATA;
-
-	if (size != 4 || offset % PCI_MSIX_ENTRY_SIZE != 0)
+	if (size != 2 || offset != dev->msix_cap + PCI_MSIX_FLAGS)
 		return 0;
 
-	index = offset / PCI_MSIX_ENTRY_SIZE;
-	if (index >= dev->udev.irq_count)
-		return -EINVAL;
+	switch (val & ~PCI_MSIX_FLAGS_QSIZE) {
+	case PCI_MSIX_FLAGS_ENABLE:
+	case 0:
+		err = uml_vfio_user_update_irqs(&dev->udev);
+		break;
+	}
 
-	dev->msix_data[index] = val;
-
-	return val ? uml_vfio_activate_irq(dev, index) :
-		uml_vfio_deactivate_irq(dev, index);
+	uml_vfio_set_maskall(dev, val & PCI_MSIX_FLAGS_MASKALL);
+	return err;
 }
 
 static unsigned long __uml_vfio_cfgspace_read(struct uml_vfio_device *dev,
@@ -340,10 +392,33 @@ static void uml_vfio_cfgspace_write(struct um_pci_device *pdev,
 	__uml_vfio_cfgspace_write(dev, offset, size, val);
 }
 
+static void *uml_vfio_find_shadow(struct uml_vfio_device *dev, int bar,
+				  unsigned int offset, int size)
+{
+	int i;
+
+	for (i = 0; i < UML_VFIO_NR_SHADOWS; i++) {
+		struct uml_vfio_shadow *shadow = &dev->shadow[i];
+
+		if (shadow->mem && shadow->bar == bar &&
+		    offset >= shadow->offset &&
+		    offset + size <= shadow->offset + shadow->size)
+			return shadow->mem + offset - shadow->offset;
+	}
+
+	return NULL;
+}
+
 static void uml_vfio_bar_copy_from(struct um_pci_device *pdev, int bar,
 				   void *buffer, unsigned int offset, int size)
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
+	void *shadow = uml_vfio_find_shadow(dev, bar, offset, size);
+
+	if (shadow) {
+		memcpy(buffer, shadow, size);
+		return;
+	}
 
 	memset(buffer, 0xff, size);
 	uml_vfio_user_bar_read(&dev->udev, bar, offset, buffer, size);
@@ -377,6 +452,12 @@ static void uml_vfio_bar_copy_to(struct um_pci_device *pdev, int bar,
 				 int size)
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
+	void *shadow = uml_vfio_find_shadow(dev, bar, offset, size);
+
+	if (shadow) {
+		memcpy(shadow, buffer, size);
+		return;
+	}
 
 	uml_vfio_user_bar_write(&dev->udev, bar, offset, buffer, size);
 }
@@ -385,12 +466,7 @@ static void uml_vfio_bar_write(struct um_pci_device *pdev, int bar,
 			       unsigned int offset, int size,
 			       unsigned long val)
 {
-	struct uml_vfio_device *dev = to_vdev(pdev);
 	u8 data[8];
-
-	if (bar == dev->msix_bar && offset + size > dev->msix_offset &&
-	    offset < dev->msix_offset + dev->msix_size)
-		WARN_ON(uml_vfio_update_msix_table(dev, offset, size, val));
 
 	switch (size) {
 	case 1:
@@ -415,11 +491,111 @@ static void uml_vfio_bar_write(struct um_pci_device *pdev, int bar,
 static void uml_vfio_bar_set(struct um_pci_device *pdev, int bar,
 			     unsigned int offset, u8 value, int size)
 {
-	struct uml_vfio_device *dev = to_vdev(pdev);
 	int i;
 
 	for (i = 0; i < size; i++)
-		uml_vfio_user_bar_write(&dev->udev, bar, offset + i, &value, 1);
+		uml_vfio_bar_copy_to(pdev, bar, offset + i, &value, 1);
+}
+
+static void __iomem *uml_vfio_bar_map(struct um_pci_device *pdev, int bar)
+{
+	return (void __iomem __force *)to_vdev(pdev)->bar_map[bar];
+}
+
+/*
+ * The first activation of a vector comes from MSI_FLAG_ACTIVATE_EARLY when
+ * the vectors are allocated, which may sleep. Later activations from
+ * request_irq() hold the irq descriptor lock and reuse the existing eventfd.
+ */
+static int uml_vfio_msi_activate(struct um_pci_device *pdev,
+				 unsigned int index, unsigned int irq)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+	struct uml_vfio_intr_ctx *ctx;
+	unsigned long flags;
+
+	if (index >= dev->udev.irq_count)
+		return -EINVAL;
+
+	ctx = &dev->intr_ctx[index];
+
+	raw_spin_lock_irqsave(&dev->irq_lock, flags);
+	ctx->virq = irq;
+	ctx->masked = true;
+	ctx->pending = false;
+	raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
+
+	return uml_vfio_activate_irq(dev, index);
+}
+
+/*
+ * Deactivation can run under the irq descriptor lock from free_irq(), so the
+ * eventfd is kept until the device is released. This also keeps the eventfd
+ * that VFIO signals valid if the vector is activated again.
+ */
+static void uml_vfio_msi_deactivate(struct um_pci_device *pdev,
+				    unsigned int index)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+	struct uml_vfio_intr_ctx *ctx;
+	unsigned long flags;
+
+	if (index >= dev->udev.irq_count)
+		return;
+
+	ctx = &dev->intr_ctx[index];
+
+	raw_spin_lock_irqsave(&dev->irq_lock, flags);
+	ctx->masked = true;
+	ctx->pending = false;
+	raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
+}
+
+static void uml_vfio_msi_mask(struct um_pci_device *pdev, unsigned int index,
+			      bool masked)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+	struct uml_vfio_intr_ctx *ctx;
+	unsigned long flags;
+
+	if (index >= dev->udev.irq_count)
+		return;
+
+	ctx = &dev->intr_ctx[index];
+
+	raw_spin_lock_irqsave(&dev->irq_lock, flags);
+	ctx->masked = masked;
+	if (ctx->pending && !uml_vfio_irq_masked(ctx))
+		uml_vfio_retrigger_irq(ctx);
+	raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
+}
+
+/*
+ * Called by the irq core to resend an interrupt that arrived while it was
+ * disabled. A masked vector records it as pending instead.
+ */
+static bool uml_vfio_msi_retrigger(struct um_pci_device *pdev,
+				   unsigned int index)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+	struct uml_vfio_intr_ctx *ctx;
+	unsigned long flags;
+	bool ret;
+
+	if (index >= dev->udev.irq_count)
+		return false;
+
+	ctx = &dev->intr_ctx[index];
+
+	raw_spin_lock_irqsave(&dev->irq_lock, flags);
+	ret = ctx->irq >= 0;
+	if (uml_vfio_irq_masked(ctx))
+		ctx->pending = true;
+	else
+		uml_vfio_retrigger_irq(ctx);
+	raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
+
+	return ret;
 }
 
 static const struct um_pci_ops uml_vfio_um_pci_ops = {
@@ -430,6 +606,11 @@ static const struct um_pci_ops uml_vfio_um_pci_ops = {
 	.bar_copy_from	= uml_vfio_bar_copy_from,
 	.bar_copy_to	= uml_vfio_bar_copy_to,
 	.bar_set	= uml_vfio_bar_set,
+	.bar_map	= uml_vfio_bar_map,
+	.msi_activate	= uml_vfio_msi_activate,
+	.msi_deactivate	= uml_vfio_msi_deactivate,
+	.msi_mask	= uml_vfio_msi_mask,
+	.msi_retrigger	= uml_vfio_msi_retrigger,
 };
 
 static u8 uml_vfio_find_capability(struct uml_vfio_device *dev, u8 cap)
@@ -455,11 +636,11 @@ static u8 uml_vfio_find_capability(struct uml_vfio_device *dev, u8 cap)
 	return 0;
 }
 
-static int uml_vfio_read_msix_table(struct uml_vfio_device *dev)
+static int uml_vfio_read_msix_cap(struct uml_vfio_device *dev)
 {
 	unsigned int off;
+	u32 tbl, pba;
 	u16 flags;
-	u32 tbl;
 
 	off = uml_vfio_find_capability(dev, PCI_CAP_ID_MSIX);
 	if (!off)
@@ -468,15 +649,109 @@ static int uml_vfio_read_msix_table(struct uml_vfio_device *dev)
 	dev->msix_cap = off;
 
 	tbl = __uml_vfio_cfgspace_read(dev, off + PCI_MSIX_TABLE, sizeof(tbl));
+	pba = __uml_vfio_cfgspace_read(dev, off + PCI_MSIX_PBA, sizeof(pba));
 	flags = __uml_vfio_cfgspace_read(dev, off + PCI_MSIX_FLAGS, sizeof(flags));
 
-	dev->msix_bar = tbl & PCI_MSIX_TABLE_BIR;
-	dev->msix_offset = tbl & PCI_MSIX_TABLE_OFFSET;
-	dev->msix_size = ((flags & PCI_MSIX_FLAGS_QSIZE) + 1) * PCI_MSIX_ENTRY_SIZE;
+	dev->msix_entries = (flags & PCI_MSIX_FLAGS_QSIZE) + 1;
 
-	dev->msix_data = kzalloc(dev->msix_size, GFP_KERNEL);
-	if (!dev->msix_data)
-		return -ENOMEM;
+	dev->shadow[UML_VFIO_SHADOW_TABLE] = (struct uml_vfio_shadow) {
+		.bar = tbl & PCI_MSIX_TABLE_BIR,
+		.offset = tbl & PCI_MSIX_TABLE_OFFSET,
+		.size = dev->msix_entries * PCI_MSIX_ENTRY_SIZE,
+	};
+	dev->shadow[UML_VFIO_SHADOW_PBA] = (struct uml_vfio_shadow) {
+		.bar = pba & PCI_MSIX_PBA_BIR,
+		.offset = pba & PCI_MSIX_PBA_OFFSET,
+		.size = DIV_ROUND_UP(dev->msix_entries, 64) * sizeof(u64),
+	};
+
+	if (dev->shadow[UML_VFIO_SHADOW_TABLE].bar >= PCI_STD_NUM_BARS ||
+	    dev->shadow[UML_VFIO_SHADOW_PBA].bar >= PCI_STD_NUM_BARS)
+		return -EINVAL;
+
+	return 0;
+}
+
+static bool uml_vfio_bar_is_mem(struct uml_vfio_device *dev, int bar)
+{
+	u32 val;
+
+	val = __uml_vfio_cfgspace_read(dev, PCI_BASE_ADDRESS_0 + bar * 4,
+				       sizeof(val));
+	return (val & PCI_BASE_ADDRESS_SPACE) == PCI_BASE_ADDRESS_SPACE_MEMORY;
+}
+
+static void uml_vfio_unmap_bars(struct uml_vfio_device *dev)
+{
+	int i;
+
+	for (i = 0; i < UML_VFIO_NR_SHADOWS; i++) {
+		struct uml_vfio_shadow *shadow = &dev->shadow[i];
+
+		if (!dev->bar_map[shadow->bar])
+			kfree(shadow->mem);
+		shadow->mem = NULL;
+	}
+
+	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+		if (dev->bar_map[i])
+			uml_vfio_user_unmap_bar(&dev->udev, i, dev->bar_map[i]);
+		dev->bar_map[i] = NULL;
+	}
+}
+
+/*
+ * Map each memory BAR directly, with the MSI-X table and PBA backed by
+ * shadow memory. BARs that cannot be mapped are accessed through the VFIO
+ * device fd, with the shadows in kernel memory.
+ */
+static int uml_vfio_map_bars(struct uml_vfio_device *dev)
+{
+	struct uml_vfio_user_range ranges[UML_VFIO_NR_SHADOWS];
+	struct uml_vfio_shadow *shadow;
+	int bar, i, n;
+
+	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+		if (bar >= dev->udev.num_regions || !dev->udev.region[bar].size)
+			continue;
+		if (!uml_vfio_bar_is_mem(dev, bar))
+			continue;
+
+		n = 0;
+		for (i = 0; i < UML_VFIO_NR_SHADOWS; i++) {
+			shadow = &dev->shadow[i];
+			if (shadow->bar != bar)
+				continue;
+			ranges[n].offset = shadow->offset;
+			ranges[n].size = shadow->size;
+			n++;
+		}
+
+		dev->bar_map[bar] = uml_vfio_user_map_bar(&dev->udev, bar,
+							  ranges, n);
+		if (!dev->bar_map[bar])
+			pr_warn("BAR %d of %s cannot be mapped, using trapped access\n",
+				bar, dev->name);
+	}
+
+	for (i = 0; i < UML_VFIO_NR_SHADOWS; i++) {
+		shadow = &dev->shadow[i];
+		if (dev->bar_map[shadow->bar])
+			shadow->mem = dev->bar_map[shadow->bar] + shadow->offset;
+		else
+			shadow->mem = kzalloc(shadow->size, GFP_KERNEL);
+		if (!shadow->mem) {
+			uml_vfio_unmap_bars(dev);
+			return -ENOMEM;
+		}
+	}
+
+	/* Vectors are masked at reset. */
+	for (i = 0; i < dev->msix_entries; i++)
+		put_unaligned_le32(PCI_MSIX_ENTRY_CTRL_MASKBIT,
+				   dev->shadow[UML_VFIO_SHADOW_TABLE].mem +
+				   i * PCI_MSIX_ENTRY_SIZE +
+				   PCI_MSIX_ENTRY_VECTOR_CTRL);
 
 	return 0;
 }
@@ -507,9 +782,16 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 		goto release_group;
 	}
 
-	err = uml_vfio_read_msix_table(dev);
+	err = uml_vfio_read_msix_cap(dev);
 	if (err) {
-		pr_err("Failed to read MSI-X table (%s), error %d\n",
+		pr_err("Failed to read MSI-X capability (%s), error %d\n",
+		       dev->name, err);
+		goto teardown_udev;
+	}
+
+	err = uml_vfio_map_bars(dev);
+	if (err) {
+		pr_err("Failed to map BARs (%s), error %d\n",
 		       dev->name, err);
 		goto teardown_udev;
 	}
@@ -519,13 +801,16 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 	if (!dev->intr_ctx) {
 		pr_err("Failed to allocate interrupt context (%s)\n",
 		       dev->name);
-		goto free_msix;
+		goto unmap_bars;
 	}
 
+	raw_spin_lock_init(&dev->irq_lock);
 	for (i = 0; i < dev->udev.irq_count; i++) {
 		ctx = &dev->intr_ctx[i];
 		ctx->dev = dev;
 		ctx->irq = -1;
+		ctx->masked = true;
+		ctx->pending = false;
 	}
 
 	dev->pdev.ops = &uml_vfio_um_pci_ops;
@@ -541,8 +826,8 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 
 free_intr_ctx:
 	kfree(dev->intr_ctx);
-free_msix:
-	kfree(dev->msix_data);
+unmap_bars:
+	uml_vfio_unmap_bars(dev);
 teardown_udev:
 	uml_vfio_user_teardown_device(&dev->udev);
 release_group:
@@ -563,7 +848,7 @@ static void uml_vfio_release_device(struct uml_vfio_device *dev)
 
 	um_pci_device_unregister(&dev->pdev);
 	kfree(dev->intr_ctx);
-	kfree(dev->msix_data);
+	uml_vfio_unmap_bars(dev);
 	uml_vfio_user_teardown_device(&dev->udev);
 	uml_vfio_release_group(dev->group);
 	list_del(&dev->list);

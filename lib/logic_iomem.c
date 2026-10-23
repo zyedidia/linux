@@ -102,6 +102,12 @@ void __iomem *ioremap(phys_addr_t offset, size_t size)
 	if (!found)
 		goto out;
 
+	if (IS_ENABLED(CONFIG_INDIRECT_IOMEM_FALLBACK) && found->ops->map_direct) {
+		ret = found->ops->map_direct(offset - found->res->start, size);
+		if (ret)
+			goto out;
+	}
+
 	for (i = 0; i < MAX_AREAS; i++) {
 		long offs;
 
@@ -138,8 +144,10 @@ get_area(const volatile void __iomem *addr)
 	unsigned long a = (unsigned long)addr;
 	unsigned int idx;
 
-	if (WARN_ON((a & IOREMAP_MASK) != IOREMAP_BIAS))
+	if ((a & IOREMAP_MASK) != IOREMAP_BIAS) {
+		WARN_ON(!IS_ENABLED(CONFIG_INDIRECT_IOMEM_FALLBACK));
 		return NULL;
+	}
 
 	idx = (a & AREA_BITS) >> AREA_SHIFT;
 

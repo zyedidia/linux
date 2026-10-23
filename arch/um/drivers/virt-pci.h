@@ -30,6 +30,25 @@ struct um_pci_ops {
 			    unsigned int offset, const void *buffer, int size);
 	void (*bar_set)(struct um_pci_device *dev, int bar,
 			unsigned int offset, u8 value, int size);
+
+	/*
+	 * Optional. Return a pointer to a direct mapping of the BAR, or NULL
+	 * to access it through the ops above.
+	 */
+	void __iomem *(*bar_map)(struct um_pci_device *dev, int bar);
+
+	/* Optional. Called when an MSI or MSI-X vector is set up or torn down. */
+	int (*msi_activate)(struct um_pci_device *dev, unsigned int index,
+			    unsigned int irq);
+	void (*msi_deactivate)(struct um_pci_device *dev, unsigned int index);
+	/* Optional. Called when a vector is masked or unmasked. */
+	void (*msi_mask)(struct um_pci_device *dev, unsigned int index,
+			 bool masked);
+	/*
+	 * Optional. Resend an interrupt on a vector. Return true if the
+	 * interrupt will be delivered again.
+	 */
+	bool (*msi_retrigger)(struct um_pci_device *dev, unsigned int index);
 };
 
 int um_pci_device_register(struct um_pci_device *dev);
