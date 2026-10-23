@@ -10,6 +10,8 @@
 #include <linux/logic_iomem.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <irq_kern.h>
@@ -29,6 +31,25 @@ struct uml_vfio_intr_ctx {
 	int virq;
 	bool masked;
 	bool pending;
+
+	/*
+	 * Counters, protected by irq_lock. Signals is the sum of the eventfd
+	 * counts read, and each read is either delivered to the driver or
+	 * deferred because the vector is masked. Replays are deferred or
+	 * resent interrupts written back to the eventfd.
+	 */
+	u64 signals;
+	u64 delivered;
+	u64 deferred;
+	u64 replays;
+};
+
+/* Accesses that are forwarded to the VFIO device fd. */
+struct uml_vfio_access_stats {
+	atomic64_t cfg_reads;
+	atomic64_t cfg_writes;
+	atomic64_t bar_reads;
+	atomic64_t bar_writes;
 };
 
 /*
@@ -78,6 +99,10 @@ struct uml_vfio_device {
 	u8 msix_next;
 	/* Protects the mask state of the device and its vectors. */
 	raw_spinlock_t irq_lock;
+
+	struct uml_vfio_access_stats stats;
+	/* Set while the device is registered, for the proc file. */
+	bool registered;
 
 	struct list_head list;
 };
@@ -220,8 +245,10 @@ static void uml_vfio_retrigger_irq(struct uml_vfio_intr_ctx *ctx)
 	lockdep_assert_held(&dev->irq_lock);
 
 	ctx->pending = false;
-	if (ctx->irq >= 0)
+	if (ctx->irq >= 0) {
 		WARN_ON(os_write_file(irqfd, &v, sizeof(v)) != sizeof(v));
+		ctx->replays++;
+	}
 }
 
 static irqreturn_t uml_vfio_interrupt(int unused, void *opaque)
@@ -244,6 +271,11 @@ static irqreturn_t uml_vfio_interrupt(int unused, void *opaque)
 		masked = uml_vfio_irq_masked(ctx);
 		if (masked)
 			ctx->pending = true;
+		ctx->signals += v;
+		if (masked)
+			ctx->deferred++;
+		else
+			ctx->delivered++;
 		raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
 
 		if (!masked)
@@ -422,6 +454,8 @@ static unsigned long uml_vfio_cfgspace_read(struct um_pci_device *pdev,
 	unsigned long val = __uml_vfio_cfgspace_read(dev, offset, size);
 	int shift;
 
+	atomic64_inc(&dev->stats.cfg_reads);
+
 	if (dev->msix_hidden && dev->msix_ptr >= offset &&
 	    dev->msix_ptr < offset + size) {
 		shift = (dev->msix_ptr - offset) * 8;
@@ -464,6 +498,8 @@ static void uml_vfio_cfgspace_write(struct um_pci_device *pdev,
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
 
+	atomic64_inc(&dev->stats.cfg_writes);
+
 	if (dev->msix_cap)
 		WARN_ON(uml_vfio_update_msix_cap(dev, offset, size, val));
 	if (dev->msi_cap)
@@ -500,6 +536,7 @@ static void uml_vfio_bar_copy_from(struct um_pci_device *pdev, int bar,
 		return;
 	}
 
+	atomic64_inc(&dev->stats.bar_reads);
 	memset(buffer, 0xff, size);
 	uml_vfio_user_bar_read(&dev->udev, bar, offset, buffer, size);
 }
@@ -539,6 +576,7 @@ static void uml_vfio_bar_copy_to(struct um_pci_device *pdev, int bar,
 		return;
 	}
 
+	atomic64_inc(&dev->stats.bar_writes);
 	uml_vfio_user_bar_write(&dev->udev, bar, offset, buffer, size);
 }
 
@@ -930,7 +968,7 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 		goto teardown_udev;
 	}
 
-	dev->intr_ctx = kmalloc_objs(struct uml_vfio_intr_ctx,
+	dev->intr_ctx = kzalloc_objs(struct uml_vfio_intr_ctx,
 				     dev->udev.irq_count);
 	if (!dev->intr_ctx) {
 		pr_err("Failed to allocate interrupt context (%s)\n",
@@ -958,6 +996,8 @@ static void uml_vfio_open_device(struct uml_vfio_device *dev)
 		goto free_intr_ctx;
 	}
 
+	scoped_guard(mutex, &uml_vfio_devices_mtx)
+		dev->registered = true;
 	return;
 
 free_intr_ctx:
@@ -969,7 +1009,8 @@ teardown_udev:
 release_group:
 	uml_vfio_release_group(dev->group);
 free_dev:
-	list_del(&dev->list);
+	scoped_guard(mutex, &uml_vfio_devices_mtx)
+		list_del(&dev->list);
 	kfree(dev->name);
 	kfree(dev);
 }
@@ -977,6 +1018,9 @@ free_dev:
 static void uml_vfio_release_device(struct uml_vfio_device *dev)
 {
 	int i;
+
+	scoped_guard(mutex, &uml_vfio_devices_mtx)
+		dev->registered = false;
 
 	scoped_guard(raw_spinlock_irqsave, &dev->mode_lock)
 		uml_vfio_set_irq_mode(dev, UML_VFIO_IRQ_NONE);
@@ -988,7 +1032,8 @@ static void uml_vfio_release_device(struct uml_vfio_device *dev)
 	uml_vfio_unmap_bars(dev);
 	uml_vfio_user_teardown_device(&dev->udev);
 	uml_vfio_release_group(dev->group);
-	list_del(&dev->list);
+	scoped_guard(mutex, &uml_vfio_devices_mtx)
+		list_del(&dev->list);
 	kfree(dev->name);
 	kfree(dev);
 }
@@ -1102,6 +1147,79 @@ static struct mc_device uml_vfio_mc = {
 	.remove         = uml_vfio_mc_remove,
 };
 
+static const char *const uml_vfio_irq_mode_names[] = {
+	[UML_VFIO_IRQ_NONE] = "none",
+	[UML_VFIO_IRQ_MSI] = "msi",
+	[UML_VFIO_IRQ_MSIX] = "msix",
+};
+
+static void uml_vfio_show_device(struct seq_file *m,
+				 struct uml_vfio_device *dev)
+{
+	struct uml_vfio_access_stats *stats = &dev->stats;
+	unsigned long flags;
+	int i;
+
+	seq_printf(m, "device %s\n", dev->name);
+	seq_printf(m, "  %-18s %s\n", "irq_mode",
+		   uml_vfio_irq_mode_names[READ_ONCE(dev->irq_mode)]);
+
+	for (i = 0; i < PCI_STD_NUM_BARS && i < dev->udev.num_regions; i++) {
+		char name[8];
+
+		if (!dev->udev.region[i].size)
+			continue;
+		snprintf(name, sizeof(name), "bar%d", i);
+		seq_printf(m, "  %-18s %s 0x%llx\n", name,
+			   dev->bar_map[i] ? "direct" : "trapped",
+			   (unsigned long long)dev->udev.region[i].size);
+	}
+
+	seq_printf(m, "  %-18s %lld\n", "cfg_reads",
+		   atomic64_read(&stats->cfg_reads));
+	seq_printf(m, "  %-18s %lld\n", "cfg_writes",
+		   atomic64_read(&stats->cfg_writes));
+	seq_printf(m, "  %-18s %lld\n", "bar_reads",
+		   atomic64_read(&stats->bar_reads));
+	seq_printf(m, "  %-18s %lld\n", "bar_writes",
+		   atomic64_read(&stats->bar_writes));
+
+	seq_printf(m, "  %-6s %12s %12s %12s %12s\n", "vector", "signals",
+		   "delivered", "deferred", "replays");
+	for (i = 0; i < dev->udev.irq_count; i++) {
+		struct uml_vfio_intr_ctx *ctx = &dev->intr_ctx[i];
+		u64 signals, delivered, deferred, replays;
+
+		if (ctx->irq < 0)
+			continue;
+
+		raw_spin_lock_irqsave(&dev->irq_lock, flags);
+		signals = ctx->signals;
+		delivered = ctx->delivered;
+		deferred = ctx->deferred;
+		replays = ctx->replays;
+		raw_spin_unlock_irqrestore(&dev->irq_lock, flags);
+
+		seq_printf(m, "  %-6d %12llu %12llu %12llu %12llu\n", i,
+			   signals, delivered, deferred, replays);
+	}
+}
+
+static int __maybe_unused uml_vfio_proc_show(struct seq_file *m, void *v)
+{
+	struct uml_vfio_device *dev;
+
+	uml_vfio_dma_show(m);
+
+	guard(mutex)(&uml_vfio_devices_mtx);
+	list_for_each_entry(dev, &uml_vfio_devices, list) {
+		if (dev->registered)
+			uml_vfio_show_device(m, dev);
+	}
+
+	return 0;
+}
+
 static int __init uml_vfio_init(void)
 {
 	struct uml_vfio_device *dev, *n;
@@ -1113,6 +1231,7 @@ static int __init uml_vfio_init(void)
 		uml_vfio_open_device(dev);
 
 	mconsole_register_dev(&uml_vfio_mc);
+	proc_create_single("vfio_uml", 0444, NULL, uml_vfio_proc_show);
 
 	return 0;
 }
@@ -1121,6 +1240,8 @@ late_initcall(uml_vfio_init);
 static void __exit uml_vfio_exit(void)
 {
 	struct uml_vfio_device *dev, *n;
+
+	remove_proc_entry("vfio_uml", NULL);
 
 	list_for_each_entry_safe(dev, n, &uml_vfio_devices, list)
 		uml_vfio_release_device(dev);

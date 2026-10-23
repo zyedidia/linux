@@ -11,6 +11,7 @@
 #include <linux/iova.h>
 #include <linux/mm.h>
 #include <linux/scatterlist.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 
 #include "vfio_dma.h"
@@ -23,6 +24,36 @@ static struct {
 	unsigned long limit_pfn;
 	bool ready;
 } uml_vfio_dma;
+
+/*
+ * Counters for the container. Byte counts are of whole pages, which is what
+ * the host pins.
+ */
+static struct {
+	atomic64_t maps;
+	atomic64_t unmaps;
+	atomic64_t map_errors;
+	atomic64_t unmap_errors;
+	atomic64_t mapped_bytes;
+	atomic64_t live_bytes;
+	atomic64_t peak_bytes;
+} uml_vfio_dma_stats;
+
+static void uml_vfio_dma_count_map(unsigned long npages)
+{
+	s64 bytes = (s64)npages << PAGE_SHIFT;
+	s64 live, peak;
+
+	atomic64_inc(&uml_vfio_dma_stats.maps);
+	atomic64_add(bytes, &uml_vfio_dma_stats.mapped_bytes);
+	live = atomic64_add_return(bytes, &uml_vfio_dma_stats.live_bytes);
+
+	peak = atomic64_read(&uml_vfio_dma_stats.peak_bytes);
+	while (live > peak &&
+	       !atomic64_try_cmpxchg(&uml_vfio_dma_stats.peak_bytes, &peak,
+				     live))
+		;
+}
 
 static unsigned long uml_vfio_dma_limit_pfn(u64 mask)
 {
@@ -60,19 +91,23 @@ static dma_addr_t uml_vfio_dma_map(unsigned long vaddr, size_t size, u64 mask,
 		return DMA_MAPPING_ERROR;
 
 	pfn = uml_vfio_dma_alloc_iova(npages, mask);
-	if (!pfn)
+	if (!pfn) {
+		atomic64_inc(&uml_vfio_dma_stats.map_errors);
 		return DMA_MAPPING_ERROR;
+	}
 
 	err = uml_vfio_user_dma_map(uml_vfio_dma.container, vaddr - offset,
 				    (u64)pfn << PAGE_SHIFT,
 				    (u64)npages << PAGE_SHIFT, read, write);
 	if (err) {
 		free_iova(&uml_vfio_dma.iovad, pfn);
+		atomic64_inc(&uml_vfio_dma_stats.map_errors);
 		pr_warn_ratelimited("Failed to map %zu bytes for DMA, error %d\n",
 				    size, err);
 		return DMA_MAPPING_ERROR;
 	}
 
+	uml_vfio_dma_count_map(npages);
 	return ((dma_addr_t)pfn << PAGE_SHIFT) + offset;
 }
 
@@ -92,10 +127,15 @@ static void uml_vfio_dma_unmap(dma_addr_t addr, size_t size)
 	 */
 	if (WARN(r != (int64_t)npages << PAGE_SHIFT,
 		 "DMA unmap of 0x%llx (0x%lx pages) returned %lld\n",
-		 iova, npages, (long long)r))
+		 iova, npages, (long long)r)) {
+		atomic64_inc(&uml_vfio_dma_stats.unmap_errors);
 		return;
+	}
 
 	free_iova(&uml_vfio_dma.iovad, iova >> PAGE_SHIFT);
+	atomic64_inc(&uml_vfio_dma_stats.unmaps);
+	atomic64_sub((s64)npages << PAGE_SHIFT,
+		     &uml_vfio_dma_stats.live_bytes);
 }
 
 static bool uml_vfio_dma_read(enum dma_data_direction dir)
@@ -291,6 +331,25 @@ int uml_vfio_dma_add_group(int container)
 out:
 	kfree(ranges);
 	return err;
+}
+
+void uml_vfio_dma_show(struct seq_file *m)
+{
+	seq_puts(m, "dma\n");
+	seq_printf(m, "  %-18s %lld\n", "maps",
+		   atomic64_read(&uml_vfio_dma_stats.maps));
+	seq_printf(m, "  %-18s %lld\n", "unmaps",
+		   atomic64_read(&uml_vfio_dma_stats.unmaps));
+	seq_printf(m, "  %-18s %lld\n", "map_errors",
+		   atomic64_read(&uml_vfio_dma_stats.map_errors));
+	seq_printf(m, "  %-18s %lld\n", "unmap_errors",
+		   atomic64_read(&uml_vfio_dma_stats.unmap_errors));
+	seq_printf(m, "  %-18s %lld\n", "mapped_bytes",
+		   atomic64_read(&uml_vfio_dma_stats.mapped_bytes));
+	seq_printf(m, "  %-18s %lld\n", "live_bytes",
+		   atomic64_read(&uml_vfio_dma_stats.live_bytes));
+	seq_printf(m, "  %-18s %lld\n", "peak_live_bytes",
+		   atomic64_read(&uml_vfio_dma_stats.peak_bytes));
 }
 
 /* Tear down the IOVA domain after the last group has left the container. */

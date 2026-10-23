@@ -4,9 +4,12 @@
 
 #include <linux/dma-map-ops.h>
 
+struct seq_file;
+
 extern const struct dma_map_ops uml_vfio_dma_ops;
 
 int uml_vfio_dma_add_group(int container);
 void uml_vfio_dma_release(void);
+void uml_vfio_dma_show(struct seq_file *m);
 
 #endif /* __UM_VFIO_DMA_H */
