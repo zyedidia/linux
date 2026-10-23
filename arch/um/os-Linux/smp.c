@@ -33,6 +33,7 @@ static void *cpu_thread(void *arg)
 	struct cpu_thread_data *data = arg;
 
 	__curr_cpu = data->cpu;
+	os_pin_cpu_thread(data->cpu);
 
 	uml_start_secondary(data);
 

@@ -15,6 +15,7 @@
 #include <kern_util.h>
 #include <os.h>
 #include <um_malloc.h>
+#include "internal.h"
 
 struct helper_data {
 	void (*pre_exec)(void*);
@@ -196,7 +197,7 @@ int os_run_helper_thread(struct os_helper_thread **td_out,
 		return err;
 	}
 
-	err = pthread_create(&td->handle, NULL, routine, arg);
+	err = os_create_helper_thread(&td->handle, routine, arg);
 
 	if (sigprocmask(SIG_SETMASK, &oset, NULL) < 0)
 		panic("Failed to restore the signal mask: %d", errno);

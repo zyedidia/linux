@@ -484,6 +484,8 @@ int start_userspace(struct mm_id *mm_id)
 		goto out_close;
 	}
 
+	os_pin_userspace(mm_id->pid);
+
 	if (using_seccomp) {
 		wait_stub_done_seccomp(mm_id, 1, 1);
 	} else {

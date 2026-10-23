@@ -4,6 +4,7 @@
 
 #include <mm_id.h>
 #include <stub-data.h>
+#include <pthread.h>
 #include <signal.h>
 
 /*
@@ -16,6 +17,14 @@ int os_epoll_fd(void);
  */
 void sigio_idle_enter(void);
 int sigio_idle_exit(void);
+
+/*
+ * pin.c
+ */
+void os_pin_cpu_thread(int cpu);
+void os_pin_userspace(int pid);
+int os_create_helper_thread(pthread_t *thread, void *(*routine)(void *),
+			    void *arg);
 
 /*
  * elf_aux.c
