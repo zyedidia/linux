@@ -253,38 +253,46 @@ int uml_vfio_user_unset_container(int container, int group)
 	return 0;
 }
 
-static int vfio_set_irqs(int device, int start, int count, int *irqfd)
+static int vfio_irq_index(int mode)
 {
-	struct vfio_irq_set *irq_set;
-	int argsz = sizeof(*irq_set) + sizeof(*irqfd) * count;
-	int err = 0;
+	return mode == UML_VFIO_IRQ_MSI ? VFIO_PCI_MSI_IRQ_INDEX :
+					  VFIO_PCI_MSIX_IRQ_INDEX;
+}
 
-	irq_set = uml_kmalloc(argsz, UM_GFP_KERNEL);
-	if (!irq_set)
-		return -ENOMEM;
-
-	irq_set->argsz = argsz;
-	irq_set->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
-	irq_set->index = VFIO_PCI_MSIX_IRQ_INDEX;
+static int vfio_set_irqs(int device, struct vfio_irq_set *irq_set, int mode,
+			 int start, int count, const int32_t *irqfd)
+{
+	irq_set->argsz = sizeof(*irq_set) + sizeof(*irqfd) * count;
+	irq_set->flags = VFIO_IRQ_SET_ACTION_TRIGGER;
+	irq_set->flags |= irqfd ? VFIO_IRQ_SET_DATA_EVENTFD :
+				  VFIO_IRQ_SET_DATA_NONE;
+	irq_set->index = vfio_irq_index(mode);
 	irq_set->start = start;
 	irq_set->count = count;
-	memcpy(irq_set->data, irqfd, sizeof(*irqfd) * count);
+	if (irqfd)
+		memcpy(irq_set->data, irqfd, sizeof(*irqfd) * count);
 
-	if (ioctl(device, VFIO_DEVICE_SET_IRQS, irq_set) < 0) {
-		err = -errno;
-		goto out;
-	}
+	if (ioctl(device, VFIO_DEVICE_SET_IRQS, irq_set) < 0)
+		return -errno;
+	return 0;
+}
 
-out:
-	kfree(irq_set);
-	return err;
+static int vfio_get_irq_count(int device, unsigned int index)
+{
+	struct vfio_irq_info irq_info = {
+		.argsz = sizeof(irq_info),
+		.index = index,
+	};
+
+	if (ioctl(device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0)
+		return -errno;
+	return irq_info.count;
 }
 
 int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 			       int group, const char *device)
 {
 	struct vfio_device_info device_info = { .argsz = sizeof(device_info) };
-	struct vfio_irq_info irq_info = { .argsz = sizeof(irq_info) };
 	int err, i;
 
 	dev->device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, device);
@@ -320,26 +328,41 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 		dev->region[i].offset = region.offset;
 	}
 
-	/* Only MSI-X is supported currently. */
-	irq_info.index = VFIO_PCI_MSIX_IRQ_INDEX;
-	if (ioctl(dev->device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info) < 0) {
-		err = -errno;
+	dev->msix_count = vfio_get_irq_count(dev->device,
+					     VFIO_PCI_MSIX_IRQ_INDEX);
+	dev->msi_count = vfio_get_irq_count(dev->device, VFIO_PCI_MSI_IRQ_INDEX);
+	if (dev->msix_count < 0 || dev->msi_count < 0) {
+		err = dev->msix_count < 0 ? dev->msix_count : dev->msi_count;
 		goto free_region;
 	}
 
-	dev->irq_count = irq_info.count;
+	/* Only single-vector MSI is supported. */
+	if (dev->msi_count > 1)
+		dev->msi_count = 1;
 
-	dev->irqfd = uml_kmalloc(sizeof(int) * dev->irq_count, UM_GFP_KERNEL);
+	dev->irq_count = dev->msix_count > dev->msi_count ?
+			 dev->msix_count : dev->msi_count;
+	if (!dev->irq_count) {
+		err = -ENODEV;
+		goto free_region;
+	}
+
+	dev->irqfd = uml_kmalloc(sizeof(int32_t) * dev->irq_count,
+				 UM_GFP_KERNEL);
 	if (!dev->irqfd) {
 		err = -ENOMEM;
 		goto free_region;
 	}
 
-	memset(dev->irqfd, -1, sizeof(int) * dev->irq_count);
+	memset(dev->irqfd, -1, sizeof(int32_t) * dev->irq_count);
 
-	err = vfio_set_irqs(dev->device, 0, dev->irq_count, dev->irqfd);
-	if (err)
+	dev->irq_set = uml_kmalloc(sizeof(struct vfio_irq_set) +
+				   sizeof(int32_t) * dev->irq_count,
+				   UM_GFP_KERNEL);
+	if (!dev->irq_set) {
+		err = -ENOMEM;
 		goto free_irqfd;
+	}
 
 	return 0;
 
@@ -354,6 +377,7 @@ close_device:
 
 void uml_vfio_user_teardown_device(struct uml_vfio_user_device *dev)
 {
+	kfree(dev->irq_set);
 	kfree(dev->irqfd);
 	kfree(dev->region);
 	close(dev->device);
@@ -377,9 +401,43 @@ void uml_vfio_user_deactivate_irq(struct uml_vfio_user_device *dev, int index)
 	dev->irqfd[index] = -1;
 }
 
-int uml_vfio_user_update_irqs(struct uml_vfio_user_device *dev)
+static int vfio_mode_irq_count(struct uml_vfio_user_device *dev, int mode)
 {
-	return vfio_set_irqs(dev->device, 0, dev->irq_count, dev->irqfd);
+	return mode == UML_VFIO_IRQ_MSI ? dev->msi_count : dev->msix_count;
+}
+
+/*
+ * Enable the interrupt mode on the host and set the eventfds of all its
+ * vectors. This does not allocate, since it is called with a raw spinlock
+ * held.
+ */
+int uml_vfio_user_enable_irqs(struct uml_vfio_user_device *dev, int mode)
+{
+	return vfio_set_irqs(dev->device, dev->irq_set, mode, 0,
+			     vfio_mode_irq_count(dev, mode), dev->irqfd);
+}
+
+/* Set the eventfd of one vector of an enabled interrupt mode. */
+int uml_vfio_user_update_irq(struct uml_vfio_user_device *dev, int mode,
+			     int index)
+{
+	union {
+		struct vfio_irq_set set;
+		char buf[sizeof(struct vfio_irq_set) + sizeof(int32_t)];
+	} irq_set;
+
+	if (index >= vfio_mode_irq_count(dev, mode))
+		return -EINVAL;
+
+	return vfio_set_irqs(dev->device, &irq_set.set, mode, index, 1,
+			     &dev->irqfd[index]);
+}
+
+int uml_vfio_user_disable_irqs(struct uml_vfio_user_device *dev, int mode)
+{
+	struct vfio_irq_set irq_set;
+
+	return vfio_set_irqs(dev->device, &irq_set, mode, 0, 0, NULL);
 }
 
 static int vfio_region_read(struct uml_vfio_user_device *dev, unsigned int index,

@@ -189,5 +189,5 @@ config UML_PCI_OVER_VFIO
 	select IOMMU_IOVA
 	help
 	  This driver provides support for VFIO-based PCI passthrough.
-	  Currently, only MSI-X capable devices are supported, and it
-	  is assumed that drivers will use MSI-X.
+	  Devices must support MSI-X or MSI. Legacy INTx interrupts are
+	  not supported.

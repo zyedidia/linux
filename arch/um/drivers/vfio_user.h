@@ -13,6 +13,12 @@ struct uml_vfio_user_iova_range {
 	uint64_t end;
 };
 
+enum {
+	UML_VFIO_IRQ_NONE,
+	UML_VFIO_IRQ_MSI,
+	UML_VFIO_IRQ_MSIX,
+};
+
 struct uml_vfio_user_device {
 	int device;
 
@@ -22,8 +28,13 @@ struct uml_vfio_user_device {
 	} *region;
 	int num_regions;
 
+	/* Eventfds of the vectors, shared by MSI and MSI-X. */
 	int32_t *irqfd;
 	int irq_count;
+	int msi_count;
+	int msix_count;
+	/* Buffer for setting the eventfds of every vector. */
+	void *irq_set;
 };
 
 int uml_vfio_user_open_container(void);
@@ -45,7 +56,10 @@ void uml_vfio_user_teardown_device(struct uml_vfio_user_device *dev);
 
 int uml_vfio_user_activate_irq(struct uml_vfio_user_device *dev, int index);
 void uml_vfio_user_deactivate_irq(struct uml_vfio_user_device *dev, int index);
-int uml_vfio_user_update_irqs(struct uml_vfio_user_device *dev);
+int uml_vfio_user_enable_irqs(struct uml_vfio_user_device *dev, int mode);
+int uml_vfio_user_update_irq(struct uml_vfio_user_device *dev, int mode,
+			     int index);
+int uml_vfio_user_disable_irqs(struct uml_vfio_user_device *dev, int mode);
 
 int uml_vfio_user_cfgspace_read(struct uml_vfio_user_device *dev,
 				unsigned int offset, void *buf, int size);
