@@ -4,6 +4,7 @@
 #define __UML_ARCH_H__
 
 extern void * __init uml_load_file(const char *filename, unsigned long long *size);
+extern void * __init uml_load_fd(int fd, const char *name, unsigned long long *size);
 
 #ifdef CONFIG_OF
 extern void __init uml_dtb_init(void);

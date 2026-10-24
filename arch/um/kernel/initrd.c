@@ -6,6 +6,8 @@
 #include <linux/init.h>
 #include <linux/memblock.h>
 #include <linux/initrd.h>
+#include <linux/kstrtox.h>
+#include <linux/string.h>
 #include <asm/types.h>
 #include <init.h>
 #include <os.h>
@@ -19,11 +21,21 @@ int __init read_initrd(void)
 {
 	unsigned long long size;
 	void *area;
+	int fd;
 
 	if (!initrd)
 		return 0;
 
-	area = uml_load_file(initrd, &size);
+	if (strstarts(initrd, "fd:")) {
+		if (kstrtoint(initrd + 3, 10, &fd) || fd <= 2) {
+			printk(KERN_ERR "Invalid initrd fd '%s'\n", initrd);
+			return 0;
+		}
+		area = uml_load_fd(fd, initrd, &size);
+		os_close_file(fd);
+	} else {
+		area = uml_load_file(initrd, &size);
+	}
 	if (!area)
 		return 0;
 
@@ -41,6 +53,8 @@ static int __init uml_initrd_setup(char *line, int *add)
 
 __uml_setup("initrd=", uml_initrd_setup,
 "initrd=<initrd image>\n"
+"initrd=fd:<n>\n"
 "    This is used to boot UML from an initrd image.  The argument is the\n"
-"    name of the file containing the image.\n\n"
+"    name of the file containing the image, or fd:<n> for an image in an\n"
+"    open host file descriptor, which is closed after it is read.\n\n"
 );
