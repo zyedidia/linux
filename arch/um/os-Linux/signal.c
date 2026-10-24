@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <string.h>
 #include <strings.h>
+#include <arch.h>
 #include <as-layout.h>
 #include <kern_util.h>
 #include <os.h>
@@ -37,12 +38,27 @@ void (*sig_info[NSIG])(int, struct siginfo *, struct uml_pt_regs *, void *mc) = 
 static void sig_handler_common(int sig, struct siginfo *si, mcontext_t *mc)
 {
 	struct uml_pt_regs r;
+	unsigned long fixup;
 
 	r.is_user = 0;
-	if (sig == SIGSEGV) {
-		/* For segfaults, we want the data from the sigcontext. */
+	if (sig == SIGSEGV || sig == SIGBUS) {
+		/* For faults, we want the data from the sigcontext. */
 		get_regs_from_mc(&r, mc);
-		GET_FAULTINFO_FROM_MC(r.faultinfo, mc);
+		if (sig == SIGSEGV)
+			GET_FAULTINFO_FROM_MC(r.faultinfo, mc);
+	}
+
+	/*
+	 * A bus error in an I/O memory accessor continues after the access.
+	 * This is done before signals are enabled, since the accessor may run
+	 * with interrupts disabled.
+	 */
+	if (IS_ENABLED(CONFIG_INDIRECT_IOMEM_FALLBACK) && sig == SIGBUS) {
+		fixup = uml_iomem_fixup(UPT_IP(&r));
+		if (fixup) {
+			mc_set_rip(mc, (void *)fixup);
+			return;
+		}
 	}
 
 	/* enable signals if sig isn't IRQ signal */

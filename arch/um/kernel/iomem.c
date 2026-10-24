@@ -3,10 +3,40 @@
  * Accessors for IO memory that is mapped directly into the UML process.
  */
 #include <linux/align.h>
+#include <linux/atomic.h>
+#include <linux/bitfield.h>
 #include <linux/bug.h>
 #include <linux/export.h>
+#include <linux/extable.h>
 #include <linux/io.h>
+#include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <kern_util.h>
+
+static atomic64_t uml_iomem_fault_count;
+
+/*
+ * Return the address to continue at after a bus error at ip, or 0 if ip is
+ * not an access by one of the accessors in asm/io.h. This runs in the SIGBUS
+ * handler.
+ */
+unsigned long uml_iomem_fixup(unsigned long ip)
+{
+	const struct exception_table_entry *e;
+
+	e = search_exception_tables(ip);
+	if (!e || FIELD_GET(EX_DATA_TYPE_MASK, e->data) != EX_TYPE_DEFAULT)
+		return 0;
+
+	atomic64_inc(&uml_iomem_fault_count);
+	return (unsigned long)&e->fixup + e->fixup;
+}
+
+/* Return the number of accesses that faulted and were skipped. */
+u64 uml_iomem_faults(void)
+{
+	return atomic64_read(&uml_iomem_fault_count);
+}
 
 void __iomem *real_ioremap(phys_addr_t offset, size_t size)
 {

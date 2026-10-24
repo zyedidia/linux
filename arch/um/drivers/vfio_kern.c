@@ -1316,6 +1316,10 @@ static int __maybe_unused uml_vfio_proc_show(struct seq_file *m, void *v)
 
 	uml_vfio_dma_show(m);
 
+	seq_puts(m, "iomem\n");
+	seq_printf(m, "  %-18s %llu\n", "faulted_accesses",
+		   (unsigned long long)uml_iomem_faults());
+
 	guard(mutex)(&uml_vfio_devices_mtx);
 	list_for_each_entry(dev, &uml_vfio_devices, list) {
 		if (dev->registered)

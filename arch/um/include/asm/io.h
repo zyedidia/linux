@@ -4,16 +4,35 @@
 #include <linux/types.h>
 
 #ifdef CONFIG_INDIRECT_IOMEM_FALLBACK
+#include <asm/asm.h>
+
+/*
+ * Each access is a single instruction with an exception table entry. VFIO
+ * makes a directly mapped BAR fault while the device's memory is disabled,
+ * and the fixup then skips the instruction. A read returns all ones and a
+ * write is dropped, as for a device that does not answer.
+ */
 #define UM_REAL_IO_OPS(op, sz)						\
 static inline u##sz real_raw_read##op(const volatile void __iomem *addr)\
 {									\
-	return *(const volatile u##sz __force *)addr;			\
+	u##sz val = (u##sz)~0ULL;					\
+									\
+	asm volatile("1:	mov %1, %0\n"				\
+		     "2:\n"						\
+		     _ASM_EXTABLE(1b, 2b)				\
+		     : "+q" (val)					\
+		     : "m" (*(const volatile u##sz __force *)addr));	\
+	return val;							\
 }									\
 									\
 static inline void real_raw_write##op(u##sz val,			\
 				      volatile void __iomem *addr)	\
 {									\
-	*(volatile u##sz __force *)addr = val;				\
+	asm volatile("1:	mov %1, %0\n"				\
+		     "2:\n"						\
+		     _ASM_EXTABLE(1b, 2b)				\
+		     : "=m" (*(volatile u##sz __force *)addr)		\
+		     : "q" (val));					\
 }
 
 UM_REAL_IO_OPS(b, 8)
@@ -43,6 +62,13 @@ void real_memcpy_fromio(void *buffer, const volatile void __iomem *addr,
 #define real_memcpy_toio real_memcpy_toio
 void real_memcpy_toio(volatile void __iomem *addr, const void *buffer,
 		      size_t size);
+
+u64 uml_iomem_faults(void);
+#else
+static inline u64 uml_iomem_faults(void)
+{
+	return 0;
+}
 #endif /* CONFIG_INDIRECT_IOMEM_FALLBACK */
 
 /* get emulated iomem (if desired) */
