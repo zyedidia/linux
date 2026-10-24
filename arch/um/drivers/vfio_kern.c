@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/logic_iomem.h>
 #include <linux/mutex.h>
+#include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -72,6 +73,8 @@ enum {
 struct uml_vfio_device {
 	const char *name;
 	int group;
+	/* The group fd given on the command line, or -1. */
+	int passed_group;
 
 	struct um_pci_device pdev;
 	struct uml_vfio_user_device udev;
@@ -129,11 +132,48 @@ static DEFINE_MUTEX(uml_vfio_devices_mtx);
 static bool uml_vfio_no_msix;
 module_param_named(no_msix, uml_vfio_no_msix, bool, 0400);
 
+static int uml_vfio_container_fd = -1;
+module_param_named(container_fd, uml_vfio_container_fd, int, 0400);
+
+/* Open the container, or check the one given on the command line. */
+static int uml_vfio_get_container(void)
+{
+	int err;
+
+	lockdep_assert_held(&uml_vfio_container_mtx);
+
+	if (uml_vfio_container.fd >= 0)
+		return 0;
+
+	if (uml_vfio_container_fd < 0) {
+		err = uml_vfio_user_open_container();
+		if (err < 0) {
+			pr_err("Failed to open container, error %d\n", err);
+			return err;
+		}
+		uml_vfio_container.fd = err;
+		return 0;
+	}
+
+	err = uml_vfio_user_check_container(uml_vfio_container_fd);
+	if (err) {
+		pr_err("Failed to use container fd %d, error %d\n",
+		       uml_vfio_container_fd, err);
+		return err;
+	}
+	uml_vfio_container.fd = uml_vfio_container_fd;
+	return 0;
+}
+
 static int uml_vfio_set_container(int group_fd)
 {
 	int err;
 
 	guard(mutex)(&uml_vfio_container_mtx);
+
+	err = uml_vfio_get_container();
+	if (err)
+		return err;
 
 	err = uml_vfio_user_set_container(uml_vfio_container.fd, group_fd);
 	if (err)
@@ -163,7 +203,11 @@ static void uml_vfio_unset_container(int group_fd)
 		uml_vfio_dma_release();
 }
 
-static int uml_vfio_open_group(int group_id)
+/*
+ * Return the fd of a group, given by its id or, if fd is not negative, by an
+ * open fd. The group is attached to the container when it is first used.
+ */
+static int uml_vfio_open_group(int group_id, int fd)
 {
 	struct uml_vfio_group *group;
 	int err;
@@ -171,17 +215,20 @@ static int uml_vfio_open_group(int group_id)
 	guard(mutex)(&uml_vfio_groups_mtx);
 
 	list_for_each_entry(group, &uml_vfio_groups, list) {
-		if (group->id == group_id) {
+		if (fd >= 0 ? group->fd == fd : group->id == group_id) {
 			group->users++;
 			return group->fd;
 		}
 	}
 
 	group = kzalloc_obj(*group);
-	if (!group)
+	if (!group) {
+		if (fd >= 0)
+			os_close_file(fd);
 		return -ENOMEM;
+	}
 
-	group->fd = uml_vfio_user_open_group(group_id);
+	group->fd = fd >= 0 ? fd : uml_vfio_user_open_group(group_id);
 	if (group->fd < 0) {
 		err = group->fd;
 		goto free_group;
@@ -469,6 +516,16 @@ static unsigned long uml_vfio_cfgspace_read(struct um_pci_device *pdev,
 		val |= (unsigned long)dev->msix_next << shift;
 	}
 
+	/*
+	 * Each device is function 0 of its own slot, so it is never shown as
+	 * multi-function. The PCI core does not offer a slot reset for a
+	 * multi-function device.
+	 */
+	if (PCI_HEADER_TYPE >= offset && PCI_HEADER_TYPE < offset + size) {
+		shift = (PCI_HEADER_TYPE - offset) * 8;
+		val &= ~((unsigned long)PCI_HEADER_TYPE_MFD << shift);
+	}
+
 	return val;
 }
 
@@ -621,8 +678,25 @@ static void uml_vfio_bar_set(struct um_pci_device *pdev, int bar,
 		uml_vfio_bar_copy_to(pdev, bar, offset + i, &value, 1);
 }
 
+/*
+ * VFIO resets the device with whatever method the host has for it, which may
+ * be a bus reset that the guest cannot do itself.
+ */
+static int uml_vfio_reset(struct um_pci_device *pdev, bool probe)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+
+	if (!dev->udev.can_reset)
+		return -ENOTTY;
+	if (probe)
+		return 0;
+	return uml_vfio_user_reset(&dev->udev);
+}
+
 static void __iomem *uml_vfio_bar_map(struct um_pci_device *pdev, int bar)
 {
+	if (bar >= PCI_STD_NUM_BARS)
+		return NULL;
 	return (void __iomem __force *)to_vdev(pdev)->bar_map[bar];
 }
 
@@ -748,6 +822,7 @@ static const struct um_pci_ops uml_vfio_um_pci_ops = {
 	.bar_copy_to	= uml_vfio_bar_copy_to,
 	.bar_set	= uml_vfio_bar_set,
 	.bar_map	= uml_vfio_bar_map,
+	.reset		= uml_vfio_reset,
 	.msi_activate	= uml_vfio_msi_activate,
 	.msi_deactivate	= uml_vfio_msi_deactivate,
 	.msi_mask	= uml_vfio_msi_mask,
@@ -937,19 +1012,25 @@ static int uml_vfio_map_bars(struct uml_vfio_device *dev)
 static void uml_vfio_open_device(struct uml_vfio_device *dev)
 {
 	struct uml_vfio_intr_ctx *ctx;
-	int err, group_id, i;
+	int err, group_id = -1, i;
 
-	group_id = uml_vfio_user_get_group_id(dev->name);
-	if (group_id < 0) {
-		pr_err("Failed to get group id (%s), error %d\n",
-		       dev->name, group_id);
-		goto free_dev;
+	if (dev->passed_group < 0) {
+		group_id = uml_vfio_user_get_group_id(dev->name);
+		if (group_id < 0) {
+			pr_err("Failed to get group id (%s), error %d\n",
+			       dev->name, group_id);
+			goto free_dev;
+		}
 	}
 
-	dev->group = uml_vfio_open_group(group_id);
+	dev->group = uml_vfio_open_group(group_id, dev->passed_group);
 	if (dev->group < 0) {
-		pr_err("Failed to open group %d (%s), error %d\n",
-		       group_id, dev->name, dev->group);
+		if (dev->passed_group < 0)
+			pr_err("Failed to open group %d (%s), error %d\n",
+			       group_id, dev->name, dev->group);
+		else
+			pr_err("Failed to use group fd %d (%s), error %d\n",
+			       dev->passed_group, dev->name, dev->group);
 		goto free_dev;
 	}
 
@@ -1055,32 +1136,42 @@ static struct uml_vfio_device *uml_vfio_find_device(const char *device)
 	return NULL;
 }
 
-static struct uml_vfio_device *uml_vfio_add_device(const char *device)
+/* Add a device given as <domain:bus:slot.function>[,group_fd=<n>]. */
+static struct uml_vfio_device *uml_vfio_add_device(const char *arg)
 {
 	struct uml_vfio_device *dev;
-	int fd;
+	const char *opt;
+	char *name;
+	int group_fd = -1;
+
+	opt = strchr(arg, ',');
+	if (opt) {
+		if (!strstarts(opt + 1, "group_fd=") ||
+		    kstrtoint(opt + 1 + strlen("group_fd="), 10, &group_fd) ||
+		    group_fd < 0)
+			return ERR_PTR(-EINVAL);
+		name = kstrndup(arg, opt - arg, GFP_KERNEL);
+	} else {
+		name = kstrdup(arg, GFP_KERNEL);
+	}
+	if (!name)
+		return ERR_PTR(-ENOMEM);
 
 	guard(mutex)(&uml_vfio_devices_mtx);
 
-	if (uml_vfio_container.fd < 0) {
-		fd = uml_vfio_user_open_container();
-		if (fd < 0)
-			return ERR_PTR(fd);
-		uml_vfio_container.fd = fd;
-	}
-
-	if (uml_vfio_find_device(device))
+	if (uml_vfio_find_device(name)) {
+		kfree(name);
 		return ERR_PTR(-EEXIST);
+	}
 
 	dev = kzalloc_obj(*dev);
-	if (!dev)
-		return ERR_PTR(-ENOMEM);
-
-	dev->name = kstrdup(device, GFP_KERNEL);
-	if (!dev->name) {
-		kfree(dev);
+	if (!dev) {
+		kfree(name);
 		return ERR_PTR(-ENOMEM);
 	}
+
+	dev->name = name;
+	dev->passed_group = group_fd;
 
 	list_add_tail(&dev->list, &uml_vfio_devices);
 	return dev;
@@ -1108,10 +1199,15 @@ static const struct kernel_param_ops uml_vfio_cmdline_param_ops = {
 
 device_param_cb(device, &uml_vfio_cmdline_param_ops, NULL, 0400);
 __uml_help(uml_vfio_cmdline_param_ops,
-"vfio_uml.device=<domain:bus:slot.function>\n"
+"vfio_uml.device=<domain:bus:slot.function>[,group_fd=<n>]\n"
 "    Pass through a PCI device to UML via VFIO. The device must support\n"
 "    MSI-X or MSI. This parameter can be specified multiple times to pass\n"
-"    through multiple PCI devices to UML.\n\n"
+"    through multiple PCI devices to UML. With group_fd, the device's\n"
+"    group is the open host file descriptor <n> instead of the one opened\n"
+"    from /dev/vfio. Devices in the same group take the same fd.\n\n"
+"vfio_uml.container_fd=<n>\n"
+"    Use the open host file descriptor <n> as the VFIO container instead\n"
+"    of opening /dev/vfio/vfio.\n\n"
 "vfio_uml.no_msix=1\n"
 "    Hide the MSI-X capability of passed-through devices, so that drivers\n"
 "    use MSI.\n\n"
@@ -1170,14 +1266,17 @@ static void uml_vfio_show_device(struct seq_file *m,
 	seq_printf(m, "  %-18s %s\n", "irq_mode",
 		   uml_vfio_irq_mode_names[READ_ONCE(dev->irq_mode)]);
 
-	for (i = 0; i < PCI_STD_NUM_BARS && i < dev->udev.num_regions; i++) {
+	for (i = 0; i <= PCI_ROM_RESOURCE && i < dev->udev.num_regions; i++) {
 		char name[8];
 
 		if (!dev->udev.region[i].size)
 			continue;
-		snprintf(name, sizeof(name), "bar%d", i);
+		if (i == PCI_ROM_RESOURCE)
+			strscpy(name, "rom");
+		else
+			snprintf(name, sizeof(name), "bar%d", i);
 		seq_printf(m, "  %-18s %s 0x%llx\n", name,
-			   dev->bar_map[i] ? "direct" : "trapped",
+			   uml_vfio_bar_map(&dev->pdev, i) ? "direct" : "trapped",
 			   (unsigned long long)dev->udev.region[i].size);
 	}
 

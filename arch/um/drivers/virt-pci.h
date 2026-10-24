@@ -9,8 +9,8 @@ struct um_pci_device {
 	/* Optional DMA ops for the device, dma-direct is used if NULL. */
 	const struct dma_map_ops *dma_ops;
 
-	/* for now just standard BARs */
-	u8 resptr[PCI_STD_NUM_BARS];
+	/* The standard BARs and the expansion ROM. */
+	u8 resptr[PCI_ROM_RESOURCE + 1];
 
 	int irq;
 };
@@ -38,6 +38,12 @@ struct um_pci_ops {
 	 * to access it through the ops above.
 	 */
 	void __iomem *(*bar_map)(struct um_pci_device *dev, int bar);
+
+	/*
+	 * Optional. Reset the device, or with probe, return 0 if it can be
+	 * reset. The guest uses it as a slot reset.
+	 */
+	int (*reset)(struct um_pci_device *dev, bool probe);
 
 	/* Optional. Called when an MSI or MSI-X vector is set up or torn down. */
 	int (*msi_activate)(struct um_pci_device *dev, unsigned int index,

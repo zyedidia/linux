@@ -21,6 +21,8 @@ enum {
 
 struct uml_vfio_user_device {
 	int device;
+	/* Set if VFIO can reset the device. */
+	int can_reset;
 
 	struct {
 		uint64_t size;
@@ -37,6 +39,7 @@ struct uml_vfio_user_device {
 	void *irq_set;
 };
 
+int uml_vfio_user_check_container(int fd);
 int uml_vfio_user_open_container(void);
 int uml_vfio_user_setup_iommu(int container);
 int uml_vfio_user_get_iova_ranges(int container,
@@ -53,6 +56,7 @@ int uml_vfio_user_unset_container(int container, int group);
 int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 			       int group, const char *device);
 void uml_vfio_user_teardown_device(struct uml_vfio_user_device *dev);
+int uml_vfio_user_reset(struct uml_vfio_user_device *dev);
 
 int uml_vfio_user_activate_irq(struct uml_vfio_user_device *dev, int index);
 void uml_vfio_user_deactivate_irq(struct uml_vfio_user_device *dev, int index);

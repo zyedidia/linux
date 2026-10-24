@@ -5,6 +5,7 @@
  */
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/pci_hotplug.h>
 #include <linux/dma-map-ops.h>
 #include <linux/logic_iomem.h>
 #include <linux/of_platform.h>
@@ -23,6 +24,8 @@
 struct um_pci_device_reg {
 	struct um_pci_device *dev;
 	void __iomem *iomem;
+	/* Registered for devices that can be reset. */
+	struct hotplug_slot slot;
 };
 
 static struct pci_host_bridge *bridge;
@@ -578,6 +581,58 @@ static struct resource virt_platform_resource = {
 	.flags = IORESOURCE_MEM,
 };
 
+static int um_pci_reset_slot(struct hotplug_slot *slot, bool probe)
+{
+	struct um_pci_device_reg *reg;
+	struct um_pci_device *dev;
+
+	reg = container_of(slot, struct um_pci_device_reg, slot);
+	dev = READ_ONCE(reg->dev);
+	if (!dev)
+		return -ENOTTY;
+	return dev->ops->reset(dev, probe);
+}
+
+static const struct hotplug_slot_ops um_pci_slot_ops = {
+	.reset_slot = um_pci_reset_slot,
+};
+
+/*
+ * The slot must exist before the device is scanned, since the PCI core finds
+ * the device's reset methods when it adds the device.
+ */
+static int um_pci_register_slot(int i, struct um_pci_device *dev)
+{
+	struct um_pci_device_reg *reg = &um_pci_devices[i];
+	char name[8];
+	int err;
+
+	lockdep_assert_held(&um_pci_mtx);
+
+	if (!dev->ops->reset)
+		return 0;
+
+	memset(&reg->slot, 0, sizeof(reg->slot));
+	reg->slot.ops = &um_pci_slot_ops;
+	snprintf(name, sizeof(name), "%d", i);
+	err = pci_hp_register(&reg->slot, bridge->bus, i, name);
+	if (err)
+		reg->slot.ops = NULL;
+	return err;
+}
+
+static void um_pci_deregister_slot(int i)
+{
+	struct um_pci_device_reg *reg = &um_pci_devices[i];
+
+	if (!reg->slot.ops)
+		return;
+
+	pci_hp_deregister(&reg->slot);
+	guard(mutex)(&um_pci_mtx);
+	reg->slot.ops = NULL;
+}
+
 int um_pci_device_register(struct um_pci_device *dev)
 {
 	int i, free = -1;
@@ -585,7 +640,8 @@ int um_pci_device_register(struct um_pci_device *dev)
 
 	mutex_lock(&um_pci_mtx);
 	for (i = 0; i < MAX_DEVICES; i++) {
-		if (um_pci_devices[i].dev)
+		/* An entry is free once its hotplug slot is deregistered. */
+		if (um_pci_devices[i].dev || um_pci_devices[i].slot.ops)
 			continue;
 		free = i;
 		break;
@@ -599,6 +655,12 @@ int um_pci_device_register(struct um_pci_device *dev)
 	dev->irq = irq_alloc_desc(numa_node_id());
 	if (dev->irq < 0) {
 		err = dev->irq;
+		goto out;
+	}
+
+	err = um_pci_register_slot(free, dev);
+	if (err) {
+		irq_free_desc(dev->irq);
 		goto out;
 	}
 
@@ -628,9 +690,12 @@ void um_pci_device_unregister(struct um_pci_device *dev)
 	if (i < MAX_DEVICES) {
 		struct pci_dev *pci_dev;
 
-		pci_dev = pci_get_slot(bridge->bus, i);
-		if (pci_dev)
+		pci_dev = pci_get_slot(bridge->bus, PCI_DEVFN(i, 0));
+		if (pci_dev) {
 			pci_stop_and_remove_bus_device_locked(pci_dev);
+			pci_dev_put(pci_dev);
+		}
+		um_pci_deregister_slot(i);
 	}
 }
 

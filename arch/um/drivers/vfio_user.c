@@ -21,6 +21,21 @@
 
 #include "vfio_user.h"
 
+int uml_vfio_user_check_container(int fd)
+{
+	int r;
+
+	r = ioctl(fd, VFIO_GET_API_VERSION);
+	if (r != VFIO_API_VERSION)
+		return r < 0 ? -errno : -EINVAL;
+
+	r = ioctl(fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU);
+	if (r <= 0)
+		return r < 0 ? -errno : -EINVAL;
+
+	return 0;
+}
+
 int uml_vfio_user_open_container(void)
 {
 	int r, fd;
@@ -29,23 +44,13 @@ int uml_vfio_user_open_container(void)
 	if (fd < 0)
 		return -errno;
 
-	r = ioctl(fd, VFIO_GET_API_VERSION);
-	if (r != VFIO_API_VERSION) {
-		r = r < 0 ? -errno : -EINVAL;
-		goto error;
-	}
-
-	r = ioctl(fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU);
-	if (r <= 0) {
-		r = r < 0 ? -errno : -EINVAL;
-		goto error;
+	r = uml_vfio_user_check_container(fd);
+	if (r) {
+		close(fd);
+		return r;
 	}
 
 	return fd;
-
-error:
-	close(fd);
-	return r;
 }
 
 int uml_vfio_user_setup_iommu(int container)
@@ -304,6 +309,8 @@ int uml_vfio_user_setup_device(struct uml_vfio_user_device *dev,
 		goto close_device;
 	}
 
+	dev->can_reset = !!(device_info.flags & VFIO_DEVICE_FLAGS_RESET);
+
 	dev->num_regions = device_info.num_regions;
 	if (dev->num_regions > VFIO_PCI_CONFIG_REGION_INDEX + 1)
 		dev->num_regions = VFIO_PCI_CONFIG_REGION_INDEX + 1;
@@ -381,6 +388,17 @@ void uml_vfio_user_teardown_device(struct uml_vfio_user_device *dev)
 	kfree(dev->irqfd);
 	kfree(dev->region);
 	close(dev->device);
+}
+
+int uml_vfio_user_reset(struct uml_vfio_user_device *dev)
+{
+	int r;
+
+	do {
+		r = ioctl(dev->device, VFIO_DEVICE_RESET);
+	} while (r < 0 && errno == EINTR);
+
+	return r < 0 ? -errno : 0;
 }
 
 int uml_vfio_user_activate_irq(struct uml_vfio_user_device *dev, int index)
