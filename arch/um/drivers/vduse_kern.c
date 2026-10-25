@@ -7,6 +7,8 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/workqueue.h>
@@ -25,6 +27,36 @@ struct uml_vduse_region {
 	struct list_head list;
 };
 
+/*
+ * Counters of a queue. Kicks is the sum of the kick eventfd counts read, so
+ * it counts the host driver's notifications, and kick_irqs counts the runs of
+ * the kick handler. Requests and out_bytes count the chains taken and the
+ * sizes of their readable buffers. In_bytes is the sum of the used lengths.
+ * Each completion either injects an interrupt or is suppressed because the
+ * driver does not want one.
+ */
+struct uml_vduse_vq_stats {
+	atomic64_t kicks;
+	atomic64_t kick_irqs;
+	atomic64_t dropped_kicks;
+	atomic64_t requests;
+	atomic64_t bad_requests;
+	atomic64_t out_bytes;
+	atomic64_t in_bytes;
+	atomic64_t injected;
+	atomic64_t suppressed;
+	atomic64_t inject_errors;
+};
+
+struct uml_vduse_dev_stats {
+	atomic64_t msgs[UML_VDUSE_MSG_UNKNOWN + 1];
+	atomic64_t starts;
+	atomic64_t resets;
+	atomic64_t maps;
+	atomic64_t unmaps;
+	atomic64_t map_errors;
+};
+
 struct uml_vduse_vq {
 	struct uml_vduse_dev *dev;
 	unsigned int index;
@@ -38,6 +70,7 @@ struct uml_vduse_vq {
 	spinlock_t lock;
 	bool ready;
 	bool running;
+	struct uml_vduse_vq_stats stats;
 };
 
 struct uml_vduse_dev {
@@ -63,6 +96,9 @@ struct uml_vduse_dev {
 	/* Regions of the IOVA space mapped into UML, protected by map_lock. */
 	struct list_head regions;
 	struct mutex map_lock;
+
+	struct uml_vduse_dev_stats stats;
+	struct list_head list;
 };
 
 static const struct uml_vduse_backend_ops *const uml_vduse_backends[] = {
@@ -74,6 +110,9 @@ static const struct uml_vduse_backend_ops *const uml_vduse_backends[] = {
 static const char *uml_vduse_args[UML_VDUSE_MAX_DEVICES];
 static int uml_vduse_nr_args;
 static int uml_vduse_control = -1;
+
+/* The devices that were created, which is fixed after boot. */
+static LIST_HEAD(uml_vduse_devices);
 
 const char *uml_vduse_name(struct uml_vduse_dev *dev)
 {
@@ -103,12 +142,14 @@ static void *uml_vduse_translate(struct uml_vduse_dev *dev, u64 iova,
 
 	err = uml_vduse_user_map(dev->fd, iova, &r->user);
 	if (err) {
+		atomic64_inc(&dev->stats.map_errors);
 		pr_warn_ratelimited("%s: cannot map IOVA 0x%llx: %d\n",
 				    dev->name, iova, err);
 		kfree(r);
 		return NULL;
 	}
 	list_add(&r->list, &dev->regions);
+	atomic64_inc(&dev->stats.maps);
 
 found:
 	if (last > r->user.last)
@@ -131,6 +172,7 @@ static void uml_vduse_unmap_range(struct uml_vduse_dev *dev, u64 start,
 		uml_vduse_user_unmap(&r->user);
 		list_del(&r->list);
 		kfree(r);
+		atomic64_inc(&dev->stats.unmaps);
 	}
 }
 
@@ -180,8 +222,13 @@ int uml_vduse_getdesc(struct uml_vduse_dev *dev, unsigned int index,
 			err = uml_vduse_translate_iov(dev, riov, false);
 			if (!err)
 				err = uml_vduse_translate_iov(dev, wiov, true);
-			if (!err)
+			if (!err) {
+				atomic64_inc(&vq->stats.requests);
+				if (riov)
+					atomic64_add(vringh_kiov_length(riov),
+						     &vq->stats.out_bytes);
 				return 1;
+			}
 		}
 		if (!err)
 			return 0;
@@ -194,6 +241,7 @@ int uml_vduse_getdesc(struct uml_vduse_dev *dev, unsigned int index,
 
 		pr_warn_ratelimited("%s: dropping a bad request on queue %u: %d\n",
 				    dev->name, index, err);
+		atomic64_inc(&vq->stats.bad_requests);
 		uml_vduse_complete(dev, index, *head, 0);
 	}
 }
@@ -210,8 +258,13 @@ void uml_vduse_complete(struct uml_vduse_dev *dev, unsigned int index,
 	notify = vringh_need_notify_kern(&vq->vrh);
 	spin_unlock_irqrestore(&vq->lock, flags);
 
-	if (notify > 0)
-		uml_vduse_user_vq_inject_irq(dev->fd, index);
+	atomic64_add(len, &vq->stats.in_bytes);
+	if (notify <= 0)
+		atomic64_inc(&vq->stats.suppressed);
+	else if (uml_vduse_user_vq_inject_irq(dev->fd, index))
+		atomic64_inc(&vq->stats.inject_errors);
+	else
+		atomic64_inc(&vq->stats.injected);
 }
 
 void uml_vduse_notify_disable(struct uml_vduse_dev *dev, unsigned int index)
@@ -327,12 +380,16 @@ static int uml_vduse_set_status(struct uml_vduse_dev *dev, u8 status)
 		if (err)
 			pr_err("%s: cannot start the device: %d\n", dev->name,
 			       err);
+		else
+			atomic64_inc(&dev->stats.starts);
 	} else if (!(status & VIRTIO_CONFIG_S_DRIVER_OK) && dev->running) {
 		uml_vduse_stop(dev);
 	}
 
-	if (!status)
+	if (!status) {
 		uml_vduse_unmap_range(dev, 0, U64_MAX);
+		atomic64_inc(&dev->stats.resets);
+	}
 
 	return err;
 }
@@ -349,6 +406,7 @@ static void uml_vduse_msg_work(struct work_struct *work)
 	while (!(err = uml_vduse_user_read_msg(dev->fd, &msg))) {
 		avail_index = 0;
 		ok = true;
+		atomic64_inc(&dev->stats.msgs[msg.type]);
 
 		switch (msg.type) {
 		case UML_VDUSE_MSG_GET_VQ_STATE:
@@ -400,8 +458,15 @@ static irqreturn_t uml_vduse_kick_interrupt(int irq, void *opaque)
 		r = os_read_file(vq->kickfd, &v, sizeof(v));
 	} while (r == -EINTR);
 
-	if (r == sizeof(v) && READ_ONCE(vq->running))
+	atomic64_inc(&vq->stats.kick_irqs);
+	if (r != sizeof(v))
+		return IRQ_HANDLED;
+
+	atomic64_add(v, &vq->stats.kicks);
+	if (READ_ONCE(vq->running))
 		dev->ops->kick(dev->priv, vq->index);
+	else
+		atomic64_add(v, &vq->stats.dropped_kicks);
 
 	return IRQ_HANDLED;
 }
@@ -626,6 +691,7 @@ static void __init uml_vduse_add(const char *arg)
 	}
 
 	pr_info("%s: created %s device\n", dev->name, dev->type);
+	list_add_tail(&dev->list, &uml_vduse_devices);
 	return;
 
 free:
@@ -663,6 +729,71 @@ __uml_help(uml_vduse_cmdline_param_ops,
 "    <disk> is /dev/<name> or <major>:<minor>.\n\n"
 );
 
+static const char *const uml_vduse_msg_names[] = {
+	[UML_VDUSE_MSG_GET_VQ_STATE] = "msg_get_vq_state",
+	[UML_VDUSE_MSG_SET_STATUS] = "msg_set_status",
+	[UML_VDUSE_MSG_UPDATE_IOTLB] = "msg_update_iotlb",
+	[UML_VDUSE_MSG_UNKNOWN] = "msg_unknown",
+};
+
+static void uml_vduse_show_counter(struct seq_file *m, int indent,
+				   const char *name, atomic64_t *v)
+{
+	seq_printf(m, "%*s%-*s %lld\n", indent, "", 20 - indent, name,
+		   atomic64_read(v));
+}
+
+static void uml_vduse_show_device(struct seq_file *m,
+				  struct uml_vduse_dev *dev)
+{
+	struct uml_vduse_dev_stats *stats = &dev->stats;
+	unsigned int i;
+
+	seq_printf(m, "device %s\n", dev->name);
+	seq_printf(m, "  %-18s %s\n", "type", dev->type);
+	seq_printf(m, "  %-18s %s\n", "state",
+		   READ_ONCE(dev->running) ? "running" : "stopped");
+	seq_printf(m, "  %-18s 0x%llx\n", "features", READ_ONCE(dev->features));
+
+	for (i = 0; i < ARRAY_SIZE(uml_vduse_msg_names); i++)
+		uml_vduse_show_counter(m, 2, uml_vduse_msg_names[i],
+				       &stats->msgs[i]);
+	uml_vduse_show_counter(m, 2, "starts", &stats->starts);
+	uml_vduse_show_counter(m, 2, "resets", &stats->resets);
+	uml_vduse_show_counter(m, 2, "iova_maps", &stats->maps);
+	uml_vduse_show_counter(m, 2, "iova_unmaps", &stats->unmaps);
+	uml_vduse_show_counter(m, 2, "iova_map_errors", &stats->map_errors);
+
+	for (i = 0; i < dev->num_queues; i++) {
+		struct uml_vduse_vq_stats *q = &dev->vqs[i].stats;
+
+		seq_printf(m, "  queue %u\n", i);
+		uml_vduse_show_counter(m, 4, "kicks", &q->kicks);
+		uml_vduse_show_counter(m, 4, "kick_irqs", &q->kick_irqs);
+		uml_vduse_show_counter(m, 4, "dropped_kicks",
+				       &q->dropped_kicks);
+		uml_vduse_show_counter(m, 4, "requests", &q->requests);
+		uml_vduse_show_counter(m, 4, "bad_requests",
+				       &q->bad_requests);
+		uml_vduse_show_counter(m, 4, "out_bytes", &q->out_bytes);
+		uml_vduse_show_counter(m, 4, "in_bytes", &q->in_bytes);
+		uml_vduse_show_counter(m, 4, "injected", &q->injected);
+		uml_vduse_show_counter(m, 4, "suppressed", &q->suppressed);
+		uml_vduse_show_counter(m, 4, "inject_errors",
+				       &q->inject_errors);
+	}
+}
+
+static int __maybe_unused uml_vduse_proc_show(struct seq_file *m, void *v)
+{
+	struct uml_vduse_dev *dev;
+
+	list_for_each_entry(dev, &uml_vduse_devices, list)
+		uml_vduse_show_device(m, dev);
+
+	return 0;
+}
+
 static int __init uml_vduse_init(void)
 {
 	int i;
@@ -675,6 +806,7 @@ static int __init uml_vduse_init(void)
 	for (i = 0; i < uml_vduse_nr_args; i++)
 		uml_vduse_add(uml_vduse_args[i]);
 
+	proc_create_single("vduse_uml", 0444, NULL, uml_vduse_proc_show);
 	return 0;
 }
 late_initcall(uml_vduse_init);
