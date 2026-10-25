@@ -18,6 +18,7 @@
 #include <os.h>
 #include <sigio.h>
 #include <um_malloc.h>
+#include <smp.h>
 #include "internal.h"
 
 /*
@@ -33,10 +34,10 @@ static int epollfd = -1;
 static struct epoll_event epoll_events[MAX_EPOLL_EVENTS];
 
 /*
- * State of the CPU that handles SIGIO, shared with the helper thread. While
- * that CPU is idle, it waits on the IRQ epoll set itself, which holds every
- * fd that the helper watches, so the helper does not signal it and marks the
- * state KICKED instead.
+ * State of each CPU, shared with the helper thread. While a CPU is idle, it
+ * waits on its IRQ epoll set itself, which holds every fd of that CPU that
+ * the helper watches, so the helper does not signal it and marks the state
+ * KICKED instead.
  */
 enum {
 	SIGIO_CPU_BUSY,
@@ -44,26 +45,28 @@ enum {
 	SIGIO_CPU_KICKED,
 };
 
-static int sigio_cpu_state = SIGIO_CPU_BUSY;
+static int sigio_cpu_state[CONFIG_NR_CPUS];
 
 void sigio_idle_enter(void)
 {
-	__atomic_store_n(&sigio_cpu_state, SIGIO_CPU_IDLE, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&sigio_cpu_state[uml_curr_cpu()], SIGIO_CPU_IDLE,
+			 __ATOMIC_SEQ_CST);
 }
 
 /* Return whether the helper saw an event while the CPU was idle. */
 int sigio_idle_exit(void)
 {
-	return __atomic_exchange_n(&sigio_cpu_state, SIGIO_CPU_BUSY,
+	return __atomic_exchange_n(&sigio_cpu_state[uml_curr_cpu()],
+				   SIGIO_CPU_BUSY,
 				   __ATOMIC_SEQ_CST) == SIGIO_CPU_KICKED;
 }
 
-/* Return whether the CPU still has to be signalled for an event. */
-static int sigio_cpu_needs_signal(void)
+/* Return whether a CPU still has to be signalled for an event. */
+static int sigio_cpu_needs_signal(int cpu)
 {
 	int state = SIGIO_CPU_IDLE;
 
-	if (__atomic_compare_exchange_n(&sigio_cpu_state, &state,
+	if (__atomic_compare_exchange_n(&sigio_cpu_state[cpu], &state,
 					SIGIO_CPU_KICKED, 0, __ATOMIC_SEQ_CST,
 					__ATOMIC_SEQ_CST))
 		return 0;
@@ -73,7 +76,8 @@ static int sigio_cpu_needs_signal(void)
 static void *write_sigio_thread(void *unused)
 {
 	int pid = getpid();
-	int r;
+	unsigned long long cpus;
+	int cpu, i, r;
 
 	os_fix_helper_thread_signals();
 
@@ -86,13 +90,22 @@ static void *write_sigio_thread(void *unused)
 			       __func__, errno);
 		}
 
-		if (!sigio_cpu_needs_signal())
-			continue;
+		/* Each ready fd needs the CPU that handles its IRQ. */
+		cpus = 0;
+		for (i = 0; i < r; i++)
+			cpus |= 1ULL << os_fd_cpu(epoll_events[i].data.fd);
 
-		CATCH_EINTR(r = syscall(__NR_tgkill, pid, pid, SIGIO));
-		if (r < 0)
-			printk(UM_KERN_ERR "%s: tgkill failed, errno = %d\n",
-			       __func__, errno);
+		for (cpu = 0; cpu < uml_ncpus; cpu++) {
+			if (!(cpus & (1ULL << cpu)) ||
+			    !sigio_cpu_needs_signal(cpu))
+				continue;
+
+			CATCH_EINTR(r = syscall(__NR_tgkill, pid,
+						os_cpu_tid(cpu), SIGIO));
+			if (r < 0)
+				printk(UM_KERN_ERR "%s: tgkill failed, errno = %d\n",
+				       __func__, errno);
+		}
 	}
 
 	return NULL;

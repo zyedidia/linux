@@ -407,14 +407,30 @@ int os_set_fd_async(int fd)
 		return err;
 	}
 
-	if ((fcntl(fd, F_SETSIG, SIGIO) < 0) ||
-	    (fcntl(fd, F_SETOWN, os_getpid()) < 0)) {
+	if ((fcntl(fd, F_SETSIG, SIGIO) < 0) || (os_set_fd_owner(fd, 0) < 0)) {
 		err = -errno;
 		printk(UM_KERN_ERR "os_set_fd_async : Failed to fcntl F_SETOWN "
 		       "(or F_SETSIG) fd %d, errno = %d\n", fd, errno);
 		return err;
 	}
 
+	return 0;
+}
+
+/*
+ * Direct an fd's SIGIO at the host thread of a CPU. A signal for the process
+ * would go to any CPU that does not block it, which might not be the CPU
+ * whose epoll set holds the fd.
+ */
+int os_set_fd_owner(int fd, int cpu)
+{
+	struct f_owner_ex owner = {
+		.type = F_OWNER_TID,
+		.pid = os_cpu_tid(cpu),
+	};
+
+	if (fcntl(fd, F_SETOWN_EX, &owner) < 0)
+		return -errno;
 	return 0;
 }
 

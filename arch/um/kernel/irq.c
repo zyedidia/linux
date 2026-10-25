@@ -50,6 +50,8 @@ struct irq_reg {
 struct irq_entry {
 	struct list_head list;
 	int fd;
+	/* The CPU whose IRQ epoll set holds the fd. */
+	int cpu;
 	struct irq_reg reg[NUM_IRQ_TYPES];
 	bool suspended;
 	bool sigio_workaround;
@@ -267,7 +269,7 @@ static void remove_irq_entry(struct irq_entry *to_free, bool remove)
 		return;
 
 	if (remove)
-		os_del_epoll_fd(to_free->fd);
+		os_del_epoll_fd(to_free->cpu, to_free->fd);
 	list_del(&to_free->list);
 }
 
@@ -281,11 +283,11 @@ static bool update_irq_entry(struct irq_entry *entry)
 
 	if (events) {
 		/* will modify (instead of add) if needed */
-		os_add_epoll_fd(events, entry->fd, entry);
+		os_add_epoll_fd(entry->cpu, events, entry->fd, entry);
 		return true;
 	}
 
-	os_del_epoll_fd(entry->fd);
+	os_del_epoll_fd(entry->cpu, entry->fd);
 	return false;
 }
 
@@ -320,7 +322,9 @@ already:
 		}
 
 		/* temporarily disable to avoid IRQ-side locking */
-		os_del_epoll_fd(fd);
+		os_del_epoll_fd(irq_entry->cpu, fd);
+		/* os_set_fd_async() directed SIGIO at CPU 0. */
+		os_set_fd_owner(fd, irq_entry->cpu);
 	} else {
 		struct irq_entry *new;
 
@@ -401,7 +405,7 @@ static void free_irq_by_irq_and_dev(unsigned int irq, void *dev)
 			if (reg->id != dev)
 				continue;
 
-			os_del_epoll_fd(entry->fd);
+			os_del_epoll_fd(entry->cpu, entry->fd);
 			reg->events = 0;
 			to_free = update_or_remove_irq_entry(entry);
 			goto out;
@@ -418,12 +422,12 @@ void deactivate_fd(int fd, int irqnum)
 	unsigned long flags;
 	enum um_irq_type i;
 
-	os_del_epoll_fd(fd);
-
 	raw_spin_lock_irqsave(&irq_lock, flags);
 	entry = get_irq_entry_by_fd(fd);
 	if (!entry)
 		goto out;
+
+	os_del_epoll_fd(entry->cpu, fd);
 
 	for (i = 0; i < NUM_IRQ_TYPES; i++) {
 		if (!entry->reg[i].events)
@@ -459,7 +463,7 @@ int deactivate_all_fds(void)
 
 	/* we can no longer call kfree() here so just deactivate */
 	list_for_each_entry(entry, &active_fds, list)
-		os_del_epoll_fd(entry->fd);
+		os_del_epoll_fd(entry->cpu, entry->fd);
 	os_close_epoll_fd();
 	return 0;
 }
@@ -480,13 +484,12 @@ unsigned int do_IRQ(int irq, struct uml_pt_regs *regs)
 }
 
 /*
- * Whether the idle loop of this CPU should wake up when an fd in the IRQ epoll
- * set becomes ready. Only CPU 0 handles SIGIO, and suspended IRQs must not
- * wake the idle loop.
+ * Whether the idle loop of this CPU should wake up when an fd in its IRQ
+ * epoll set becomes ready. Suspended IRQs must not wake the idle loop.
  */
 bool um_idle_waits_for_irqs(void)
 {
-	return raw_smp_processor_id() == 0 && !irqs_suspended;
+	return !irqs_suspended;
 }
 
 void um_free_irq(int irq, void *dev)
@@ -623,6 +626,8 @@ void um_irqs_resume(void)
 			int err = os_set_fd_async(entry->fd);
 
 			WARN(err < 0, "os_set_fd_async returned %d\n", err);
+			/* os_set_fd_async() directed SIGIO at CPU 0. */
+			os_set_fd_owner(entry->fd, entry->cpu);
 			entry->suspended = false;
 
 			if (entry->sigio_workaround) {

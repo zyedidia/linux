@@ -33,6 +33,7 @@ static void *cpu_thread(void *arg)
 	struct cpu_thread_data *data = arg;
 
 	__curr_cpu = data->cpu;
+	os_set_cpu_tid(data->cpu, gettid());
 	os_pin_cpu_thread(data->cpu);
 
 	uml_start_secondary(data);
@@ -76,8 +77,11 @@ void os_start_secondary(void *arg, jmp_buf *switch_buf)
 {
 	struct cpu_thread_data *data = arg;
 
+	/*
+	 * SIGIO stays unblocked: it is directed at the CPU whose IRQ epoll set
+	 * holds the fd.
+	 */
 	sigaddset(&data->sigset, IPI_SIGNAL);
-	sigaddset(&data->sigset, SIGIO);
 
 	if (sigprocmask(SIG_SETMASK, &data->sigset, NULL) < 0)
 		panic("Failed to restore the signal mask, errno = %d", errno);

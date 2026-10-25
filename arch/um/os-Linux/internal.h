@@ -11,6 +11,7 @@
  * irq.c
  */
 int os_epoll_fd(void);
+int os_fd_cpu(int fd);
 
 /*
  * sigio.c

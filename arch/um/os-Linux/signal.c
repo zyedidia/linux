@@ -20,7 +20,10 @@
 #include <skas.h>
 #include <sysdep/mcontext.h>
 #include <um_malloc.h>
+#include <sys/syscall.h>
 #include <sys/ucontext.h>
+#include <unistd.h>
+#include <smp.h>
 #include <timetravel.h>
 #include "internal.h"
 
@@ -266,9 +269,18 @@ void set_handler(int sig)
 		panic("sigprocmask failed - errno = %d\n", errno);
 }
 
+/* Signal every CPU, so that each one reads its own IRQ epoll set. */
 void send_sigio_to_self(void)
 {
-	kill(os_getpid(), SIGIO);
+	int cpu;
+
+	for (cpu = 0; cpu < uml_ncpus; cpu++)
+		os_send_sigio(cpu);
+}
+
+void os_send_sigio(int cpu)
+{
+	syscall(__NR_tgkill, os_getpid(), os_cpu_tid(cpu), SIGIO);
 }
 
 int change_sig(int signal, int on)
