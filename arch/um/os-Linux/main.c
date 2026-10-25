@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/personality.h>
@@ -44,7 +45,7 @@ static void last_ditch_exit(int sig)
 	exit(1);
 }
 
-static void __init install_fatal_handler(int sig)
+static void install_fatal_handler(int sig)
 {
 	struct sigaction action;
 
@@ -65,6 +66,44 @@ static void __init install_fatal_handler(int sig)
 			"- errno = %d\n", sig, errno);
 		exit(1);
 	}
+}
+
+static int shutdown_fd = -1;
+
+/*
+ * The first SIGINT or SIGTERM asks the kernel to power off in order. The
+ * fatal handler is installed again first, so that a second signal exits at
+ * once if the shutdown hangs.
+ */
+static void shutdown_signal(int sig)
+{
+	uint64_t v = 1;
+
+	install_fatal_handler(SIGINT);
+	install_fatal_handler(SIGTERM);
+
+	if (write(shutdown_fd, &v, sizeof(v)) != sizeof(v))
+		last_ditch_exit(sig);
+}
+
+/*
+ * Make SIGINT and SIGTERM signal the eventfd fd, which the kernel handles by
+ * powering off.
+ */
+void os_set_shutdown_fd(int fd)
+{
+	struct sigaction action;
+
+	shutdown_fd = fd;
+
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = SA_ONSTACK | SA_RESTART;
+	action.sa_restorer = NULL;
+	action.sa_handler = shutdown_signal;
+	if (sigaction(SIGINT, &action, NULL) < 0 ||
+	    sigaction(SIGTERM, &action, NULL) < 0)
+		os_warn("failed to install the shutdown handler - errno = %d\n",
+			errno);
 }
 
 #define UML_LIB_PATH	":" OS_LIB_PATH "/uml"
