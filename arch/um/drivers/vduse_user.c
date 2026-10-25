@@ -8,6 +8,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/vduse.h>
 #include <um_malloc.h>
 
@@ -255,4 +256,69 @@ out:
 void uml_vduse_user_unmap(struct uml_vduse_user_region *region)
 {
 	munmap(region->addr, region->last - region->start + 1);
+}
+
+int uml_vduse_user_node_id(int fd, uint64_t *dev, uint64_t *ino)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) < 0)
+		return -errno;
+	*dev = st.st_dev;
+	*ino = st.st_ino;
+	return 0;
+}
+
+int uml_vduse_user_open_log(const char *path)
+{
+	int fd;
+
+	fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return -errno;
+	return fd;
+}
+
+/*
+ * Map the log. A file of another size is resized if resize is set, and is
+ * otherwise an error.
+ */
+int uml_vduse_user_map_log(int fd, size_t size, int resize, void **addr)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) < 0)
+		return -errno;
+	if (st.st_size != (off_t)size) {
+		if (!resize)
+			return -EINVAL;
+		if (ftruncate(fd, size) < 0)
+			return -errno;
+	}
+
+	*addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (*addr == MAP_FAILED) {
+		*addr = NULL;
+		return -errno;
+	}
+	return 0;
+}
+
+void uml_vduse_user_unmap_log(void *addr, size_t size)
+{
+	munmap(addr, size);
+}
+
+int uml_vduse_user_remove_log(const char *path)
+{
+	if (unlink(path) < 0)
+		return -errno;
+	return 0;
+}
+
+int uml_vduse_user_truncate_log(int fd)
+{
+	if (ftruncate(fd, 0) < 0)
+		return -errno;
+	return 0;
 }

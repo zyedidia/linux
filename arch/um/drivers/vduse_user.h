@@ -60,4 +60,11 @@ int uml_vduse_user_map(int fd, uint64_t iova,
 		       struct uml_vduse_user_region *region);
 void uml_vduse_user_unmap(struct uml_vduse_user_region *region);
 
+int uml_vduse_user_node_id(int fd, uint64_t *dev, uint64_t *ino);
+int uml_vduse_user_open_log(const char *path);
+int uml_vduse_user_map_log(int fd, size_t size, int resize, void **addr);
+void uml_vduse_user_unmap_log(void *addr, size_t size);
+int uml_vduse_user_remove_log(const char *path);
+int uml_vduse_user_truncate_log(int fd);
+
 #endif /* __UM_VDUSE_USER_H */

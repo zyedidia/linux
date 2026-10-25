@@ -4,6 +4,7 @@
 
 #include <linux/module.h>
 #include <linux/interrupt.h>
+#include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
@@ -11,6 +12,7 @@
 #include <linux/reboot.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/string.h>
 #include <linux/workqueue.h>
 #include <uapi/linux/virtio_config.h>
@@ -23,6 +25,39 @@
 #include "vduse_user.h"
 
 #define UML_VDUSE_MAX_DEVICES 8
+#define UML_VDUSE_LOG_MAGIC 0x676f6c76
+#define UML_VDUSE_LOG_VERSION 1
+
+/*
+ * The in-flight log lives in a host file that outlives the guest, so that
+ * the next guest can tell which requests were outstanding. A header is
+ * followed by one area per queue, with an entry for each descriptor. The
+ * header names the device by the host inode of /dev/vduse/<name>, which is
+ * new each time the device is created.
+ */
+struct uml_vduse_log_header {
+	u32 magic;
+	u32 version;
+	u32 num_queues;
+	u32 queue_size;
+	u64 node_dev;
+	u64 node_ino;
+};
+
+struct uml_vduse_log_desc {
+	u8 inflight;
+	u8 pad[7];
+	/* The order in which the requests were taken. */
+	u64 counter;
+};
+
+struct uml_vduse_log_queue {
+	/* The used index and the head of the last completion. */
+	u16 used_idx;
+	u16 last_head;
+	u8 pad[12];
+	struct uml_vduse_log_desc desc[];
+};
 
 struct uml_vduse_region {
 	struct uml_vduse_user_region user;
@@ -48,6 +83,7 @@ struct uml_vduse_vq_stats {
 	atomic64_t injected;
 	atomic64_t suppressed;
 	atomic64_t inject_errors;
+	atomic64_t replayed;
 };
 
 struct uml_vduse_dev_stats {
@@ -57,6 +93,7 @@ struct uml_vduse_dev_stats {
 	atomic64_t maps;
 	atomic64_t unmaps;
 	atomic64_t map_errors;
+	atomic64_t reconnects;
 };
 
 struct uml_vduse_vq {
@@ -66,18 +103,28 @@ struct uml_vduse_vq {
 	int irq;
 	struct vringh vrh;
 	/*
-	 * Protects the used ring. The available ring is only accessed from
-	 * the backend's processing of the queue.
+	 * Protects the used ring and the log. The available ring is only
+	 * accessed from the backend's processing of the queue.
 	 */
 	spinlock_t lock;
 	bool ready;
 	bool running;
+
+	/* The queue's area of the in-flight log. */
+	struct uml_vduse_log_queue *log;
+	u64 counter;
+	/* Requests of an earlier guest to take again, oldest first. */
+	u16 *replay;
+	unsigned int nr_replay;
+	unsigned int replay_pos;
+
 	struct uml_vduse_vq_stats stats;
 };
 
 struct uml_vduse_dev {
 	char *type;
 	char *name;
+	/* The options left for the backend. */
 	char *opts;
 
 	const struct uml_vduse_backend_ops *ops;
@@ -94,6 +141,19 @@ struct uml_vduse_dev {
 	/* The features that the host's driver accepted. */
 	u64 features;
 	bool running;
+	/*
+	 * Reconnect is set when the device was left by a guest, until a start
+	 * takes over its queues. Resume is set until the message work has
+	 * tried to.
+	 */
+	bool reconnect;
+	bool resume;
+
+	/* The in-flight log and the file given for it. */
+	char *log_path;
+	int log_fd;
+	void *log;
+	size_t log_size;
 
 	/* Regions of the IOVA space mapped into UML, protected by map_lock. */
 	struct list_head regions;
@@ -211,11 +271,72 @@ static void uml_vduse_unmap_range(struct uml_vduse_dev *dev, u64 start,
 	}
 }
 
+static void uml_vduse_inject(struct uml_vduse_dev *dev, unsigned int index)
+{
+	struct uml_vduse_vq *vq = &dev->vqs[index];
+
+	if (uml_vduse_user_vq_inject_irq(dev->fd, index))
+		atomic64_inc(&vq->stats.inject_errors);
+	else
+		atomic64_inc(&vq->stats.injected);
+}
+
+static u16 uml_vduse_used_idx(struct uml_vduse_vq *vq)
+{
+	return vringh16_to_cpu(&vq->vrh, READ_ONCE(vq->vrh.vring.used->idx));
+}
+
+/*
+ * Record in the log that a request was taken. The head can be taken again as
+ * soon as its last completion is published, which is before that completion
+ * clears its flag, so the lock orders the two.
+ */
+static void uml_vduse_log_take(struct uml_vduse_vq *vq, u16 head)
+{
+	struct uml_vduse_log_desc *d = &vq->log->desc[head];
+	unsigned long flags;
+
+	spin_lock_irqsave(&vq->lock, flags);
+	WRITE_ONCE(d->counter, vq->counter++);
+	smp_wmb();
+	WRITE_ONCE(d->inflight, 1);
+	spin_unlock_irqrestore(&vq->lock, flags);
+}
+
+static void uml_vduse_free_replay(struct uml_vduse_vq *vq)
+{
+	kfree(vq->replay);
+	vq->replay = NULL;
+	vq->nr_replay = 0;
+	vq->replay_pos = 0;
+}
+
+/* Take the next request that an earlier guest left outstanding. */
+static int uml_vduse_take_replay(struct uml_vduse_vq *vq,
+				 struct vringh_kiov *riov,
+				 struct vringh_kiov *wiov, u16 *head)
+{
+	int err;
+
+	*head = vq->replay[vq->replay_pos++];
+	if (vq->replay_pos == vq->nr_replay)
+		uml_vduse_free_replay(vq);
+
+	err = vringh_chain_kern_range(&vq->vrh, *head, riov, wiov,
+				      uml_vduse_getrange, GFP_KERNEL);
+	if (err)
+		return err;
+
+	atomic64_inc(&vq->stats.replayed);
+	return 1;
+}
+
 /*
  * Get the next available descriptor chain with its buffers translated to
- * pointers. A chain that cannot be translated is returned to the driver as
- * used with no data. Returns 1 for a chain, 0 if there is none, or an error
- * if the ring itself is invalid.
+ * pointers. Requests that an earlier guest left outstanding come first. A
+ * chain that cannot be translated is returned to the driver as used with no
+ * data. Returns 1 for a chain, 0 if there is none, or an error if the ring
+ * itself is invalid.
  */
 int uml_vduse_getdesc(struct uml_vduse_dev *dev, unsigned int index,
 		      struct vringh_kiov *riov, struct vringh_kiov *wiov,
@@ -225,9 +346,15 @@ int uml_vduse_getdesc(struct uml_vduse_dev *dev, unsigned int index,
 	int err;
 
 	for (;;) {
-		err = vringh_getdesc_kern_range(&vq->vrh, riov, wiov,
-						uml_vduse_getrange, head,
-						GFP_KERNEL);
+		if (vq->nr_replay) {
+			err = uml_vduse_take_replay(vq, riov, wiov, head);
+		} else {
+			err = vringh_getdesc_kern_range(&vq->vrh, riov, wiov,
+							uml_vduse_getrange,
+							head, GFP_KERNEL);
+			if (err > 0)
+				uml_vduse_log_take(vq, *head);
+		}
 		if (err > 0) {
 			atomic64_inc(&vq->stats.requests);
 			if (riov)
@@ -258,18 +385,26 @@ void uml_vduse_complete(struct uml_vduse_dev *dev, unsigned int index,
 	unsigned long flags;
 	int notify;
 
+	/*
+	 * The log's used index trails the ring's only between publishing the
+	 * completion and clearing its flag, and then the head is last_head.
+	 */
 	spin_lock_irqsave(&vq->lock, flags);
+	WRITE_ONCE(vq->log->last_head, head);
+	smp_wmb();
 	vringh_complete_kern(&vq->vrh, head, len);
+	WRITE_ONCE(vq->log->desc[head].inflight, 0);
+	smp_wmb();
+	WRITE_ONCE(vq->log->used_idx,
+		   vq->vrh.last_used_idx + vq->vrh.completed);
 	notify = vringh_need_notify_kern(&vq->vrh);
 	spin_unlock_irqrestore(&vq->lock, flags);
 
 	atomic64_add(len, &vq->stats.in_bytes);
 	if (notify <= 0)
 		atomic64_inc(&vq->stats.suppressed);
-	else if (uml_vduse_user_vq_inject_irq(dev->fd, index))
-		atomic64_inc(&vq->stats.inject_errors);
 	else
-		atomic64_inc(&vq->stats.injected);
+		uml_vduse_inject(dev, index);
 }
 
 void uml_vduse_notify_disable(struct uml_vduse_dev *dev, unsigned int index)
@@ -284,6 +419,100 @@ void uml_vduse_notify_disable(struct uml_vduse_dev *dev, unsigned int index)
 bool uml_vduse_notify_enable(struct uml_vduse_dev *dev, unsigned int index)
 {
 	return vringh_notify_enable_kern(&dev->vqs[index].vrh);
+}
+
+static size_t uml_vduse_log_queue_size(struct uml_vduse_dev *dev)
+{
+	return struct_size_t(struct uml_vduse_log_queue, desc, dev->queue_size);
+}
+
+static void uml_vduse_clear_log(struct uml_vduse_dev *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < dev->num_queues; i++) {
+		struct uml_vduse_vq *vq = &dev->vqs[i];
+
+		memset(vq->log, 0, uml_vduse_log_queue_size(dev));
+		vq->counter = 0;
+		uml_vduse_free_replay(vq);
+	}
+}
+
+struct uml_vduse_inflight {
+	u64 counter;
+	u16 head;
+};
+
+static int uml_vduse_cmp_inflight(const void *a, const void *b)
+{
+	const struct uml_vduse_inflight *x = a, *y = b;
+
+	return x->counter < y->counter ? -1 : x->counter > y->counter;
+}
+
+/*
+ * Take over a queue that an earlier guest left running. The log marks its
+ * outstanding requests, and the next entry of the available ring follows
+ * them, since every request taken is either completed or in flight. This
+ * runs again after a failed start, so it replaces any earlier replay list.
+ */
+static int uml_vduse_recover_vq(struct uml_vduse_dev *dev,
+				struct uml_vduse_vq *vq)
+{
+	struct uml_vduse_log_queue *log = vq->log;
+	unsigned int num = vq->vrh.vring.num;
+	struct uml_vduse_inflight *in;
+	unsigned int i, n = 0;
+	u16 used;
+
+	uml_vduse_free_replay(vq);
+	vq->counter = 0;
+
+	used = uml_vduse_used_idx(vq);
+	vq->vrh.last_used_idx = used;
+
+	/* The earlier guest stopped between publishing and logging. */
+	if (log->used_idx != used) {
+		if (log->last_head < num)
+			log->desc[log->last_head].inflight = 0;
+		log->used_idx = used;
+	}
+
+	in = kmalloc_objs(*in, num);
+	if (!in)
+		return -ENOMEM;
+
+	for (i = 0; i < dev->queue_size; i++) {
+		if (!log->desc[i].inflight)
+			continue;
+		if (i >= num) {
+			log->desc[i].inflight = 0;
+			continue;
+		}
+		in[n].counter = log->desc[i].counter;
+		in[n].head = i;
+		n++;
+	}
+	sort(in, n, sizeof(*in), uml_vduse_cmp_inflight, NULL);
+
+	if (n) {
+		vq->replay = kmalloc_objs(*vq->replay, n);
+		if (!vq->replay) {
+			kfree(in);
+			return -ENOMEM;
+		}
+		for (i = 0; i < n; i++)
+			vq->replay[i] = in[i].head;
+		vq->nr_replay = n;
+		vq->counter = in[n - 1].counter + 1;
+	}
+	vq->vrh.last_avail_idx = used + n;
+	kfree(in);
+
+	pr_info("%s: queue %u has %u requests to replay\n", dev->name,
+		vq->index, n);
+	return 0;
 }
 
 static int uml_vduse_start_vq(struct uml_vduse_dev *dev,
@@ -321,6 +550,15 @@ static int uml_vduse_start_vq(struct uml_vduse_dev *dev,
 	vq->vrh.last_avail_idx = info.avail_index;
 	vq->vrh.last_used_idx = info.avail_index;
 
+	/* The log's used index follows the ring's from the start. */
+	if (dev->reconnect) {
+		err = uml_vduse_recover_vq(dev, vq);
+		if (err)
+			return err;
+	} else {
+		WRITE_ONCE(vq->log->used_idx, uml_vduse_used_idx(vq));
+	}
+
 	return uml_vduse_user_vq_set_kickfd(dev->fd, vq->index, vq->kickfd);
 }
 
@@ -354,13 +592,21 @@ static int uml_vduse_start(struct uml_vduse_dev *dev)
 		return err;
 	dev->running = true;
 
-	/* Kicks that arrived before the queues were running were dropped. */
+	/*
+	 * Kicks that arrived before the queues were running were dropped. An
+	 * earlier guest may have stopped after publishing a completion and
+	 * before raising its interrupt, so a reconnecting device raises one on
+	 * each queue.
+	 */
 	for (i = 0; i < dev->num_queues; i++) {
 		if (!dev->vqs[i].ready)
 			continue;
 		WRITE_ONCE(dev->vqs[i].running, true);
+		if (dev->reconnect)
+			uml_vduse_inject(dev, i);
 		dev->ops->kick(dev->priv, i);
 	}
+	dev->reconnect = false;
 
 	return 0;
 }
@@ -393,10 +639,46 @@ static int uml_vduse_set_status(struct uml_vduse_dev *dev, u8 status)
 
 	if (!status) {
 		uml_vduse_unmap_range(dev, 0, U64_MAX);
+		uml_vduse_clear_log(dev);
+		dev->reconnect = false;
 		atomic64_inc(&dev->stats.resets);
 	}
 
 	return err;
+}
+
+/*
+ * Start the queues that the driver had running when the earlier guest
+ * stopped. With no ready queue, the driver has not started the device, and
+ * its messages start it as usual. If the start fails, the device stays
+ * reconnecting, so that a later DRIVER_OK takes over the queues again
+ * instead of starting them from the beginning.
+ */
+static void uml_vduse_resume(struct uml_vduse_dev *dev)
+{
+	struct uml_vduse_user_vq_info info;
+	bool ready = false;
+	unsigned int i;
+	int err;
+
+	dev->resume = false;
+	atomic64_inc(&dev->stats.reconnects);
+
+	for (i = 0; i < dev->num_queues; i++) {
+		if (!uml_vduse_user_vq_get_info(dev->fd, i, &info) && info.ready)
+			ready = true;
+	}
+
+	if (!ready) {
+		dev->reconnect = false;
+		return;
+	}
+
+	err = uml_vduse_start(dev);
+	if (err)
+		pr_err("%s: cannot resume the device: %d\n", dev->name, err);
+	else
+		atomic64_inc(&dev->stats.starts);
 }
 
 static void uml_vduse_msg_work(struct work_struct *work)
@@ -407,6 +689,13 @@ static void uml_vduse_msg_work(struct work_struct *work)
 	u16 avail_index;
 	bool ok;
 	int err;
+
+	/*
+	 * A reconnecting device takes over its queues before handling the
+	 * messages that the earlier guest left unanswered.
+	 */
+	if (dev->resume)
+		uml_vduse_resume(dev);
 
 	while (!(err = uml_vduse_user_read_msg(dev->fd, &msg))) {
 		avail_index = 0;
@@ -501,13 +790,22 @@ static void uml_vduse_free_irq(int fd, int irq, void *opaque)
 	um_free_irq(irq, opaque);
 }
 
-/* Create the host device, removing a leftover one with the same name. */
+static u64 __init uml_vduse_features(const struct uml_vduse_config *cfg)
+{
+	return cfg->features | BIT_ULL(VIRTIO_F_VERSION_1) |
+	       BIT_ULL(VIRTIO_F_ACCESS_PLATFORM) |
+	       BIT_ULL(VIRTIO_RING_F_INDIRECT_DESC);
+}
+
+/*
+ * Create the host device. A device with the same name that no process opens
+ * and no driver uses is destroyed and created again. Returns 1 for one that
+ * is still in use, to reconnect to.
+ */
 static int __init uml_vduse_create_host(struct uml_vduse_dev *dev,
 					const struct uml_vduse_config *cfg)
 {
-	u64 features = cfg->features | BIT_ULL(VIRTIO_F_VERSION_1) |
-		       BIT_ULL(VIRTIO_F_ACCESS_PLATFORM) |
-		       BIT_ULL(VIRTIO_RING_F_INDIRECT_DESC);
+	u64 features = uml_vduse_features(cfg);
 	int err;
 
 	if (uml_vduse_control < 0) {
@@ -523,11 +821,8 @@ static int __init uml_vduse_create_host(struct uml_vduse_dev *dev,
 		return err;
 
 	err = uml_vduse_user_destroy(uml_vduse_control, dev->name);
-	if (err == -EBUSY) {
-		pr_err("%s: a device with this name is still bound, run 'vdpa dev del %s' on the host\n",
-		       dev->name, dev->name);
-		return -EEXIST;
-	}
+	if (err == -EBUSY)
+		return 1;
 	if (err)
 		return err;
 
@@ -535,6 +830,127 @@ static int __init uml_vduse_create_host(struct uml_vduse_dev *dev,
 				     cfg->device_id, features,
 				     cfg->num_queues, PAGE_SIZE, cfg->config,
 				     cfg->config_size);
+}
+
+/*
+ * Check that a device left by an earlier guest has this device's queues, and
+ * that its driver uses no feature this device does not offer. VDUSE cannot
+ * report the device type or configuration space, so those are assumed to be
+ * the same.
+ */
+static int __init uml_vduse_check_reconnect(struct uml_vduse_dev *dev,
+					    u64 offered)
+{
+	struct uml_vduse_user_vq_info info;
+	unsigned int i;
+	u64 features;
+	int err;
+
+	err = uml_vduse_user_get_features(dev->fd, &features);
+	if (err == -EPERM) {
+		pr_err("%s: the device stopped working after a message timed out, run 'vdpa dev del %s' on the host\n",
+		       dev->name, dev->name);
+		return err;
+	}
+	if (err)
+		return err;
+
+	if (features & ~offered) {
+		pr_err("%s: the driver uses features 0x%llx that this device does not offer\n",
+		       dev->name, features & ~offered);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < dev->num_queues; i++) {
+		err = uml_vduse_user_vq_get_info(dev->fd, i, &info);
+		if (err || info.num > dev->queue_size)
+			goto mismatch;
+	}
+	if (!uml_vduse_user_vq_get_info(dev->fd, dev->num_queues, &info))
+		goto mismatch;
+	return 0;
+
+mismatch:
+	pr_err("%s: the device has different queues from this one\n",
+	       dev->name);
+	return -EINVAL;
+}
+
+static bool __init uml_vduse_log_matches(struct uml_vduse_dev *dev,
+					 u64 node_dev, u64 node_ino)
+{
+	struct uml_vduse_log_header *hdr = dev->log;
+
+	return hdr->magic == UML_VDUSE_LOG_MAGIC &&
+	       hdr->version == UML_VDUSE_LOG_VERSION &&
+	       hdr->num_queues == dev->num_queues &&
+	       hdr->queue_size == dev->queue_size &&
+	       hdr->node_dev == node_dev && hdr->node_ino == node_ino;
+}
+
+/*
+ * Map the in-flight log. A new device starts with an empty log. Reconnecting
+ * needs the log of the earlier guest, since without it the requests that
+ * guest left outstanding cannot be found.
+ */
+static int __init uml_vduse_open_log(struct uml_vduse_dev *dev)
+{
+	size_t qsize = uml_vduse_log_queue_size(dev);
+	struct uml_vduse_log_header *hdr;
+	u64 node_dev, node_ino;
+	unsigned int i;
+	int err;
+
+	err = uml_vduse_user_node_id(dev->fd, &node_dev, &node_ino);
+	if (err)
+		return err;
+
+	if (dev->log_path) {
+		dev->log_fd = uml_vduse_user_open_log(dev->log_path);
+		if (dev->log_fd < 0)
+			return dev->log_fd;
+	}
+
+	dev->log_size = sizeof(*hdr) + dev->num_queues * qsize;
+	err = uml_vduse_user_map_log(dev->log_fd, dev->log_size,
+				     !dev->reconnect, &dev->log);
+	if (err == -EINVAL ||
+	    (!err && dev->reconnect &&
+	     !uml_vduse_log_matches(dev, node_dev, node_ino))) {
+		pr_err("%s: the in-flight log does not describe this device\n",
+		       dev->name);
+		return -EINVAL;
+	}
+	if (err)
+		return err;
+
+	hdr = dev->log;
+	if (!dev->reconnect) {
+		memset(dev->log, 0, dev->log_size);
+		hdr->magic = UML_VDUSE_LOG_MAGIC;
+		hdr->version = UML_VDUSE_LOG_VERSION;
+		hdr->num_queues = dev->num_queues;
+		hdr->queue_size = dev->queue_size;
+		hdr->node_dev = node_dev;
+		hdr->node_ino = node_ino;
+	}
+
+	for (i = 0; i < dev->num_queues; i++)
+		dev->vqs[i].log = dev->log + sizeof(*hdr) + i * qsize;
+	return 0;
+}
+
+static void __init uml_vduse_close_log(struct uml_vduse_dev *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < dev->num_queues; i++)
+		dev->vqs[i].log = NULL;
+	if (dev->log)
+		uml_vduse_user_unmap_log(dev->log, dev->log_size);
+	dev->log = NULL;
+	if (dev->log_path && dev->log_fd >= 0)
+		os_close_file(dev->log_fd);
 }
 
 static void uml_vduse_close_vqs(struct uml_vduse_dev *dev,
@@ -547,6 +963,7 @@ static void uml_vduse_close_vqs(struct uml_vduse_dev *dev,
 	}
 }
 
+/* A reconnecting guest keeps the sizes that the device already has. */
 static int __init uml_vduse_open_vqs(struct uml_vduse_dev *dev)
 {
 	unsigned int i;
@@ -555,9 +972,12 @@ static int __init uml_vduse_open_vqs(struct uml_vduse_dev *dev)
 	for (i = 0; i < dev->num_queues; i++) {
 		struct uml_vduse_vq *vq = &dev->vqs[i];
 
-		err = uml_vduse_user_vq_setup(dev->fd, i, dev->queue_size);
-		if (err)
-			goto close;
+		if (!dev->reconnect) {
+			err = uml_vduse_user_vq_setup(dev->fd, i,
+						      dev->queue_size);
+			if (err)
+				goto close;
+		}
 
 		vq->kickfd = uml_vduse_user_create_kickfd();
 		if (vq->kickfd < 0) {
@@ -623,14 +1043,28 @@ static int __init uml_vduse_setup(struct uml_vduse_dev *dev)
 	}
 
 	err = uml_vduse_create_host(dev, &cfg);
-	if (err)
+	if (err < 0)
 		return err;
+	dev->reconnect = dev->resume = err;
 
 	dev->fd = uml_vduse_user_open(dev->name);
 	if (dev->fd < 0) {
 		err = dev->fd;
+		if (err == -EBUSY)
+			pr_err("%s: another process serves the device\n",
+			       dev->name);
 		goto destroy;
 	}
+
+	if (dev->reconnect) {
+		err = uml_vduse_check_reconnect(dev, uml_vduse_features(&cfg));
+		if (err)
+			goto close;
+	}
+
+	err = uml_vduse_open_log(dev);
+	if (err)
+		goto close;
 
 	err = uml_vduse_open_vqs(dev);
 	if (err)
@@ -643,15 +1077,59 @@ static int __init uml_vduse_setup(struct uml_vduse_dev *dev)
 		goto close;
 	}
 
-	/* Messages sent before the IRQ existed raise no event. */
+	pr_info("%s: %s %s device\n", dev->name,
+		dev->reconnect ? "reconnecting to the" : "created", dev->type);
+
+	/*
+	 * Messages sent before the IRQ existed raise no event. A reconnecting
+	 * device resumes in the work too.
+	 */
 	schedule_work(&dev->msg_work);
 	return 0;
 
 close:
+	uml_vduse_close_log(dev);
 	os_close_file(dev->fd);
 destroy:
-	uml_vduse_user_destroy(uml_vduse_control, dev->name);
+	if (!dev->reconnect)
+		uml_vduse_user_destroy(uml_vduse_control, dev->name);
 	return err;
+}
+
+/* Take the transport's own options out of the backend's. */
+static int __init uml_vduse_parse_opts(struct uml_vduse_dev *dev, char *opts)
+{
+	size_t len = 0;
+	char *opt;
+
+	dev->log_fd = -1;
+	dev->opts = kzalloc(opts ? strlen(opts) + 1 : 1, GFP_KERNEL);
+	if (!dev->opts)
+		return -ENOMEM;
+
+	while ((opt = strsep(&opts, ","))) {
+		if (strstarts(opt, "log=")) {
+			dev->log_path = opt + strlen("log=");
+		} else if (strstarts(opt, "log_fd=")) {
+			if (kstrtoint(opt + strlen("log_fd="), 10, &dev->log_fd) ||
+			    dev->log_fd < 0)
+				return -EINVAL;
+		} else if (*opt) {
+			if (len)
+				dev->opts[len++] = ',';
+			strcpy(dev->opts + len, opt);
+			len += strlen(opt);
+		}
+	}
+
+	if (dev->log_path && dev->log_fd >= 0)
+		return -EINVAL;
+	if (!dev->log_path && dev->log_fd < 0) {
+		pr_err("%s: the device needs an in-flight log, given with log=<host path> or log_fd=<n>\n",
+		       dev->name);
+		return -EINVAL;
+	}
+	return 0;
 }
 
 /* Add a device given as <type>,<name>[,<options>]. */
@@ -682,9 +1160,13 @@ static void __init uml_vduse_add(const char *arg)
 	dev->name = sep + 1;
 
 	sep = strchr(dev->name, ',');
-	if (sep) {
+	if (sep)
 		*sep = '\0';
-		dev->opts = sep + 1;
+
+	err = uml_vduse_parse_opts(dev, sep ? sep + 1 : NULL);
+	if (err) {
+		pr_err("%s: invalid options\n", dev->name);
+		goto free;
 	}
 
 	err = uml_vduse_setup(dev);
@@ -696,11 +1178,11 @@ static void __init uml_vduse_add(const char *arg)
 		goto free;
 	}
 
-	pr_info("%s: created %s device\n", dev->name, dev->type);
 	list_add_tail(&dev->list, &uml_vduse_devices);
 	return;
 
 free:
+	kfree(dev->opts);
 	kfree(dev->vqs);
 	kfree(dev->type);
 	kfree(dev);
@@ -732,7 +1214,12 @@ __uml_help(uml_vduse_cmdline_param_ops,
 "    /dev/vduse/<name>. The host attaches it with 'vdpa dev add name <name>\n"
 "    mgmtdev vduse'. This parameter can be specified multiple times. The\n"
 "    blk type serves a guest block device and takes disk=<disk>, where\n"
-"    <disk> is /dev/<name> or <major>:<minor>.\n\n"
+"    <disk> is /dev/<name> or <major>:<minor>.\n"
+"    Every device needs an in-flight log, a host file that outlives UML,\n"
+"    given with log=<host path> or as the open descriptor log_fd=<n>. If\n"
+"    the device already exists and is still in use on the host, UML\n"
+"    reconnects to it and takes over the outstanding requests that the\n"
+"    earlier UML recorded in the log.\n\n"
 );
 
 static const char *const uml_vduse_msg_names[] = {
@@ -769,6 +1256,7 @@ static void uml_vduse_show_device(struct seq_file *m,
 	uml_vduse_show_counter(m, 2, "iova_maps", &stats->maps);
 	uml_vduse_show_counter(m, 2, "iova_unmaps", &stats->unmaps);
 	uml_vduse_show_counter(m, 2, "iova_map_errors", &stats->map_errors);
+	uml_vduse_show_counter(m, 2, "reconnects", &stats->reconnects);
 
 	for (i = 0; i < dev->num_queues; i++) {
 		struct uml_vduse_vq_stats *q = &dev->vqs[i].stats;
@@ -787,6 +1275,7 @@ static void uml_vduse_show_device(struct seq_file *m,
 		uml_vduse_show_counter(m, 4, "suppressed", &q->suppressed);
 		uml_vduse_show_counter(m, 4, "inject_errors",
 				       &q->inject_errors);
+		uml_vduse_show_counter(m, 4, "replayed", &q->replayed);
 	}
 }
 
@@ -801,9 +1290,9 @@ static int __maybe_unused uml_vduse_proc_show(struct seq_file *m, void *v)
 }
 
 /*
- * Stop the backend, close the device's fds and destroy it on the host. A
- * device that is still on the host's vDPA bus cannot be destroyed, and the
- * next start reclaims it once the host has removed it.
+ * Stop the backend, which completes the requests it has taken, close the
+ * device's fds and destroy it on the host. A device that is still on the
+ * host's vDPA bus cannot be destroyed, and the next guest reconnects to it.
  */
 static void uml_vduse_release(struct uml_vduse_dev *dev)
 {
@@ -819,14 +1308,20 @@ static void uml_vduse_release(struct uml_vduse_dev *dev)
 	uml_vduse_close_vqs(dev, dev->num_queues);
 	os_close_file(dev->fd);
 
+	/* A device still on the bus keeps its log for the next guest. */
 	err = uml_vduse_user_destroy(uml_vduse_control, dev->name);
-	if (err == -EBUSY)
-		pr_warn("%s: the device is still on the host's vDPA bus, run 'vdpa dev del %s' on the host\n",
-			dev->name, dev->name);
-	else if (err)
+	if (err == -EBUSY) {
+		pr_info("%s: the device stays on the host's vDPA bus for the next guest\n",
+			dev->name);
+	} else if (err) {
 		pr_warn("%s: cannot destroy the device: %d\n", dev->name, err);
-	else
+	} else {
 		pr_info("%s: destroyed the device\n", dev->name);
+		if (dev->log_path)
+			uml_vduse_user_remove_log(dev->log_path);
+		else
+			uml_vduse_user_truncate_log(dev->log_fd);
+	}
 }
 
 /* This runs before device_shutdown(), while the backends' disks still work. */
