@@ -192,3 +192,19 @@ config UML_PCI_OVER_VFIO
 	  This driver provides support for VFIO-based PCI passthrough.
 	  Devices must support MSI-X or MSI. Legacy INTx interrupts are
 	  not supported.
+
+config UML_VDUSE
+	bool "Export VirtIO devices to the host through VDUSE"
+	select VHOST_RING
+	help
+	  This driver makes UML a VDUSE device, which the host attaches to
+	  its vDPA bus and drives with its own VirtIO driver. Devices are
+	  given with vduse_uml.device= and served by backends in UML.
+
+config UML_VDUSE_BLK
+	bool "VDUSE virtio-blk backend"
+	depends on UML_VDUSE && BLOCK
+	default y
+	help
+	  Export a block device of the guest to the host as a virtio-blk
+	  device.
