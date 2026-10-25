@@ -172,7 +172,9 @@ int mconsole_reply(struct mc_request *req, const char *str, int err, int more)
 
 int mconsole_unlink_socket(void)
 {
-	unlink(mconsole_socket_name);
+	/* A socket given as an fd has no name, and belongs to its creator. */
+	if (*mconsole_socket_name)
+		unlink(mconsole_socket_name);
 	return 0;
 }
 

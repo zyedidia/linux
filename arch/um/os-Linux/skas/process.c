@@ -370,6 +370,9 @@ static int __init init_stub_exe_fd(void)
 				   MFD_EXEC | MFD_CLOEXEC | MFD_ALLOW_SEALING);
 
 	if (stub_exe_fd < 0) {
+		if (tempdir == NULL)
+			panic("No tempdir for the stub binary: %d", -errno);
+
 		printk(UM_KERN_INFO "Could not create executable memfd, using temporary file!");
 
 		tmpfile = malloc(strlen(tempdir) +

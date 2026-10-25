@@ -56,6 +56,26 @@ void kasan_map_memory(void *start, size_t len)
 /* Set by make_tempfile() during early boot. */
 char *tempdir = NULL;
 
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+
+/* Set if memory files are memfds instead of files in tempdir. */
+static int use_memfd;
+
+static int __init set_use_memfd(char *line, int *add)
+{
+	*add = 0;
+	use_memfd = 1;
+	return 0;
+}
+
+__uml_setup("memfd", set_use_memfd,
+"memfd\n"
+"    Create guest memory and other memory files with memfd_create instead\n"
+"    of in a tempdir, so that UML needs no filesystem for them.\n\n"
+);
+
 /* Check if dir is on tmpfs. Return 0 if yes, -1 if no or error. */
 static int __init check_tmpfs(const char *dir)
 {
@@ -125,13 +145,21 @@ done:
 }
 
 /*
- * Create an unlinked tempfile in a suitable tempdir. template must be the
- * basename part of the template with a leading '/'.
+ * Create an unlinked tempfile in a suitable tempdir, or a memfd with the
+ * memfd option. template must be the basename part of the template with a
+ * leading '/'.
  */
 static int __init make_tempfile(const char *template)
 {
 	char *tempname;
 	int fd;
+
+	if (use_memfd) {
+		fd = memfd_create("uml-memory", MFD_EXEC | MFD_CLOEXEC);
+		if (fd < 0)
+			os_warn("memfd_create failed: %s\n", strerror(errno));
+		return fd;
+	}
 
 	if (tempdir == NULL) {
 		tempdir = choose_tempdir();
@@ -230,12 +258,13 @@ void __init check_tmpexec(void)
 
 	addr = mmap(NULL, UM_KERN_PAGE_SIZE,
 		    PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, fd, 0);
-	os_info("Checking PROT_EXEC mmap in %s...", tempdir);
+	os_info("Checking PROT_EXEC mmap in %s...",
+		use_memfd ? "a memfd" : tempdir);
 	if (addr == MAP_FAILED) {
 		err = errno;
 		os_warn("%s\n", strerror(err));
 		close(fd);
-		if (err == EPERM)
+		if (err == EPERM && !use_memfd)
 			os_warn("%s must be not mounted noexec\n", tempdir);
 		exit(1);
 	}

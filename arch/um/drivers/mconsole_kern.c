@@ -8,6 +8,7 @@
 #include <linux/ctype.h>
 #include <linux/string.h>
 #include <linux/interrupt.h>
+#include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -715,6 +716,9 @@ static int __init mount_proc(void)
  */
 static char *notify_socket = NULL;
 
+/* A bound socket given with mconsole=fd:<n>, or -1. */
+static int mconsole_fd = -1;
+
 static int __init mconsole_init(void)
 {
 	/* long to avoid size mismatch warnings from gcc */
@@ -724,14 +728,18 @@ static int __init mconsole_init(void)
 
 	mount_proc();
 
-	if (umid_file_name("mconsole", file, sizeof(file)))
-		return -1;
-	snprintf(mconsole_socket_name, sizeof(file), "%s", file);
+	if (mconsole_fd >= 0) {
+		sock = mconsole_fd;
+	} else {
+		if (umid_file_name("mconsole", file, sizeof(file)))
+			return -1;
+		snprintf(mconsole_socket_name, sizeof(file), "%s", file);
 
-	sock = os_create_unix_socket(file, sizeof(file), 1);
-	if (sock < 0) {
-		printk(KERN_ERR "Failed to initialize management console\n");
-		return 1;
+		sock = os_create_unix_socket(file, sizeof(file), 1);
+		if (sock < 0) {
+			printk(KERN_ERR "Failed to initialize management console\n");
+			return 1;
+		}
 	}
 	if (os_set_fd_block(sock, 0))
 		goto out;
@@ -755,8 +763,12 @@ static int __init mconsole_init(void)
 			    "string\n");
 	}
 
-	printk(KERN_INFO "mconsole (version %d) initialized on %s\n",
-	       MCONSOLE_VERSION, mconsole_socket_name);
+	if (mconsole_fd >= 0)
+		printk(KERN_INFO "mconsole (version %d) initialized on fd %d\n",
+		       MCONSOLE_VERSION, mconsole_fd);
+	else
+		printk(KERN_INFO "mconsole (version %d) initialized on %s\n",
+		       MCONSOLE_VERSION, mconsole_socket_name);
 	return 0;
 
  out:
@@ -815,12 +827,20 @@ void unlock_notify(void)
 __initcall(create_proc_mconsole);
 
 #define NOTIFY "notify:"
+#define FD "fd:"
 
 static int mconsole_setup(char *str)
 {
 	if (!strncmp(str, NOTIFY, strlen(NOTIFY))) {
 		str += strlen(NOTIFY);
 		notify_socket = str;
+	} else if (!strncmp(str, FD, strlen(FD))) {
+		if (kstrtoint(str + strlen(FD), 10, &mconsole_fd) ||
+		    mconsole_fd < 0) {
+			printk(KERN_ERR "mconsole_setup : Invalid fd - '%s'\n",
+			       str);
+			mconsole_fd = -1;
+		}
 	}
 	else printk(KERN_ERR "mconsole_setup : Unknown option - '%s'\n", str);
 	return 1;
@@ -834,6 +854,10 @@ __uml_help(mconsole_setup,
 "    socket containing the name of the mconsole socket.  This also serves\n"
 "    to notify outside processes when UML has booted far enough to respond\n"
 "    to mconsole requests.\n\n"
+"mconsole=fd:<n>\n"
+"    Serve the management console on the open host file descriptor <n>, a\n"
+"    bound Unix datagram socket, instead of creating a socket in the umid\n"
+"    directory.\n\n"
 );
 
 static int notify_panic(struct notifier_block *self, unsigned long unused1,

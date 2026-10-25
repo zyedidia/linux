@@ -330,6 +330,13 @@ static void tty_output(int master, int slave)
 
 static void __init check_sigio(void)
 {
+	/*
+	 * The check opens a pty. Without pty channels it is skipped, and tty
+	 * fds use the SIGIO workaround, which works whatever the result.
+	 */
+	if (!IS_ENABLED(CONFIG_PTY_CHAN))
+		return;
+
 	if ((access("/dev/ptmx", R_OK) < 0) &&
 	    (access("/dev/ptyp0", R_OK) < 0)) {
 		printk(UM_KERN_WARNING "No pseudo-terminals available - "

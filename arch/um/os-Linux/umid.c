@@ -250,6 +250,22 @@ int __init set_umid(char *name)
 /* Changed in make_umid, which is called during early boot */
 static int umid_setup = 0;
 
+/* Set by the no_uml_dir option. */
+static int no_uml_dir;
+
+static int __init set_no_uml_dir(char *line, int *add)
+{
+	*add = 0;
+	no_uml_dir = 1;
+	return 0;
+}
+
+__uml_setup("no_uml_dir", set_no_uml_dir,
+"no_uml_dir\n"
+"    Do not create the umid directory or its pid file. The management\n"
+"    console then needs mconsole=fd:<n>.\n\n"
+);
+
 static int __init make_umid(void)
 {
 	int fd, err;
@@ -257,6 +273,9 @@ static int __init make_umid(void)
 
 	if (umid_setup)
 		return 0;
+
+	if (no_uml_dir)
+		return -ENOENT;
 
 	make_uml_dir();
 
@@ -316,7 +335,7 @@ static int __init make_umid(void)
 
 static int __init make_umid_init(void)
 {
-	if (!make_umid())
+	if (no_uml_dir || !make_umid())
 		return 0;
 
 	/*
@@ -392,6 +411,9 @@ __uml_setup("uml_dir=", set_uml_dir,
 static void remove_umid_dir(void)
 {
 	char *dir, err;
+
+	if (!umid_setup)
+		return;
 
 	dir = malloc(strlen(uml_dir) + UMID_LEN + 1);
 	if (!dir)

@@ -390,6 +390,27 @@ static void __init check_coredump_limit(void)
 		os_info("%llu\n", (unsigned long long)lim.rlim_max);
 }
 
+static int cpuinfo_fd __initdata = -1;
+
+static int __init set_cpuinfo_fd(char *line, int *add)
+{
+	char *end;
+
+	*add = 0;
+	cpuinfo_fd = strtol(line, &end, 10);
+	if (*end != '\0' || end == line || cpuinfo_fd < 0) {
+		os_warn("Invalid cpuinfo_fd '%s'\n", line);
+		cpuinfo_fd = -1;
+	}
+	return 0;
+}
+
+__uml_setup("cpuinfo_fd=", set_cpuinfo_fd,
+"cpuinfo_fd=<n>\n"
+"    Read the host's CPU features from the open host file descriptor <n>\n"
+"    instead of opening /proc/cpuinfo.\n\n"
+);
+
 void  __init get_host_cpu_features(
 		void (*flags_helper_func)(char *line),
 		void (*cache_helper_func)(char *line))
@@ -399,7 +420,10 @@ void  __init get_host_cpu_features(
 	size_t len = 0;
 	int done_parsing = 0;
 
-	cpuinfo = fopen("/proc/cpuinfo", "r");
+	if (cpuinfo_fd >= 0)
+		cpuinfo = fdopen(cpuinfo_fd, "r");
+	else
+		cpuinfo = fopen("/proc/cpuinfo", "r");
 	if (cpuinfo == NULL) {
 		os_info("Failed to get host CPU features\n");
 	} else {
