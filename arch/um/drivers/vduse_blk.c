@@ -151,6 +151,76 @@ static int uml_vduse_blk_alloc_pages(struct uml_vduse_blk_req *req)
 	return 0;
 }
 
+/*
+ * Whether every data buffer of a request lies in guest pages, which the
+ * transport gives when guest pages back the bounce region, and is aligned to
+ * the disk's logical block size.
+ */
+static bool uml_vduse_blk_in_pages(struct uml_vduse_blk_req *req)
+{
+	unsigned int lbs = bdev_logical_block_size(req->blk->bdev);
+	const struct iov_iter *it = &req->data;
+	size_t left = iov_iter_count(it), off = it->iov_offset;
+	const struct kvec *kv = it->kvec;
+
+	for (; left; kv++, off = 0) {
+		size_t n = min(kv->iov_len - off, left);
+		void *p = kv->iov_base + off;
+
+		if (!n)
+			continue;
+		if (!virt_addr_valid(p) || !virt_addr_valid(p + n - 1) ||
+		    !IS_ALIGNED((unsigned long)p, lbs) || !IS_ALIGNED(n, lbs))
+			return false;
+		left -= n;
+	}
+	return true;
+}
+
+/* Submit a request whose data buffers lie in guest pages, without a copy. */
+static void uml_vduse_blk_rw_pages(struct uml_vduse_blk_req *req, u64 sector,
+				   blk_opf_t opf)
+{
+	struct block_device *bdev = req->blk->bdev;
+	const struct iov_iter *it = &req->data;
+	size_t left = iov_iter_count(it), off = it->iov_offset, done = 0;
+	const struct kvec *kv = it->kvec;
+	unsigned int nr_vecs;
+	struct bio *bio;
+
+	nr_vecs = min_t(size_t, DIV_ROUND_UP(left, PAGE_SIZE) + it->nr_segs,
+			BIO_MAX_VECS);
+	bio = bio_alloc(bdev, nr_vecs, opf, GFP_KERNEL);
+	bio->bi_iter.bi_sector = sector;
+
+	for (; left; kv++, off = 0) {
+		size_t seg = min(kv->iov_len - off, left);
+		void *p = kv->iov_base + off;
+
+		left -= seg;
+		while (seg) {
+			unsigned int n = min_t(size_t, seg,
+					       PAGE_SIZE - offset_in_page(p));
+			struct page *page = virt_to_page(p);
+
+			if (bio_add_page(bio, page, n, offset_in_page(p)) != n) {
+				bio = blk_next_bio(bio, bdev, nr_vecs, opf,
+						   GFP_KERNEL);
+				bio->bi_iter.bi_sector = sector +
+					(done >> SECTOR_SHIFT);
+				__bio_add_page(bio, page, n, offset_in_page(p));
+			}
+			p += n;
+			seg -= n;
+			done += n;
+		}
+	}
+
+	bio->bi_private = req;
+	bio->bi_end_io = uml_vduse_blk_end_io;
+	submit_bio(bio);
+}
+
 static int uml_vduse_blk_rw(struct uml_vduse_blk_req *req, u64 sector,
 			    blk_opf_t opf)
 {
@@ -169,6 +239,11 @@ static int uml_vduse_blk_rw(struct uml_vduse_blk_req *req, u64 sector,
 
 	if (!left) {
 		uml_vduse_blk_finish(req, VIRTIO_BLK_S_OK, 1);
+		return 0;
+	}
+
+	if (uml_vduse_blk_in_pages(req)) {
+		uml_vduse_blk_rw_pages(req, sector, opf);
 		return 0;
 	}
 
