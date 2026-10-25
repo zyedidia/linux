@@ -794,7 +794,8 @@ static u64 __init uml_vduse_features(const struct uml_vduse_config *cfg)
 {
 	return cfg->features | BIT_ULL(VIRTIO_F_VERSION_1) |
 	       BIT_ULL(VIRTIO_F_ACCESS_PLATFORM) |
-	       BIT_ULL(VIRTIO_RING_F_INDIRECT_DESC);
+	       BIT_ULL(VIRTIO_RING_F_INDIRECT_DESC) |
+	       BIT_ULL(VIRTIO_RING_F_EVENT_IDX);
 }
 
 /*
