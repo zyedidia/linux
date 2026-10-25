@@ -5,12 +5,14 @@
 #include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/kstrtox.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/proc_fs.h>
 #include <linux/reboot.h>
+#include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
@@ -86,6 +88,8 @@ struct uml_vduse_vq_stats {
 	atomic64_t suppressed;
 	atomic64_t inject_errors;
 	atomic64_t replayed;
+	atomic64_t polled;
+	atomic64_t poll_timeouts;
 };
 
 struct uml_vduse_dev_stats {
@@ -144,6 +148,11 @@ struct uml_vduse_dev {
 	/* The features that the host's driver accepted. */
 	u64 features;
 	bool running;
+	/*
+	 * How long a queue that runs out of buffers waits for more before it
+	 * enables notifications, set by poll=<usecs>.
+	 */
+	u64 poll_ns;
 	/*
 	 * Reconnect is set when the device was left by a guest, until a start
 	 * takes over its queues. Resume is set until the message work has
@@ -568,6 +577,35 @@ void uml_vduse_notify_disable(struct uml_vduse_dev *dev, unsigned int index)
 bool uml_vduse_notify_enable(struct uml_vduse_dev *dev, unsigned int index)
 {
 	return vringh_notify_enable_kern(&dev->vqs[index].vrh);
+}
+
+/*
+ * Wait for the driver to make more buffers available, with notifications
+ * still disabled, for up to the device's poll time or until the CPU is
+ * needed. Return whether it did. Each kick that this saves costs the host a
+ * notification and the guest a wakeup.
+ */
+bool uml_vduse_poll(struct uml_vduse_dev *dev, unsigned int index)
+{
+	struct uml_vduse_vq *vq = &dev->vqs[index];
+	struct vringh *vrh = &vq->vrh;
+	u64 end;
+
+	if (!dev->poll_ns)
+		return false;
+
+	end = ktime_get_ns() + dev->poll_ns;
+	do {
+		if (vringh16_to_cpu(vrh, READ_ONCE(vrh->vring.avail->idx)) !=
+		    vrh->last_avail_idx) {
+			atomic64_inc(&vq->stats.polled);
+			return true;
+		}
+		cpu_relax();
+	} while (!need_resched() && ktime_get_ns() < end);
+
+	atomic64_inc(&vq->stats.poll_timeouts);
+	return false;
 }
 
 static size_t uml_vduse_log_queue_size(struct uml_vduse_dev *dev)
@@ -1282,6 +1320,12 @@ static int __init uml_vduse_parse_opts(struct uml_vduse_dev *dev, char *opts)
 			dev->bounce_guest = true;
 		} else if (!strcmp(opt, "bounce=host")) {
 			dev->bounce_guest = false;
+		} else if (strstarts(opt, "poll=")) {
+			unsigned int usecs;
+
+			if (kstrtouint(opt + strlen("poll="), 10, &usecs))
+				return -EINVAL;
+			dev->poll_ns = (u64)usecs * NSEC_PER_USEC;
 		} else if (*opt) {
 			if (len)
 				dev->opts[len++] = ',';
@@ -1396,7 +1440,11 @@ __uml_help(uml_vduse_cmdline_param_ops,
 "    It uses as much guest memory as the region, 64 MB by default, and\n"
 "    pins that memory on the host, where it counts against\n"
 "    RLIMIT_MEMLOCK. The default, bounce=host, leaves the region in host\n"
-"    memory.\n\n"
+"    memory.\n"
+"    With poll=<usecs>, a queue that runs out of buffers keeps looking for\n"
+"    more for up to that long before it asks the host for a kick, which\n"
+"    saves kicks under load at the cost of guest CPU time. The default is\n"
+"    0.\n\n"
 );
 
 static const char *const uml_vduse_msg_names[] = {
@@ -1456,6 +1504,9 @@ static void uml_vduse_show_device(struct seq_file *m,
 		uml_vduse_show_counter(m, 4, "inject_errors",
 				       &q->inject_errors);
 		uml_vduse_show_counter(m, 4, "replayed", &q->replayed);
+		uml_vduse_show_counter(m, 4, "polled", &q->polled);
+		uml_vduse_show_counter(m, 4, "poll_timeouts",
+				       &q->poll_timeouts);
 	}
 }
 

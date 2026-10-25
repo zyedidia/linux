@@ -45,5 +45,6 @@ void uml_vduse_complete(struct uml_vduse_dev *dev, unsigned int index,
 			u16 head, u32 len);
 void uml_vduse_notify_disable(struct uml_vduse_dev *dev, unsigned int index);
 bool uml_vduse_notify_enable(struct uml_vduse_dev *dev, unsigned int index);
+bool uml_vduse_poll(struct uml_vduse_dev *dev, unsigned int index);
 
 #endif /* __UM_VDUSE_H */

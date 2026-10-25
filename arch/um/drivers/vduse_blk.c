@@ -406,6 +406,8 @@ static void uml_vduse_blk_work(struct work_struct *work)
 				uml_vduse_blk_free(req);
 				if (r < 0)
 					return;
+				if (uml_vduse_poll(blk->dev, q->index))
+					continue;
 				break;
 			}
 
