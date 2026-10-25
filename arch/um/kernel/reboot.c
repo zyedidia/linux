@@ -125,6 +125,8 @@ static int __init uml_shutdown_init(void)
 		goto close;
 	}
 
+	/* Eventfds cannot raise SIGIO, so the SIGIO helper watches it. */
+	sigio_broken();
 	err = add_sigio_fd(fd);
 	if (err)
 		goto free_irq;
