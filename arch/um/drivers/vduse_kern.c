@@ -8,6 +8,7 @@
 #include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/proc_fs.h>
+#include <linux/reboot.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -494,7 +495,7 @@ static int __init uml_vduse_request_irq(int fd, irq_handler_t handler,
 	return irq;
 }
 
-static void __init uml_vduse_free_irq(int fd, int irq, void *opaque)
+static void uml_vduse_free_irq(int fd, int irq, void *opaque)
 {
 	ignore_sigio_fd(fd);
 	um_free_irq(irq, opaque);
@@ -536,7 +537,7 @@ static int __init uml_vduse_create_host(struct uml_vduse_dev *dev,
 				     cfg->config_size);
 }
 
-static void __init uml_vduse_close_vqs(struct uml_vduse_dev *dev,
+static void uml_vduse_close_vqs(struct uml_vduse_dev *dev,
 				       unsigned int n)
 {
 	while (n--) {
@@ -799,6 +800,51 @@ static int __maybe_unused uml_vduse_proc_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/*
+ * Stop the backend, close the device's fds and destroy it on the host. A
+ * device that is still on the host's vDPA bus cannot be destroyed, and the
+ * next start reclaims it once the host has removed it.
+ */
+static void uml_vduse_release(struct uml_vduse_dev *dev)
+{
+	int err;
+
+	/* Once the IRQ is gone, no message can start the backend again. */
+	uml_vduse_free_irq(dev->fd, dev->irq, dev);
+	cancel_work_sync(&dev->msg_work);
+
+	if (dev->running)
+		uml_vduse_stop(dev);
+	uml_vduse_unmap_range(dev, 0, U64_MAX);
+	uml_vduse_close_vqs(dev, dev->num_queues);
+	os_close_file(dev->fd);
+
+	err = uml_vduse_user_destroy(uml_vduse_control, dev->name);
+	if (err == -EBUSY)
+		pr_warn("%s: the device is still on the host's vDPA bus, run 'vdpa dev del %s' on the host\n",
+			dev->name, dev->name);
+	else if (err)
+		pr_warn("%s: cannot destroy the device: %d\n", dev->name, err);
+	else
+		pr_info("%s: destroyed the device\n", dev->name);
+}
+
+/* This runs before device_shutdown(), while the backends' disks still work. */
+static int uml_vduse_reboot(struct notifier_block *nb, unsigned long code,
+			    void *unused)
+{
+	struct uml_vduse_dev *dev;
+
+	list_for_each_entry(dev, &uml_vduse_devices, list)
+		uml_vduse_release(dev);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block uml_vduse_reboot_notifier = {
+	.notifier_call = uml_vduse_reboot,
+};
+
 static int __init uml_vduse_init(void)
 {
 	int i;
@@ -812,6 +858,7 @@ static int __init uml_vduse_init(void)
 		uml_vduse_add(uml_vduse_args[i]);
 
 	proc_create_single("vduse_uml", 0444, NULL, uml_vduse_proc_show);
+	register_reboot_notifier(&uml_vduse_reboot_notifier);
 	return 0;
 }
 late_initcall(uml_vduse_init);
