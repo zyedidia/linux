@@ -386,8 +386,8 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 	memcpy(blk->id, name, min(strlen(name), sizeof(blk->id)));
 
 	/*
-	 * Without indirect descriptors, a request needs a descriptor for each
-	 * segment, the header and the status byte, all from the ring.
+	 * A request's chain has a descriptor for each segment, the header and
+	 * the status byte, and must not be longer than the queue.
 	 */
 	blk->config.capacity = __cpu_to_virtio64(true,
 						 bdev_nr_sectors(blk->bdev));

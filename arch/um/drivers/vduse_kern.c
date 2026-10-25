@@ -13,6 +13,7 @@
 #include <linux/string.h>
 #include <linux/workqueue.h>
 #include <uapi/linux/virtio_config.h>
+#include <uapi/linux/virtio_ring.h>
 #include <irq_kern.h>
 #include <init.h>
 #include <os.h>
@@ -119,21 +120,22 @@ const char *uml_vduse_name(struct uml_vduse_dev *dev)
 	return dev->name;
 }
 
-static void *uml_vduse_translate(struct uml_vduse_dev *dev, u64 iova,
-				 size_t len, bool write)
+/*
+ * Find the region that holds an IOVA, and map it on a miss. Regions are only
+ * unmapped while the queues are stopped, so a region stays valid after the
+ * lock is dropped.
+ */
+static struct uml_vduse_region *uml_vduse_find_region(struct uml_vduse_dev *dev,
+						      u64 iova)
 {
 	struct uml_vduse_region *r;
-	u64 last;
 	int err;
-
-	if (!len || check_add_overflow(iova, (u64)len - 1, &last))
-		return NULL;
 
 	guard(mutex)(&dev->map_lock);
 
 	list_for_each_entry(r, &dev->regions, list) {
 		if (iova >= r->user.start && iova <= r->user.last)
-			goto found;
+			return r;
 	}
 
 	r = kzalloc_obj(*r);
@@ -150,13 +152,45 @@ static void *uml_vduse_translate(struct uml_vduse_dev *dev, u64 iova,
 	}
 	list_add(&r->list, &dev->regions);
 	atomic64_inc(&dev->stats.maps);
+	return r;
+}
 
-found:
-	if (last > r->user.last)
+static void *uml_vduse_translate(struct uml_vduse_dev *dev, u64 iova,
+				 size_t len, bool write)
+{
+	struct uml_vduse_region *r;
+	u64 last;
+
+	if (!len || check_add_overflow(iova, (u64)len - 1, &last))
+		return NULL;
+
+	r = uml_vduse_find_region(dev, iova);
+	if (!r || last > r->user.last)
 		return NULL;
 	if (write ? !r->user.writable : !r->user.readable)
 		return NULL;
 	return r->user.addr + (iova - r->user.start);
+}
+
+/*
+ * Give vringh the region that holds a buffer or an indirect table. The host
+ * maps the bounce region and coherent allocations for both reading and
+ * writing, so a range covers a whole region.
+ */
+static bool uml_vduse_getrange(struct vringh *vrh, u64 addr,
+			       struct vringh_range *range)
+{
+	struct uml_vduse_vq *vq = container_of(vrh, struct uml_vduse_vq, vrh);
+	struct uml_vduse_region *r;
+
+	r = uml_vduse_find_region(vq->dev, addr);
+	if (!r)
+		return false;
+
+	range->start = r->user.start;
+	range->end_incl = r->user.last;
+	range->offset = (unsigned long)r->user.addr - r->user.start;
+	return true;
 }
 
 static void uml_vduse_unmap_range(struct uml_vduse_dev *dev, u64 start,
@@ -176,31 +210,6 @@ static void uml_vduse_unmap_range(struct uml_vduse_dev *dev, u64 start,
 	}
 }
 
-static int uml_vduse_translate_iov(struct uml_vduse_dev *dev,
-				   struct vringh_kiov *iov, bool write)
-{
-	unsigned int i;
-
-	if (!iov)
-		return 0;
-
-	for (i = 0; i < iov->used; i++) {
-		struct kvec *v = &iov->iov[i];
-		void *addr = NULL;
-
-		if (v->iov_len) {
-			addr = uml_vduse_translate(dev,
-						   (unsigned long)v->iov_base,
-						   v->iov_len, write);
-			if (!addr)
-				return -EFAULT;
-		}
-		v->iov_base = addr;
-	}
-
-	return 0;
-}
-
 /*
  * Get the next available descriptor chain with its buffers translated to
  * pointers. A chain that cannot be translated is returned to the driver as
@@ -215,20 +224,15 @@ int uml_vduse_getdesc(struct uml_vduse_dev *dev, unsigned int index,
 	int err;
 
 	for (;;) {
-		*head = vq->vrh.vring.num;
-		err = vringh_getdesc_kern(&vq->vrh, riov, wiov, head,
-					  GFP_KERNEL);
+		err = vringh_getdesc_kern_range(&vq->vrh, riov, wiov,
+						uml_vduse_getrange, head,
+						GFP_KERNEL);
 		if (err > 0) {
-			err = uml_vduse_translate_iov(dev, riov, false);
-			if (!err)
-				err = uml_vduse_translate_iov(dev, wiov, true);
-			if (!err) {
-				atomic64_inc(&vq->stats.requests);
-				if (riov)
-					atomic64_add(vringh_kiov_length(riov),
-						     &vq->stats.out_bytes);
-				return 1;
-			}
+			atomic64_inc(&vq->stats.requests);
+			if (riov)
+				atomic64_add(vringh_kiov_length(riov),
+					     &vq->stats.out_bytes);
+			return 1;
 		}
 		if (!err)
 			return 0;
@@ -501,7 +505,8 @@ static int __init uml_vduse_create_host(struct uml_vduse_dev *dev,
 					const struct uml_vduse_config *cfg)
 {
 	u64 features = cfg->features | BIT_ULL(VIRTIO_F_VERSION_1) |
-		       BIT_ULL(VIRTIO_F_ACCESS_PLATFORM);
+		       BIT_ULL(VIRTIO_F_ACCESS_PLATFORM) |
+		       BIT_ULL(VIRTIO_RING_F_INDIRECT_DESC);
 	int err;
 
 	if (uml_vduse_control < 0) {
