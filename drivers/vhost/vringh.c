@@ -1018,6 +1018,38 @@ int vringh_getdesc_kern_range(struct vringh *vrh,
 EXPORT_SYMBOL(vringh_getdesc_kern_range);
 
 /**
+ * vringh_chain_kern_range - get the descriptors of a given chain from a
+ *	kernelspace ring whose descriptors hold untranslated addresses.
+ * @vrh: the kernelspace vring.
+ * @head: the head of the chain.
+ * @riov: where to put the readable descriptors (or NULL)
+ * @wiov: where to put the writable descriptors (or NULL)
+ * @getrange: function to find the range of addresses that holds an address,
+ *	and the offset that turns it into a kernel pointer.
+ * @gfp: flags for allocating larger riov/wiov.
+ *
+ * This walks the chain at @head as vringh_getdesc_kern_range() does, but
+ * takes nothing from the available ring. A device that takes over the
+ * outstanding requests of an earlier instance uses it to get them again.
+ *
+ * Returns 0 on success, or -errno.
+ */
+int vringh_chain_kern_range(struct vringh *vrh, u16 head,
+			    struct vringh_kiov *riov,
+			    struct vringh_kiov *wiov,
+			    bool (*getrange)(struct vringh *vrh,
+					     u64 addr, struct vringh_range *r),
+			    gfp_t gfp)
+{
+	if (head >= vrh->vring.num)
+		return -EINVAL;
+
+	return __vringh_iov(vrh, head, riov, wiov, range_check, getrange,
+			    gfp, copydesc_kern);
+}
+EXPORT_SYMBOL(vringh_chain_kern_range);
+
+/**
  * vringh_complete_kern - we've finished with descriptor, publish it.
  * @vrh: the vring.
  * @head: the head as filled in by vringh_getdesc_kern.
