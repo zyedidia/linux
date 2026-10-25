@@ -101,6 +101,14 @@ static void __local_ipi_set(int enable)
 {
 	sigset_t sigset;
 
+	/*
+	 * IPIs only come from other CPUs, so with one CPU there is nothing to
+	 * mask, and the syscall would run on every change of the interrupt
+	 * state.
+	 */
+	if (uml_ncpus == 1)
+		return;
+
 	sigemptyset(&sigset);
 	sigaddset(&sigset, IPI_SIGNAL);
 
