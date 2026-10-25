@@ -4,8 +4,10 @@
 
 #include <linux/bio.h>
 #include <linux/blkdev.h>
+#include <linux/cpumask.h>
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/kstrtox.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -21,6 +23,16 @@
 #define UML_VDUSE_BLK_QUEUE_SIZE 256
 #define UML_VDUSE_BLK_INLINE_IOVS 4
 #define UML_VDUSE_BLK_RETRY_DELAY msecs_to_jiffies(10)
+#define UML_VDUSE_BLK_MAX_QUEUES 64
+
+struct uml_vduse_blk;
+
+/* A queue's processing runs on the CPU that handles the queue's kicks. */
+struct uml_vduse_blk_queue {
+	struct uml_vduse_blk *blk;
+	unsigned int index;
+	struct delayed_work work;
+};
 
 struct uml_vduse_blk {
 	struct uml_vduse_dev *dev;
@@ -29,13 +41,15 @@ struct uml_vduse_blk {
 	struct virtio_blk_config config;
 	char id[VIRTIO_BLK_ID_BYTES];
 
-	struct delayed_work work;
+	unsigned int nr_queues;
+	struct uml_vduse_blk_queue *queues;
 	atomic_t inflight;
 	wait_queue_head_t idle;
 };
 
 struct uml_vduse_blk_req {
 	struct uml_vduse_blk *blk;
+	unsigned int queue;
 	u16 head;
 	u32 type;
 	u8 *status;
@@ -51,7 +65,8 @@ struct uml_vduse_blk_req {
 	unsigned int nr_pages;
 };
 
-static struct uml_vduse_blk_req *uml_vduse_blk_alloc(struct uml_vduse_blk *blk)
+static struct uml_vduse_blk_req *uml_vduse_blk_alloc(struct uml_vduse_blk *blk,
+						    unsigned int queue)
 {
 	struct uml_vduse_blk_req *req;
 
@@ -60,6 +75,7 @@ static struct uml_vduse_blk_req *uml_vduse_blk_alloc(struct uml_vduse_blk *blk)
 		return NULL;
 
 	req->blk = blk;
+	req->queue = queue;
 	vringh_kiov_init(&req->riov, req->rkvec, ARRAY_SIZE(req->rkvec));
 	vringh_kiov_init(&req->wiov, req->wkvec, ARRAY_SIZE(req->wkvec));
 	return req;
@@ -86,7 +102,7 @@ static void uml_vduse_blk_finish(struct uml_vduse_blk_req *req, u8 status,
 
 	if (req->status)
 		*req->status = status;
-	uml_vduse_complete(blk->dev, 0, req->head, len);
+	uml_vduse_complete(blk->dev, req->queue, req->head, len);
 	uml_vduse_blk_free(req);
 
 	if (atomic_dec_and_test(&blk->inflight))
@@ -363,26 +379,28 @@ static void uml_vduse_blk_handle(struct uml_vduse_blk_req *req)
 
 static void uml_vduse_blk_work(struct work_struct *work)
 {
-	struct uml_vduse_blk *blk = container_of(to_delayed_work(work),
-						 struct uml_vduse_blk, work);
+	struct uml_vduse_blk_queue *q = container_of(to_delayed_work(work),
+						     struct uml_vduse_blk_queue,
+						     work);
+	struct uml_vduse_blk *blk = q->blk;
 	struct uml_vduse_blk_req *req;
 	int r;
 
 	do {
-		uml_vduse_notify_disable(blk->dev, 0);
+		uml_vduse_notify_disable(blk->dev, q->index);
 		for (;;) {
 			/*
 			 * Notifications stay disabled until the retry, which
 			 * finds the requests that are still available.
 			 */
-			req = uml_vduse_blk_alloc(blk);
+			req = uml_vduse_blk_alloc(blk, q->index);
 			if (!req) {
-				schedule_delayed_work(&blk->work,
+				schedule_delayed_work(&q->work,
 						      UML_VDUSE_BLK_RETRY_DELAY);
 				return;
 			}
 
-			r = uml_vduse_getdesc(blk->dev, 0, &req->riov,
+			r = uml_vduse_getdesc(blk->dev, q->index, &req->riov,
 					      &req->wiov, &req->head);
 			if (r <= 0) {
 				uml_vduse_blk_free(req);
@@ -394,14 +412,15 @@ static void uml_vduse_blk_work(struct work_struct *work)
 			atomic_inc(&blk->inflight);
 			uml_vduse_blk_handle(req);
 		}
-	} while (!uml_vduse_notify_enable(blk->dev, 0));
+	} while (!uml_vduse_notify_enable(blk->dev, q->index));
 }
 
+/* The kick handler runs on the queue's CPU, and so does the work it queues. */
 static void uml_vduse_blk_kick(void *priv, unsigned int index)
 {
 	struct uml_vduse_blk *blk = priv;
 
-	mod_delayed_work(system_percpu_wq, &blk->work, 0);
+	mod_delayed_work(system_percpu_wq, &blk->queues[index].work, 0);
 }
 
 static int uml_vduse_blk_start(void *priv)
@@ -412,8 +431,10 @@ static int uml_vduse_blk_start(void *priv)
 static void uml_vduse_blk_stop(void *priv)
 {
 	struct uml_vduse_blk *blk = priv;
+	unsigned int i;
 
-	cancel_delayed_work_sync(&blk->work);
+	for (i = 0; i < blk->nr_queues; i++)
+		cancel_delayed_work_sync(&blk->queues[i].work);
 	wait_event(blk->idle, !atomic_read(&blk->inflight));
 }
 
@@ -421,18 +442,23 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 					struct uml_vduse_config *cfg)
 {
 	const char *name = uml_vduse_name(dev);
+	unsigned int i, nr_queues = num_online_cpus();
 	struct uml_vduse_blk *blk;
 	char *disk = NULL, *opt;
 	dev_t devt;
 	int err;
 
 	while ((opt = strsep(&opts, ","))) {
-		if (strstarts(opt, "disk="))
+		if (strstarts(opt, "disk=")) {
 			disk = opt + strlen("disk=");
-		else if (*opt)
+		} else if (strstarts(opt, "queues=")) {
+			if (kstrtouint(opt + strlen("queues="), 10, &nr_queues))
+				return ERR_PTR(-EINVAL);
+		} else if (*opt) {
 			return ERR_PTR(-EINVAL);
+		}
 	}
-	if (!disk)
+	if (!disk || !nr_queues || nr_queues > UML_VDUSE_BLK_MAX_QUEUES)
 		return ERR_PTR(-EINVAL);
 
 	err = early_lookup_bdev(disk, &devt);
@@ -455,8 +481,20 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 	}
 	blk->bdev = file_bdev(blk->bdev_file);
 
+	blk->queues = kzalloc_objs(*blk->queues, nr_queues);
+	if (!blk->queues) {
+		fput(blk->bdev_file);
+		kfree(blk);
+		return ERR_PTR(-ENOMEM);
+	}
+	blk->nr_queues = nr_queues;
+	for (i = 0; i < nr_queues; i++) {
+		blk->queues[i].blk = blk;
+		blk->queues[i].index = i;
+		INIT_DELAYED_WORK(&blk->queues[i].work, uml_vduse_blk_work);
+	}
+
 	blk->dev = dev;
-	INIT_DELAYED_WORK(&blk->work, uml_vduse_blk_work);
 	init_waitqueue_head(&blk->idle);
 	memcpy(blk->id, name, min(strlen(name), sizeof(blk->id)));
 
@@ -470,18 +508,21 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 						UML_VDUSE_BLK_QUEUE_SIZE - 2);
 	blk->config.blk_size =
 		__cpu_to_virtio32(true, bdev_logical_block_size(blk->bdev));
+	blk->config.num_queues = __cpu_to_virtio16(true, nr_queues);
 
 	cfg->device_id = VIRTIO_ID_BLOCK;
 	cfg->features = BIT_ULL(VIRTIO_BLK_F_SEG_MAX) |
 			BIT_ULL(VIRTIO_BLK_F_BLK_SIZE) |
-			BIT_ULL(VIRTIO_BLK_F_FLUSH);
-	cfg->num_queues = 1;
+			BIT_ULL(VIRTIO_BLK_F_FLUSH) |
+			BIT_ULL(VIRTIO_BLK_F_MQ);
+	cfg->num_queues = nr_queues;
 	cfg->queue_size = UML_VDUSE_BLK_QUEUE_SIZE;
 	cfg->config = &blk->config;
 	cfg->config_size = sizeof(blk->config);
 
-	pr_info("%s: serving disk %s with %llu sectors\n", name, disk,
-		(unsigned long long)bdev_nr_sectors(blk->bdev));
+	pr_info("%s: serving disk %s with %llu sectors on %u queues\n", name,
+		disk, (unsigned long long)bdev_nr_sectors(blk->bdev),
+		nr_queues);
 	return blk;
 }
 
@@ -490,6 +531,7 @@ static void uml_vduse_blk_release(void *priv)
 	struct uml_vduse_blk *blk = priv;
 
 	fput(blk->bdev_file);
+	kfree(blk->queues);
 	kfree(blk);
 }
 
