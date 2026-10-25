@@ -261,28 +261,32 @@ static int slow_copy(struct vringh *vrh, void *dst, const void *src,
 		     bool (*getrange)(struct vringh *vrh,
 				      u64 addr,
 				      struct vringh_range *r),
-		     struct vringh_range *range,
+		     const struct vringh_range *range,
 		     int (*copy)(const struct vringh *vrh,
 				 void *dst, const void *src, size_t len))
 {
 	size_t part, len = sizeof(struct vring_desc);
+	/*
+	 * src was made with the offset of the range that holds the start of
+	 * the table. Each part is read through the offset of its own range.
+	 */
+	u64 addr = (u64)(unsigned long)src - range->offset;
+	struct vringh_range r = *range;
 
 	do {
-		u64 addr;
 		int err;
 
 		part = len;
-		addr = (u64)(unsigned long)src - range->offset;
-
-		if (!rcheck(vrh, addr, &part, range, getrange))
+		if (!rcheck(vrh, addr, &part, &r, getrange))
 			return -EINVAL;
 
-		err = copy(vrh, dst, src, part);
+		err = copy(vrh, dst, (void *)(unsigned long)(addr + r.offset),
+			   part);
 		if (err)
 			return err;
 
 		dst += part;
-		src += part;
+		addr += part;
 		len -= part;
 	} while (len);
 	return 0;
