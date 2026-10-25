@@ -57,6 +57,12 @@ struct um_pci_ops {
 	 * interrupt will be delivered again.
 	 */
 	bool (*msi_retrigger)(struct um_pci_device *dev, unsigned int index);
+	/*
+	 * Optional. Handle a vector's interrupts on a CPU. Without it, the
+	 * vector's affinity cannot be set.
+	 */
+	void (*msi_set_cpu)(struct um_pci_device *dev, unsigned int index,
+			    unsigned int cpu);
 };
 
 int um_pci_device_register(struct um_pci_device *dev);

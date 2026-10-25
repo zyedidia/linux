@@ -427,12 +427,32 @@ static int um_pci_msi_retrigger(struct irq_data *data)
 	return dev->ops->msi_retrigger(dev, index);
 }
 
+/* Handle the vector on the first online CPU of the mask. */
+static int um_pci_msi_set_affinity(struct irq_data *data,
+				   const struct cpumask *dest, bool force)
+{
+	unsigned int index, cpu = cpumask_first_and(dest, cpu_online_mask);
+	struct um_pci_device *dev;
+
+	if (cpu >= nr_cpu_ids)
+		return -EINVAL;
+
+	dev = um_pci_msi_device(data, &index);
+	if (!dev || !dev->ops->msi_set_cpu)
+		return -EINVAL;
+
+	dev->ops->msi_set_cpu(dev, index, cpu);
+	irq_data_update_effective_affinity(data, cpumask_of(cpu));
+	return IRQ_SET_MASK_OK;
+}
+
 static struct irq_chip um_pci_msi_bottom_irq_chip = {
 	.name = "UM virtual MSI",
 	.irq_compose_msi_msg = um_pci_compose_msi_msg,
 	.irq_mask = um_pci_msi_mask,
 	.irq_unmask = um_pci_msi_unmask,
 	.irq_retrigger = um_pci_msi_retrigger,
+	.irq_set_affinity = um_pci_msi_set_affinity,
 };
 
 static int um_pci_inner_domain_alloc(struct irq_domain *domain,
@@ -508,8 +528,7 @@ static const struct irq_domain_ops um_pci_inner_domain_ops = {
 
 #define UM_PCI_MSI_FLAGS_REQUIRED (MSI_FLAG_USE_DEF_DOM_OPS		| \
 				   MSI_FLAG_USE_DEF_CHIP_OPS		| \
-				   MSI_FLAG_PCI_MSI_MASK_PARENT		| \
-				   MSI_FLAG_NO_AFFINITY)
+				   MSI_FLAG_PCI_MSI_MASK_PARENT)
 #define UM_PCI_MSI_FLAGS_SUPPORTED (MSI_GENERIC_FLAGS_MASK		| \
 				    MSI_FLAG_PCI_MSIX)
 

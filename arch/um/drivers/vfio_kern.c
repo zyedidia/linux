@@ -30,6 +30,8 @@ struct uml_vfio_intr_ctx {
 	struct uml_vfio_device *dev;
 	int irq;
 	int virq;
+	/* The CPU that handles the vector, which its eventfd's IRQ follows. */
+	unsigned int cpu;
 	bool masked;
 	bool pending;
 
@@ -363,6 +365,7 @@ static int uml_vfio_activate_irq(struct uml_vfio_device *dev, int index)
 	if (err)
 		goto free_irq;
 
+	um_irq_set_cpu(ctx->irq, READ_ONCE(ctx->cpu));
 	return 0;
 
 free_irq:
@@ -813,6 +816,25 @@ static bool uml_vfio_msi_retrigger(struct um_pci_device *pdev,
 	return ret;
 }
 
+/*
+ * Move a vector's eventfd to the IRQ epoll set of a CPU, or remember the CPU
+ * for when the vector is activated.
+ */
+static void uml_vfio_msi_set_cpu(struct um_pci_device *pdev,
+				 unsigned int index, unsigned int cpu)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+	struct uml_vfio_intr_ctx *ctx;
+
+	if (index >= dev->udev.irq_count)
+		return;
+
+	ctx = &dev->intr_ctx[index];
+	WRITE_ONCE(ctx->cpu, cpu);
+	if (ctx->irq >= 0)
+		um_irq_set_cpu(ctx->irq, cpu);
+}
+
 static const struct um_pci_ops uml_vfio_um_pci_ops = {
 	.cfgspace_read	= uml_vfio_cfgspace_read,
 	.cfgspace_write	= uml_vfio_cfgspace_write,
@@ -827,6 +849,7 @@ static const struct um_pci_ops uml_vfio_um_pci_ops = {
 	.msi_deactivate	= uml_vfio_msi_deactivate,
 	.msi_mask	= uml_vfio_msi_mask,
 	.msi_retrigger	= uml_vfio_msi_retrigger,
+	.msi_set_cpu	= uml_vfio_msi_set_cpu,
 };
 
 /*
