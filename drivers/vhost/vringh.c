@@ -973,6 +973,51 @@ int vringh_getdesc_kern(struct vringh *vrh,
 EXPORT_SYMBOL(vringh_getdesc_kern);
 
 /**
+ * vringh_getdesc_kern_range - get next available descriptor from a
+ *	kernelspace ring whose descriptors hold untranslated addresses.
+ * @vrh: the kernelspace vring.
+ * @riov: where to put the readable descriptors (or NULL)
+ * @wiov: where to put the writable descriptors (or NULL)
+ * @getrange: function to find the range of addresses that holds an address,
+ *	and the offset that turns it into a kernel pointer.
+ * @head: head index we received, for passing to vringh_complete_kern().
+ * @gfp: flags for allocating larger riov/wiov.
+ *
+ * This is vringh_getdesc_kern(), except that the addresses of buffers and
+ * indirect tables are translated through @getrange, as in
+ * vringh_getdesc_user(). A buffer that crosses the end of a range is split
+ * into one iovec per range.
+ */
+int vringh_getdesc_kern_range(struct vringh *vrh,
+			      struct vringh_kiov *riov,
+			      struct vringh_kiov *wiov,
+			      bool (*getrange)(struct vringh *vrh,
+					       u64 addr, struct vringh_range *r),
+			      u16 *head,
+			      gfp_t gfp)
+{
+	int err;
+
+	*head = vrh->vring.num;
+	err = __vringh_get_head(vrh, getu16_kern, &vrh->last_avail_idx);
+	if (err < 0)
+		return err;
+
+	/* Empty... */
+	if (err == vrh->vring.num)
+		return 0;
+
+	*head = err;
+	err = __vringh_iov(vrh, *head, riov, wiov, range_check, getrange,
+			   gfp, copydesc_kern);
+	if (err)
+		return err;
+
+	return 1;
+}
+EXPORT_SYMBOL(vringh_getdesc_kern_range);
+
+/**
  * vringh_complete_kern - we've finished with descriptor, publish it.
  * @vrh: the vring.
  * @head: the head as filled in by vringh_getdesc_kern.

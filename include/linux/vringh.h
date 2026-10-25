@@ -231,6 +231,13 @@ int vringh_getdesc_kern(struct vringh *vrh,
 			struct vringh_kiov *wiov,
 			u16 *head,
 			gfp_t gfp);
+int vringh_getdesc_kern_range(struct vringh *vrh,
+			      struct vringh_kiov *riov,
+			      struct vringh_kiov *wiov,
+			      bool (*getrange)(struct vringh *vrh,
+					       u64 addr, struct vringh_range *r),
+			      u16 *head,
+			      gfp_t gfp);
 
 int vringh_complete_kern(struct vringh *vrh, u16 head, u32 len);
 
