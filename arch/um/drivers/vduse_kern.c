@@ -345,21 +345,25 @@ static void uml_vduse_register_umem(struct uml_vduse_dev *dev)
 	if (err == -EINVAL)
 		return;
 
-	dev->umem_wanted = false;
 	if (!err && size != dev->umem_size)
 		err = uml_vduse_alloc_umem(dev, size);
 	if (!err) {
 		uml_vduse_user_dereg_umem(dev->fd, size);
 		err = uml_vduse_user_reg_umem(dev->fd, dev->umem_window, size);
 	}
-	if (err) {
+	if (!err) {
+		dev->umem_registered = true;
+		atomic64_inc(&dev->stats.umem_regs);
+	} else {
 		pr_warn("%s: the bounce region stays in host memory, so requests are copied: %d\n",
 			dev->name, err);
-		return;
 	}
 
-	dev->umem_registered = true;
-	atomic64_inc(&dev->stats.umem_regs);
+	/*
+	 * Another queue that finds no registration wanted must also find its
+	 * result, so the request is withdrawn last.
+	 */
+	smp_store_release(&dev->umem_wanted, false);
 }
 
 /*
@@ -374,7 +378,7 @@ static bool uml_vduse_getrange(struct vringh *vrh, u64 addr,
 	struct uml_vduse_dev *dev = vq->dev;
 	struct uml_vduse_region *r;
 
-	if (READ_ONCE(dev->umem_wanted))
+	if (smp_load_acquire(&dev->umem_wanted))
 		uml_vduse_register_umem(dev);
 
 	/* With guest pages behind it, the bounce region is one range a chunk. */
@@ -1145,6 +1149,13 @@ static int __init uml_vduse_open_vqs(struct uml_vduse_dev *dev)
 			os_close_file(vq->kickfd);
 			goto close;
 		}
+
+		/*
+		 * Each queue's kicks, and the backend's work that they
+		 * schedule, run on a CPU of its own where there are enough.
+		 */
+		irq_set_affinity(vq->irq,
+				 cpumask_of(cpumask_local_spread(i, NUMA_NO_NODE)));
 	}
 
 	return 0;
@@ -1372,7 +1383,9 @@ __uml_help(uml_vduse_cmdline_param_ops,
 "    /dev/vduse/<name>. The host attaches it with 'vdpa dev add name <name>\n"
 "    mgmtdev vduse'. This parameter can be specified multiple times. The\n"
 "    blk type serves a guest block device and takes disk=<disk>, where\n"
-"    <disk> is /dev/<name> or <major>:<minor>.\n"
+"    <disk> is /dev/<name> or <major>:<minor>, and queues=<n>, one queue\n"
+"    per guest CPU by default. Each queue's kicks are handled on a CPU of\n"
+"    its own where there are enough.\n"
 "    Every device needs an in-flight log, a host file that outlives UML,\n"
 "    given with log=<host path> or as the open descriptor log_fd=<n>. If\n"
 "    the device already exists and is still in use on the host, UML\n"
