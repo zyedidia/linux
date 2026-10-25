@@ -322,3 +322,73 @@ int uml_vduse_user_truncate_log(int fd)
 		return -errno;
 	return 0;
 }
+
+/*
+ * Return the size of the bounce region. VDUSE reports it only once the host
+ * has made its first streaming map, and fails with -EINVAL before that.
+ */
+int uml_vduse_user_bounce_size(int fd, uint64_t *size)
+{
+	struct vduse_iova_info info;
+
+	memset(&info, 0, sizeof(info));
+	if (ioctl(fd, VDUSE_IOTLB_GET_INFO, &info) < 0)
+		return -errno;
+	if (info.start != 0 || !(info.capability & VDUSE_IOVA_CAP_UMEM))
+		return -EOPNOTSUPP;
+
+	*size = info.last + 1;
+	return 0;
+}
+
+void *uml_vduse_user_reserve_window(size_t size)
+{
+	void *addr;
+
+	addr = mmap(NULL, size, PROT_NONE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	return addr == MAP_FAILED ? NULL : addr;
+}
+
+/* Map part of a file, such as guest memory, into a reserved window. */
+int uml_vduse_user_map_window(void *addr, size_t size, int fd,
+			      unsigned long long offset)
+{
+	void *p;
+
+	p = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+		 fd, offset);
+	return p == MAP_FAILED ? -errno : 0;
+}
+
+void uml_vduse_user_unmap_window(void *addr, size_t size)
+{
+	munmap(addr, size);
+}
+
+int uml_vduse_user_reg_umem(int fd, void *addr, uint64_t size)
+{
+	struct vduse_iova_umem umem;
+
+	memset(&umem, 0, sizeof(umem));
+	umem.uaddr = (unsigned long)addr;
+	umem.iova = 0;
+	umem.size = size;
+
+	if (ioctl(fd, VDUSE_IOTLB_REG_UMEM, &umem) < 0)
+		return -errno;
+	return 0;
+}
+
+int uml_vduse_user_dereg_umem(int fd, uint64_t size)
+{
+	struct vduse_iova_umem umem;
+
+	memset(&umem, 0, sizeof(umem));
+	umem.iova = 0;
+	umem.size = size;
+
+	if (ioctl(fd, VDUSE_IOTLB_DEREG_UMEM, &umem) < 0)
+		return -errno;
+	return 0;
+}

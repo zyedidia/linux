@@ -61,6 +61,14 @@ int uml_vduse_user_map(int fd, uint64_t iova,
 void uml_vduse_user_unmap(struct uml_vduse_user_region *region);
 
 int uml_vduse_user_node_id(int fd, uint64_t *dev, uint64_t *ino);
+int uml_vduse_user_bounce_size(int fd, uint64_t *size);
+void *uml_vduse_user_reserve_window(size_t size);
+int uml_vduse_user_map_window(void *addr, size_t size, int fd,
+			      unsigned long long offset);
+void uml_vduse_user_unmap_window(void *addr, size_t size);
+int uml_vduse_user_reg_umem(int fd, void *addr, uint64_t size);
+int uml_vduse_user_dereg_umem(int fd, uint64_t size);
+
 int uml_vduse_user_open_log(const char *path);
 int uml_vduse_user_map_log(int fd, size_t size, int resize, void **addr);
 void uml_vduse_user_unmap_log(void *addr, size_t size);

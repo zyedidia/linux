@@ -6,6 +6,7 @@
 #include <linux/interrupt.h>
 #include <linux/kstrtox.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/proc_fs.h>
@@ -19,6 +20,7 @@
 #include <uapi/linux/virtio_ring.h>
 #include <irq_kern.h>
 #include <init.h>
+#include <mem.h>
 #include <os.h>
 
 #include "vduse.h"
@@ -94,6 +96,7 @@ struct uml_vduse_dev_stats {
 	atomic64_t unmaps;
 	atomic64_t map_errors;
 	atomic64_t reconnects;
+	atomic64_t umem_regs;
 };
 
 struct uml_vduse_vq {
@@ -158,6 +161,24 @@ struct uml_vduse_dev {
 	/* Regions of the IOVA space mapped into UML, protected by map_lock. */
 	struct list_head regions;
 	struct mutex map_lock;
+
+	/*
+	 * Guest pages that back the bounce region, so that backends get guest
+	 * pages for the host's buffers. Chunks of contiguous pages lie side by
+	 * side in a host window, which is registered with VDUSE. Umem_lock
+	 * serializes the registration, and umem_wanted asks for one at the
+	 * next translation. Bounce_guest is set by bounce=guest, without which
+	 * the region stays in host memory.
+	 */
+	bool bounce_guest;
+	struct mutex umem_lock;
+	struct page **umem_chunks;
+	unsigned int umem_nr_chunks;
+	unsigned int umem_shift;
+	void *umem_window;
+	u64 umem_size;
+	bool umem_wanted;
+	bool umem_registered;
 
 	struct uml_vduse_dev_stats stats;
 	struct list_head list;
@@ -233,6 +254,114 @@ static void *uml_vduse_translate(struct uml_vduse_dev *dev, u64 iova,
 	return r->user.addr + (iova - r->user.start);
 }
 
+static void uml_vduse_free_umem(struct uml_vduse_dev *dev)
+{
+	unsigned int i, order = dev->umem_shift - PAGE_SHIFT;
+
+	if (dev->umem_window)
+		uml_vduse_user_unmap_window(dev->umem_window, dev->umem_size);
+	for (i = 0; i < dev->umem_nr_chunks; i++) {
+		if (dev->umem_chunks[i])
+			__free_pages(dev->umem_chunks[i], order);
+	}
+	kfree(dev->umem_chunks);
+	dev->umem_chunks = NULL;
+	dev->umem_nr_chunks = 0;
+	dev->umem_window = NULL;
+	dev->umem_size = 0;
+}
+
+/*
+ * Allocate guest pages for a bounce region of the given size, in chunks of
+ * the largest order the page allocator gives, and map them side by side in
+ * a host window. The chunks are compound pages, so that a reference taken on
+ * any of their pages is counted.
+ */
+static int uml_vduse_alloc_umem(struct uml_vduse_dev *dev, u64 size)
+{
+	unsigned int i, nr, order = min(get_order(size), MAX_PAGE_ORDER);
+	u64 chunk = PAGE_SIZE << order, off;
+	unsigned long long phys;
+	int fd, err;
+
+	if (!PAGE_ALIGNED(size))
+		return -EINVAL;
+
+	uml_vduse_free_umem(dev);
+	dev->umem_shift = PAGE_SHIFT + order;
+	nr = DIV_ROUND_UP(size, chunk);
+	dev->umem_chunks = kzalloc_objs(*dev->umem_chunks, nr);
+	if (!dev->umem_chunks)
+		goto nomem;
+	dev->umem_nr_chunks = nr;
+
+	dev->umem_window = uml_vduse_user_reserve_window(size);
+	if (!dev->umem_window)
+		goto nomem;
+	dev->umem_size = size;
+
+	for (i = 0, off = 0; i < dev->umem_nr_chunks; i++, off += chunk) {
+		dev->umem_chunks[i] = alloc_pages(GFP_KERNEL | __GFP_NOWARN |
+						  __GFP_COMP, order);
+		if (!dev->umem_chunks[i])
+			goto nomem;
+
+		fd = phys_mapping(page_to_phys(dev->umem_chunks[i]), &phys);
+		err = uml_vduse_user_map_window(dev->umem_window + off,
+						min(chunk, size - off), fd, phys);
+		if (err) {
+			uml_vduse_free_umem(dev);
+			return err;
+		}
+	}
+
+	return 0;
+
+nomem:
+	uml_vduse_free_umem(dev);
+	return -ENOMEM;
+}
+
+/*
+ * Back the bounce region with guest pages. VDUSE accepts this only after
+ * the host's first streaming map, so a start asks for it and every
+ * translation tries until VDUSE reports the region. The host makes its
+ * streaming maps before it publishes a chain that uses them, so the first
+ * translation of an address in the region always succeeds in registering.
+ * A registration may be left from an earlier start, or from a domain that
+ * the host has since replaced, so it is dropped first. Any other failure
+ * leaves the region in host memory, and the backends copy.
+ */
+static void uml_vduse_register_umem(struct uml_vduse_dev *dev)
+{
+	u64 size;
+	int err;
+
+	guard(mutex)(&dev->umem_lock);
+	if (!dev->umem_wanted)
+		return;
+
+	err = uml_vduse_user_bounce_size(dev->fd, &size);
+	if (err == -EINVAL)
+		return;
+
+	dev->umem_wanted = false;
+	if (!err && size != dev->umem_size)
+		err = uml_vduse_alloc_umem(dev, size);
+	if (!err) {
+		uml_vduse_user_dereg_umem(dev->fd, size);
+		err = uml_vduse_user_reg_umem(dev->fd, dev->umem_window, size);
+	}
+	if (err) {
+		pr_warn("%s: the bounce region stays in host memory, so requests are copied: %d\n",
+			dev->name, err);
+		return;
+	}
+
+	dev->umem_registered = true;
+	atomic64_inc(&dev->stats.umem_regs);
+}
+
 /*
  * Give vringh the region that holds a buffer or an indirect table. The host
  * maps the bounce region and coherent allocations for both reading and
@@ -242,9 +371,25 @@ static bool uml_vduse_getrange(struct vringh *vrh, u64 addr,
 			       struct vringh_range *range)
 {
 	struct uml_vduse_vq *vq = container_of(vrh, struct uml_vduse_vq, vrh);
+	struct uml_vduse_dev *dev = vq->dev;
 	struct uml_vduse_region *r;
 
-	r = uml_vduse_find_region(vq->dev, addr);
+	if (READ_ONCE(dev->umem_wanted))
+		uml_vduse_register_umem(dev);
+
+	/* With guest pages behind it, the bounce region is one range a chunk. */
+	if (dev->umem_registered && addr < dev->umem_size) {
+		u64 chunk = addr >> dev->umem_shift;
+
+		range->start = chunk << dev->umem_shift;
+		range->end_incl = min(range->start + BIT_ULL(dev->umem_shift),
+				      dev->umem_size) - 1;
+		range->offset = (unsigned long)
+			page_address(dev->umem_chunks[chunk]) - range->start;
+		return true;
+	}
+
+	r = uml_vduse_find_region(dev, addr);
 	if (!r)
 		return false;
 
@@ -586,6 +731,13 @@ static int uml_vduse_start(struct uml_vduse_dev *dev)
 		if (err)
 			return err;
 	}
+
+	/*
+	 * No request of this start has been translated yet, so none can point
+	 * into the host's bounce pages when guest pages replace them.
+	 */
+	dev->umem_registered = false;
+	WRITE_ONCE(dev->umem_wanted, dev->bounce_guest);
 
 	err = dev->ops->start(dev->priv);
 	if (err)
@@ -1115,6 +1267,10 @@ static int __init uml_vduse_parse_opts(struct uml_vduse_dev *dev, char *opts)
 			if (kstrtoint(opt + strlen("log_fd="), 10, &dev->log_fd) ||
 			    dev->log_fd < 0)
 				return -EINVAL;
+		} else if (!strcmp(opt, "bounce=guest")) {
+			dev->bounce_guest = true;
+		} else if (!strcmp(opt, "bounce=host")) {
+			dev->bounce_guest = false;
 		} else if (*opt) {
 			if (len)
 				dev->opts[len++] = ',';
@@ -1146,6 +1302,7 @@ static void __init uml_vduse_add(const char *arg)
 
 	INIT_LIST_HEAD(&dev->regions);
 	mutex_init(&dev->map_lock);
+	mutex_init(&dev->umem_lock);
 	INIT_WORK(&dev->msg_work, uml_vduse_msg_work);
 
 	dev->type = kstrdup(arg, GFP_KERNEL);
@@ -1220,7 +1377,13 @@ __uml_help(uml_vduse_cmdline_param_ops,
 "    given with log=<host path> or as the open descriptor log_fd=<n>. If\n"
 "    the device already exists and is still in use on the host, UML\n"
 "    reconnects to it and takes over the outstanding requests that the\n"
-"    earlier UML recorded in the log.\n\n"
+"    earlier UML recorded in the log.\n"
+"    With bounce=guest, guest pages back VDUSE's bounce region, through\n"
+"    which the host's buffers pass, so that backends need not copy them.\n"
+"    It uses as much guest memory as the region, 64 MB by default, and\n"
+"    pins that memory on the host, where it counts against\n"
+"    RLIMIT_MEMLOCK. The default, bounce=host, leaves the region in host\n"
+"    memory.\n\n"
 );
 
 static const char *const uml_vduse_msg_names[] = {
@@ -1247,6 +1410,8 @@ static void uml_vduse_show_device(struct seq_file *m,
 	seq_printf(m, "  %-18s %s\n", "type", dev->type);
 	seq_printf(m, "  %-18s %s\n", "state",
 		   READ_ONCE(dev->running) ? "running" : "stopped");
+	seq_printf(m, "  %-18s %s\n", "bounce_region",
+		   READ_ONCE(dev->umem_registered) ? "guest" : "host");
 	seq_printf(m, "  %-18s 0x%llx\n", "features", READ_ONCE(dev->features));
 
 	for (i = 0; i < ARRAY_SIZE(uml_vduse_msg_names); i++)
@@ -1258,6 +1423,7 @@ static void uml_vduse_show_device(struct seq_file *m,
 	uml_vduse_show_counter(m, 2, "iova_unmaps", &stats->unmaps);
 	uml_vduse_show_counter(m, 2, "iova_map_errors", &stats->map_errors);
 	uml_vduse_show_counter(m, 2, "reconnects", &stats->reconnects);
+	uml_vduse_show_counter(m, 2, "umem_regs", &stats->umem_regs);
 
 	for (i = 0; i < dev->num_queues; i++) {
 		struct uml_vduse_vq_stats *q = &dev->vqs[i].stats;
@@ -1308,6 +1474,8 @@ static void uml_vduse_release(struct uml_vduse_dev *dev)
 	uml_vduse_unmap_range(dev, 0, U64_MAX);
 	uml_vduse_close_vqs(dev, dev->num_queues);
 	os_close_file(dev->fd);
+	/* Closing the fd made VDUSE drop its pins on these pages. */
+	uml_vduse_free_umem(dev);
 
 	/* A device still on the bus keeps its log for the next guest. */
 	err = uml_vduse_user_destroy(uml_vduse_control, dev->name);
