@@ -43,6 +43,8 @@ void check_tmpexec(void);
 extern __thread int signals_enabled;
 int timer_alarm_pending(void);
 int sigio_pending(void);
+int ipi_pending(void);
+void handle_ipi_signal(int vector);
 
 /*
  * skas/process.c

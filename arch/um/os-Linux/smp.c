@@ -77,12 +77,6 @@ void os_start_secondary(void *arg, jmp_buf *switch_buf)
 {
 	struct cpu_thread_data *data = arg;
 
-	/*
-	 * SIGIO stays unblocked: it is directed at the CPU whose IRQ epoll set
-	 * holds the fd.
-	 */
-	sigaddset(&data->sigset, IPI_SIGNAL);
-
 	if (sigprocmask(SIG_SETMASK, &data->sigset, NULL) < 0)
 		panic("Failed to restore the signal mask, errno = %d", errno);
 
@@ -101,46 +95,11 @@ int os_send_ipi(int cpu, int vector)
 	return pthread_sigqueue(cpu_threads[cpu], IPI_SIGNAL, value);
 }
 
-static void __local_ipi_set(int enable)
-{
-	sigset_t sigset;
-
-	/*
-	 * IPIs only come from other CPUs, so with one CPU there is nothing to
-	 * mask, and the syscall would run on every change of the interrupt
-	 * state.
-	 */
-	if (uml_ncpus == 1)
-		return;
-
-	sigemptyset(&sigset);
-	sigaddset(&sigset, IPI_SIGNAL);
-
-	if (sigprocmask(enable ? SIG_UNBLOCK : SIG_BLOCK, &sigset, NULL) < 0)
-		panic("%s: sigprocmask failed, errno = %d", __func__, errno);
-}
-
-void os_local_ipi_enable(void)
-{
-	__local_ipi_set(1);
-}
-
-void os_local_ipi_disable(void)
-{
-	__local_ipi_set(0);
-}
-
 static void ipi_sig_handler(int sig, siginfo_t *si, void *uc)
 {
 	int save_errno = errno;
 
-	signals_enabled = 0;
-	um_trace_signals_off();
-
-	uml_ipi_handler(si->si_value.sival_int);
-
-	um_trace_signals_on();
-	signals_enabled = 1;
+	handle_ipi_signal(si->si_value.sival_int);
 
 	errno = save_errno;
 }

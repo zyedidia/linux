@@ -86,12 +86,24 @@ static void sig_handler_common(int sig, struct siginfo *si, mcontext_t *mc)
 #define SIGCHLD_BIT 2
 #define SIGCHLD_MASK (1 << SIGCHLD_BIT)
 
+#define IPI_BIT 3
+#define IPI_MASK (1 << IPI_BIT)
+
 __thread int signals_enabled;
 #if IS_ENABLED(CONFIG_UML_TIME_TRAVEL_SUPPORT)
 static int signals_blocked, signals_blocked_pending;
 #endif
 static __thread unsigned int signals_pending;
 static __thread unsigned int signals_active;
+
+/*
+ * The IPI signal can interrupt the other signal handlers, so each one marks
+ * its signal pending with a single atomic instruction.
+ */
+static void set_pending(unsigned int mask)
+{
+	__atomic_fetch_or(&signals_pending, mask, __ATOMIC_RELAXED);
+}
 
 static void sig_handler(int sig, struct siginfo *si, mcontext_t *mc)
 {
@@ -120,12 +132,12 @@ static void sig_handler(int sig, struct siginfo *si, mcontext_t *mc)
 		if (time_travel_mode == TT_MODE_EXTERNAL)
 			sigio_run_timetravel_handlers();
 		else
-			signals_pending |= SIGIO_MASK;
+			set_pending(SIGIO_MASK);
 		return;
 	}
 
 	if (!enabled && (sig == SIGCHLD)) {
-		signals_pending |= SIGCHLD_MASK;
+		set_pending(SIGCHLD_MASK);
 		return;
 	}
 
@@ -153,7 +165,7 @@ static void timer_alarm_handler(int sig, struct siginfo *unused_si, mcontext_t *
 
 	enabled = signals_enabled;
 	if (!signals_enabled) {
-		signals_pending |= SIGALRM_MASK;
+		set_pending(SIGALRM_MASK);
 		return;
 	}
 
@@ -186,6 +198,56 @@ int sigio_pending(void)
 {
 	return !!(signals_pending & SIGIO_MASK);
 }
+
+int ipi_pending(void)
+{
+	return !!(signals_pending & IPI_MASK);
+}
+
+#if IS_ENABLED(CONFIG_SMP)
+/* The vectors of the IPIs that arrived while signals were disabled. */
+static __thread unsigned int ipis_pending;
+
+/*
+ * Disabling signals does not block the IPI signal. An IPI that arrives while
+ * signals are disabled is recorded, and unblock_signals() runs it.
+ */
+void handle_ipi_signal(int vector)
+{
+	if (!signals_enabled) {
+		ipis_pending |= 1 << vector;
+		set_pending(IPI_MASK);
+		return;
+	}
+
+	signals_enabled = 0;
+	um_trace_signals_off();
+
+	uml_ipi_handler(vector);
+
+	um_trace_signals_on();
+	signals_enabled = 1;
+}
+
+static void run_pending_ipis(void)
+{
+	/*
+	 * A single atomic instruction, so that an IPI signal that arrives
+	 * meanwhile is either taken here or recorded for the next round.
+	 */
+	unsigned int pending = __atomic_exchange_n(&ipis_pending, 0,
+						   __ATOMIC_RELAXED);
+
+	while (pending) {
+		uml_ipi_handler(__builtin_ctz(pending));
+		pending &= pending - 1;
+	}
+}
+#else
+static void run_pending_ipis(void)
+{
+}
+#endif
 
 void set_sigstack(void *sig_stack, int size)
 {
@@ -300,7 +362,6 @@ static inline void __block_signals(void)
 	if (!signals_enabled)
 		return;
 
-	os_local_ipi_disable();
 	barrier();
 	signals_enabled = 0;
 }
@@ -312,7 +373,6 @@ static inline void __unblock_signals(void)
 
 	signals_enabled = 1;
 	barrier();
-	os_local_ipi_enable();
 }
 
 void block_signals(void)
@@ -383,6 +443,9 @@ void unblock_signals(void)
 		if (save_pending & SIGIO_MASK)
 			sig_handler_common(SIGIO, NULL, NULL);
 
+		if (save_pending & IPI_MASK)
+			run_pending_ipis();
+
 		if (save_pending & SIGCHLD_MASK) {
 			struct uml_pt_regs regs = {};
 
@@ -394,9 +457,12 @@ void unblock_signals(void)
 		if ((save_pending & SIGALRM_MASK) && (!(signals_active & SIGALRM_MASK)))
 			timer_real_alarm_handler(NULL);
 
-		/* Rerun the loop only if there is still pending SIGIO and not in TIMER handler */
-
-		if (!(signals_pending & SIGIO_MASK) && (signals_active & SIGALRM_MASK))
+		/*
+		 * Rerun the loop only if there is still pending SIGIO or an
+		 * IPI and not in TIMER handler.
+		 */
+		if (!(signals_pending & (SIGIO_MASK | IPI_MASK)) &&
+		    (signals_active & SIGALRM_MASK))
 			return;
 
 		/* Re-enable signals and trace that we're doing so. */
@@ -441,11 +507,7 @@ int um_set_signals_trace(int enable)
 
 void mark_sigio_pending(void)
 {
-	/*
-	 * A single atomic instruction, so that a signal handler that updates
-	 * signals_pending on this thread runs either before or after it.
-	 */
-	__atomic_fetch_or(&signals_pending, SIGIO_MASK, __ATOMIC_RELAXED);
+	set_pending(SIGIO_MASK);
 }
 
 #if IS_ENABLED(CONFIG_UML_TIME_TRAVEL_SUPPORT)

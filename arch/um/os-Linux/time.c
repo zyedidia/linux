@@ -122,10 +122,8 @@ void os_idle_prepare(void)
 	sigaddset(&set, IPI_SIGNAL);
 
 	/*
-	 * We need to use signalfd rather than sigsuspend in idle sleep
-	 * because the IPI signal is a real-time signal that carries data,
-	 * and unlike handling SIGALRM, we cannot simply flag it in
-	 * signals_pending.
+	 * The idle sleep keeps SIGALRM and the IPI signal blocked, and this
+	 * signalfd wakes it when one of them arrives.
 	 */
 	wake_signals = signalfd(-1, &set, SFD_CLOEXEC);
 	if (wake_signals < 0)
@@ -188,24 +186,26 @@ void os_idle_sleep(int wait_irqs)
 	sigset_t set, old, wait;
 
 	/*
-	 * Block SIGALRM and SIGIO while performing the need_resched check.
-	 * Note that, because IRQs are disabled, the IPI signal is
-	 * already blocked. The wait unblocks SIGIO again atomically, so a
-	 * SIGIO that arrives after the check still interrupts it. SIGALRM
-	 * stays blocked because the signalfd reports it.
+	 * Block SIGALRM, SIGIO and the IPI signal while performing the
+	 * need_resched check. The wait unblocks SIGIO again atomically, so a
+	 * SIGIO that arrives after the check still interrupts it. SIGALRM and
+	 * the IPI signal stay blocked because the signalfd reports them.
 	 */
 	sigemptyset(&set);
 	sigaddset(&set, SIGALRM);
 	sigaddset(&set, SIGIO);
+	sigaddset(&set, IPI_SIGNAL);
 	sigprocmask(SIG_BLOCK, &set, &old);
 	wait = old;
 	sigaddset(&wait, SIGALRM);
+	sigaddset(&wait, IPI_SIGNAL);
 
 	/*
-	 * Because disabling IRQs does not block SIGALRM or SIGIO, it is
-	 * also necessary to check for any pending timer alarms or SIGIO.
+	 * Because disabling IRQs does not block these signals, it is also
+	 * necessary to check for any that arrived and are pending.
 	 */
-	if (!uml_need_resched() && !timer_alarm_pending() && !sigio_pending()) {
+	if (!uml_need_resched() && !timer_alarm_pending() && !sigio_pending() &&
+	    !ipi_pending()) {
 		if (n == 2)
 			sigio_idle_enter();
 
