@@ -12,6 +12,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
 #include <linux/module.h>
+#include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -36,8 +37,12 @@ struct irq_reg {
 	int irq;
 	/* it's cheaper to store this than to query it */
 	int events;
-	bool active;
-	bool pending;
+	/*
+	 * The runs of the handler that were asked for and not yet made. The
+	 * CPU that raises it from zero runs the handler until it drops back to
+	 * zero, so the CPUs that ask while it runs only make it run again.
+	 */
+	atomic_t requests;
 	bool wakeup;
 #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
 	bool pending_event;
@@ -55,6 +60,12 @@ struct irq_entry {
 	struct irq_reg reg[NUM_IRQ_TYPES];
 	bool suspended;
 	bool sigio_workaround;
+	/*
+	 * The SIGIO handler of another CPU may still use an entry that was
+	 * removed, so entries are freed after an RCU grace period. The handler
+	 * runs with preemption disabled, which the grace period waits for.
+	 */
+	struct rcu_head rcu;
 };
 
 static DEFINE_RAW_SPINLOCK(irq_lock);
@@ -67,24 +78,16 @@ static bool irqs_pending;
 
 static void irq_io_loop(struct irq_reg *irq, struct uml_pt_regs *regs)
 {
-/*
- * irq->active guards against reentry
- * irq->pending accumulates pending requests
- * if pending is raised the irq_handler is re-run
- * until pending is cleared
- */
-	if (irq->active) {
-		irq->active = false;
+	int runs = 1;
 
-		do {
-			irq->pending = false;
-			do_IRQ(irq->irq, regs);
-		} while (irq->pending);
+	if (atomic_inc_return(&irq->requests) != 1)
+		return;
 
-		irq->active = true;
-	} else {
-		irq->pending = true;
-	}
+	/* One more run serves every request that arrived during a run. */
+	do {
+		do_IRQ(irq->irq, regs);
+		runs = atomic_sub_return(runs, &irq->requests);
+	} while (runs);
 }
 
 #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
@@ -349,7 +352,6 @@ already:
 
 	irq_entry->reg[type].id = dev_id;
 	irq_entry->reg[type].irq = irq;
-	irq_entry->reg[type].active = true;
 	irq_entry->reg[type].events = events;
 
 #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
@@ -382,7 +384,7 @@ void free_irq_by_fd(int fd)
 	to_free = get_irq_entry_by_fd(fd);
 	remove_irq_entry(to_free, true);
 	raw_spin_unlock_irqrestore(&irq_lock, flags);
-	kfree(to_free);
+	kfree_rcu(to_free, rcu);
 }
 EXPORT_SYMBOL(free_irq_by_fd);
 
@@ -413,7 +415,7 @@ static void free_irq_by_irq_and_dev(unsigned int irq, void *dev)
 	}
 out:
 	raw_spin_unlock_irqrestore(&irq_lock, flags);
-	kfree(to_free);
+	kfree_rcu(to_free, rcu);
 }
 
 void deactivate_fd(int fd, int irqnum)
@@ -439,7 +441,7 @@ void deactivate_fd(int fd, int irqnum)
 	entry = update_or_remove_irq_entry(entry);
 out:
 	raw_spin_unlock_irqrestore(&irq_lock, flags);
-	kfree(entry);
+	kfree_rcu(entry, rcu);
 
 	ignore_sigio_fd(fd);
 }
@@ -491,6 +493,44 @@ bool um_idle_waits_for_irqs(void)
 {
 	return !irqs_suspended;
 }
+
+/*
+ * Move the fds of an IRQ to the IRQ epoll set of another CPU, and direct
+ * their SIGIO at that CPU. An fd that serves several IRQs moves with each of
+ * them. Epoll reports an fd that is already ready when it is added, and the
+ * CPU is signalled after the move, so an event that arrives during the move
+ * is not lost. If the old CPU is still handling one, the new CPU's request
+ * makes it run the handler again.
+ */
+void um_irq_set_cpu(int irq, unsigned int cpu)
+{
+	struct irq_entry *entry;
+	unsigned long flags;
+	bool moved = false;
+
+	raw_spin_lock_irqsave(&irq_lock, flags);
+	list_for_each_entry(entry, &active_fds, list) {
+		enum um_irq_type t;
+
+		for (t = 0; t < NUM_IRQ_TYPES; t++) {
+			if (entry->reg[t].events && entry->reg[t].irq == irq)
+				break;
+		}
+		if (t == NUM_IRQ_TYPES || entry->cpu == cpu)
+			continue;
+
+		os_del_epoll_fd(entry->cpu, entry->fd);
+		entry->cpu = cpu;
+		os_set_fd_owner(entry->fd, cpu);
+		update_irq_entry(entry);
+		moved = true;
+	}
+	raw_spin_unlock_irqrestore(&irq_lock, flags);
+
+	if (moved)
+		os_send_sigio(cpu);
+}
+EXPORT_SYMBOL(um_irq_set_cpu);
 
 void um_free_irq(int irq, void *dev)
 {
@@ -677,6 +717,24 @@ static void dummy(struct irq_data *d)
 {
 }
 
+#ifdef CONFIG_SMP
+/* Handle the IRQ on the first online CPU of the mask. */
+static int normal_irq_set_affinity(struct irq_data *d,
+				   const struct cpumask *dest, bool force)
+{
+	unsigned int cpu = cpumask_first_and(dest, cpu_online_mask);
+
+	if (cpu >= nr_cpu_ids)
+		return -EINVAL;
+
+	um_irq_set_cpu(d->irq, cpu);
+	irq_data_update_effective_affinity(d, cpumask_of(cpu));
+	return IRQ_SET_MASK_OK;
+}
+#else
+#define normal_irq_set_affinity NULL
+#endif
+
 /* This is used for everything other than the timer. */
 static struct irq_chip normal_irq_type = {
 	.name = "SIGIO",
@@ -686,6 +744,7 @@ static struct irq_chip normal_irq_type = {
 	.irq_mask = dummy,
 	.irq_unmask = dummy,
 	.irq_set_wake = normal_irq_set_wake,
+	.irq_set_affinity = normal_irq_set_affinity,
 };
 
 static struct irq_chip alarm_irq_type = {
