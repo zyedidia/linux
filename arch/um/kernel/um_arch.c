@@ -289,12 +289,20 @@ static void __init parse_cache_line(char *line)
 	}
 }
 
-static unsigned long __init get_top_address(char **envp)
+static unsigned long __init get_top_address(char **argv, char **envp)
 {
 	unsigned long top_addr = (unsigned long) &top_addr;
 	int i;
 
-	/* The earliest variable should be after the program name in ELF */
+	/*
+	 * The argument and environment strings are at the top of the stack,
+	 * before the program name in ELF. The arguments count too, since the
+	 * environment can be empty.
+	 */
+	for (i = 0; argv[i]; i++) {
+		if ((unsigned long) argv[i] > top_addr)
+			top_addr = (unsigned long) argv[i];
+	}
 	for (i = 0; envp[i]; i++) {
 		if ((unsigned long) envp[i] > top_addr)
 			top_addr = (unsigned long) envp[i];
@@ -326,7 +334,7 @@ int __init linux_main(int argc, char **argv, char **envp)
 	if (have_console == 0)
 		add_arg(DEFAULT_COMMAND_LINE_CONSOLE);
 
-	host_task_size = get_top_address(envp);
+	host_task_size = get_top_address(argv, envp);
 	/* reserve a few pages for the stubs */
 	stub_start = host_task_size - STUB_SIZE;
 	host_task_size = stub_start;
