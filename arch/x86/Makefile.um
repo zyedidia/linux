@@ -14,6 +14,9 @@ endif
 
 KBUILD_RUSTFLAGS += --target=$(objtree)/scripts/target.json
 
+# CFLAGS for compiling floating point code inside the kernel.
+CC_FLAGS_FPU := -msse -msse2
+
 # The target.json file is not available when invoking rustc-option, so use the
 # built-in target when checking whether flags are supported instead.
 ifeq ($(CONFIG_X86_32),y)
