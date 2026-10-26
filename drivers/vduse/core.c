@@ -89,6 +89,7 @@ struct vduse_guest_vq_stats {
 struct vduse_guest_dev_stats {
 	atomic64_t msgs[VDUSE_GUEST_MSG_UNKNOWN + 1];
 	atomic64_t starts;
+	atomic64_t start_errors;
 	atomic64_t resets;
 	atomic64_t maps;
 	atomic64_t unmaps;
@@ -835,18 +836,27 @@ static void vduse_guest_stop(struct vduse_guest_dev *dev)
 /*
  * The host frees and reallocates the rings and the bounce region without a
  * message, so a reset drops every mapping.
+ *
+ * A failed start is answered as a success. VDUSE records DRIVER_OK only when
+ * the device accepts it, and injects no interrupt without it, while the
+ * host's driver submits requests either way. Those requests would then never
+ * complete, and the host's driver would hang. Accepted, they stay outstanding
+ * until a guest that takes over the device, or scripts/vduse-blk-drain.py,
+ * completes them.
  */
-static int vduse_guest_set_status(struct vduse_guest_dev *dev, u8 status)
+static void vduse_guest_set_status(struct vduse_guest_dev *dev, u8 status)
 {
-	int err = 0;
+	int err;
 
 	if ((status & VIRTIO_CONFIG_S_DRIVER_OK) && !dev->running) {
 		err = vduse_guest_start(dev);
-		if (err)
-			pr_err("%s: cannot start the device: %d\n", dev->name,
-			       err);
-		else
+		if (err) {
+			pr_err("%s: cannot start the device, so its requests wait for another guest: %d\n",
+			       dev->name, err);
+			atomic64_inc(&dev->stats.start_errors);
+		} else {
 			atomic64_inc(&dev->stats.starts);
+		}
 	} else if (!(status & VIRTIO_CONFIG_S_DRIVER_OK) && dev->running) {
 		vduse_guest_stop(dev);
 	}
@@ -857,8 +867,6 @@ static int vduse_guest_set_status(struct vduse_guest_dev *dev, u8 status)
 		dev->reconnect = false;
 		atomic64_inc(&dev->stats.resets);
 	}
-
-	return err;
 }
 
 /*
@@ -889,10 +897,12 @@ static void vduse_guest_resume(struct vduse_guest_dev *dev)
 	}
 
 	err = vduse_guest_start(dev);
-	if (err)
+	if (err) {
 		pr_err("%s: cannot resume the device: %d\n", dev->name, err);
-	else
+		atomic64_inc(&dev->stats.start_errors);
+	} else {
 		atomic64_inc(&dev->stats.starts);
+	}
 }
 
 static void vduse_guest_msg_work(struct work_struct *work)
@@ -924,7 +934,7 @@ static void vduse_guest_msg_work(struct work_struct *work)
 				ok = false;
 			break;
 		case VDUSE_GUEST_MSG_SET_STATUS:
-			ok = !vduse_guest_set_status(dev, msg.status);
+			vduse_guest_set_status(dev, msg.status);
 			break;
 		case VDUSE_GUEST_MSG_UPDATE_IOTLB:
 			/* The rings stay mapped while the device runs. */
@@ -1409,6 +1419,7 @@ static void vduse_guest_show_device(struct seq_file *m,
 		vduse_guest_show_counter(m, 2, vduse_guest_msg_names[i],
 					 &stats->msgs[i]);
 	vduse_guest_show_counter(m, 2, "starts", &stats->starts);
+	vduse_guest_show_counter(m, 2, "start_errors", &stats->start_errors);
 	vduse_guest_show_counter(m, 2, "resets", &stats->resets);
 	vduse_guest_show_counter(m, 2, "iova_maps", &stats->maps);
 	vduse_guest_show_counter(m, 2, "iova_unmaps", &stats->unmaps);
