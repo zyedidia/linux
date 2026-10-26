@@ -15,3 +15,12 @@ config VDUSE_GUEST_BLK
 	help
 	  Export a block device of the guest to the host as a virtio-blk
 	  device.
+
+config VDUSE_GUEST_PCI
+	bool "VDUSE devices through a VMM's VDUSE proxy"
+	depends on PCI_MSI && 64BIT && !UML
+	select VDUSE_GUEST
+	help
+	  Serve a VDUSE device on the host from a VM, through the VDUSE
+	  proxy PCI device of InvirtIO's fork of Cloud Hypervisor. Devices
+	  are given with vduse_guest.device=.
