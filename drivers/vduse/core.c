@@ -1321,7 +1321,7 @@ static void __init vduse_guest_add(const char *arg)
 	}
 	dev->hops = host->ops;
 
-	err = dev->hops->alloc(dev);
+	err = dev->hops->alloc(dev, host);
 	if (err) {
 		pr_err("%s: cannot create the %s device: %d\n", dev->name,
 		       dev->type, err);

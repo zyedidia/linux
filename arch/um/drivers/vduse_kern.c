@@ -45,7 +45,8 @@ static struct uml_vduse *uml_vduse_of(struct vduse_guest_dev *dev)
 	return vduse_guest_host_data(dev);
 }
 
-static int uml_vduse_alloc(struct vduse_guest_dev *dev)
+static int uml_vduse_alloc(struct vduse_guest_dev *dev,
+			   struct vduse_guest_host *host)
 {
 	struct uml_vduse *u;
 

@@ -8,6 +8,7 @@
 
 struct page;
 struct vduse_guest_dev;
+struct vduse_guest_host;
 
 /* The device that a backend describes at setup. */
 struct vduse_guest_config {
@@ -91,10 +92,11 @@ struct vduse_guest_region {
  * The calls that a host provides to reach VDUSE. Each returns 0 or a
  * negative error unless it says otherwise.
  *
- * Alloc runs before the device's options are parsed and keeps the host's
- * data for the device, and free releases it when the device cannot be
- * created. Parse_opt returns 1 for an option of the host's own and 0 for
- * any other, and check_opts runs once every option has been parsed.
+ * Alloc runs before the device's options are parsed, with the host that
+ * serves the device, and keeps the host's data for the device. Free releases
+ * it when the device cannot be created. Parse_opt returns 1 for an option of
+ * the host's own and 0 for any other, and check_opts runs once every option
+ * has been parsed.
  *
  * Create makes the device on the host, and fails with -EEXIST if one with
  * the same name exists. Destroy fails with -EBUSY while the device is in
@@ -123,7 +125,7 @@ struct vduse_guest_region {
  * is destroyed.
  */
 struct vduse_guest_host_ops {
-	int (*alloc)(struct vduse_guest_dev *dev);
+	int (*alloc)(struct vduse_guest_dev *dev, struct vduse_guest_host *host);
 	void (*free)(struct vduse_guest_dev *dev);
 	int (*parse_opt)(struct vduse_guest_dev *dev, char *opt);
 	int (*check_opts)(struct vduse_guest_dev *dev);
