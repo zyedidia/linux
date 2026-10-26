@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#define pr_fmt(fmt) "vduse-uml-blk: " fmt
+#define pr_fmt(fmt) "vduse-guest-blk: " fmt
 
 #include <linux/bio.h>
 #include <linux/blkdev.h>
@@ -12,43 +12,42 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uio.h>
+#include <linux/vduse_guest.h>
 #include <linux/virtio_byteorder.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <uapi/linux/virtio_blk.h>
 #include <uapi/linux/virtio_ids.h>
 
-#include "vduse.h"
+#define VDUSE_GUEST_BLK_QUEUE_SIZE 256
+#define VDUSE_GUEST_BLK_INLINE_IOVS 4
+#define VDUSE_GUEST_BLK_RETRY_DELAY msecs_to_jiffies(10)
+#define VDUSE_GUEST_BLK_MAX_QUEUES 64
 
-#define UML_VDUSE_BLK_QUEUE_SIZE 256
-#define UML_VDUSE_BLK_INLINE_IOVS 4
-#define UML_VDUSE_BLK_RETRY_DELAY msecs_to_jiffies(10)
-#define UML_VDUSE_BLK_MAX_QUEUES 64
-
-struct uml_vduse_blk;
+struct vduse_guest_blk;
 
 /* A queue's processing runs on the CPU that handles the queue's kicks. */
-struct uml_vduse_blk_queue {
-	struct uml_vduse_blk *blk;
+struct vduse_guest_blk_queue {
+	struct vduse_guest_blk *blk;
 	unsigned int index;
 	struct delayed_work work;
 };
 
-struct uml_vduse_blk {
-	struct uml_vduse_dev *dev;
+struct vduse_guest_blk {
+	struct vduse_guest_dev *dev;
 	struct file *bdev_file;
 	struct block_device *bdev;
 	struct virtio_blk_config config;
 	char id[VIRTIO_BLK_ID_BYTES];
 
 	unsigned int nr_queues;
-	struct uml_vduse_blk_queue *queues;
+	struct vduse_guest_blk_queue *queues;
 	atomic_t inflight;
 	wait_queue_head_t idle;
 };
 
-struct uml_vduse_blk_req {
-	struct uml_vduse_blk *blk;
+struct vduse_guest_blk_req {
+	struct vduse_guest_blk *blk;
 	unsigned int queue;
 	u16 head;
 	u32 type;
@@ -56,8 +55,8 @@ struct uml_vduse_blk_req {
 
 	struct vringh_kiov riov;
 	struct vringh_kiov wiov;
-	struct kvec rkvec[UML_VDUSE_BLK_INLINE_IOVS];
-	struct kvec wkvec[UML_VDUSE_BLK_INLINE_IOVS];
+	struct kvec rkvec[VDUSE_GUEST_BLK_INLINE_IOVS];
+	struct kvec wkvec[VDUSE_GUEST_BLK_INLINE_IOVS];
 	/* The data buffers, without the header and the status byte. */
 	struct iov_iter data;
 
@@ -65,10 +64,10 @@ struct uml_vduse_blk_req {
 	unsigned int nr_pages;
 };
 
-static struct uml_vduse_blk_req *uml_vduse_blk_alloc(struct uml_vduse_blk *blk,
-						    unsigned int queue)
+static struct vduse_guest_blk_req *
+vduse_guest_blk_alloc(struct vduse_guest_blk *blk, unsigned int queue)
 {
-	struct uml_vduse_blk_req *req;
+	struct vduse_guest_blk_req *req;
 
 	req = kzalloc_obj(*req);
 	if (!req)
@@ -81,7 +80,7 @@ static struct uml_vduse_blk_req *uml_vduse_blk_alloc(struct uml_vduse_blk *blk,
 	return req;
 }
 
-static void uml_vduse_blk_free(struct uml_vduse_blk_req *req)
+static void vduse_guest_blk_free(struct vduse_guest_blk_req *req)
 {
 	unsigned int i;
 
@@ -95,22 +94,22 @@ static void uml_vduse_blk_free(struct uml_vduse_blk_req *req)
 	kfree(req);
 }
 
-static void uml_vduse_blk_finish(struct uml_vduse_blk_req *req, u8 status,
-				 u32 len)
+static void vduse_guest_blk_finish(struct vduse_guest_blk_req *req, u8 status,
+				   u32 len)
 {
-	struct uml_vduse_blk *blk = req->blk;
+	struct vduse_guest_blk *blk = req->blk;
 
 	if (req->status)
 		*req->status = status;
-	uml_vduse_complete(blk->dev, req->queue, req->head, len);
-	uml_vduse_blk_free(req);
+	vduse_guest_complete(blk->dev, req->queue, req->head, len);
+	vduse_guest_blk_free(req);
 
 	if (atomic_dec_and_test(&blk->inflight))
 		wake_up(&blk->idle);
 }
 
 /* Copy between the request's data buffers and its pages. */
-static bool uml_vduse_blk_copy(struct uml_vduse_blk_req *req, bool to_pages)
+static bool vduse_guest_blk_copy(struct vduse_guest_blk_req *req, bool to_pages)
 {
 	size_t left = iov_iter_count(&req->data);
 	unsigned int i;
@@ -128,9 +127,9 @@ static bool uml_vduse_blk_copy(struct uml_vduse_blk_req *req, bool to_pages)
 	return true;
 }
 
-static void uml_vduse_blk_end_io(struct bio *bio)
+static void vduse_guest_blk_end_io(struct bio *bio)
 {
-	struct uml_vduse_blk_req *req = bio->bi_private;
+	struct vduse_guest_blk_req *req = bio->bi_private;
 	u8 status = VIRTIO_BLK_S_OK;
 	u32 len = 1;
 
@@ -138,15 +137,15 @@ static void uml_vduse_blk_end_io(struct bio *bio)
 		status = VIRTIO_BLK_S_IOERR;
 	} else if (req->type == VIRTIO_BLK_T_IN) {
 		len += iov_iter_count(&req->data);
-		if (!uml_vduse_blk_copy(req, false))
+		if (!vduse_guest_blk_copy(req, false))
 			status = VIRTIO_BLK_S_IOERR;
 	}
 
 	bio_put(bio);
-	uml_vduse_blk_finish(req, status, len);
+	vduse_guest_blk_finish(req, status, len);
 }
 
-static int uml_vduse_blk_alloc_pages(struct uml_vduse_blk_req *req)
+static int vduse_guest_blk_alloc_pages(struct vduse_guest_blk_req *req)
 {
 	size_t len = iov_iter_count(&req->data);
 	unsigned int i;
@@ -172,7 +171,7 @@ static int uml_vduse_blk_alloc_pages(struct uml_vduse_blk_req *req)
  * transport gives when guest pages back the bounce region, and is aligned to
  * the disk's logical block size.
  */
-static bool uml_vduse_blk_in_pages(struct uml_vduse_blk_req *req)
+static bool vduse_guest_blk_in_pages(struct vduse_guest_blk_req *req)
 {
 	unsigned int lbs = bdev_logical_block_size(req->blk->bdev);
 	const struct iov_iter *it = &req->data;
@@ -194,8 +193,8 @@ static bool uml_vduse_blk_in_pages(struct uml_vduse_blk_req *req)
 }
 
 /* Submit a request whose data buffers lie in guest pages, without a copy. */
-static void uml_vduse_blk_rw_pages(struct uml_vduse_blk_req *req, u64 sector,
-				   blk_opf_t opf)
+static void vduse_guest_blk_rw_pages(struct vduse_guest_blk_req *req,
+				     u64 sector, blk_opf_t opf)
 {
 	struct block_device *bdev = req->blk->bdev;
 	const struct iov_iter *it = &req->data;
@@ -233,14 +232,14 @@ static void uml_vduse_blk_rw_pages(struct uml_vduse_blk_req *req, u64 sector,
 	}
 
 	bio->bi_private = req;
-	bio->bi_end_io = uml_vduse_blk_end_io;
+	bio->bi_end_io = vduse_guest_blk_end_io;
 	submit_bio(bio);
 }
 
-static int uml_vduse_blk_rw(struct uml_vduse_blk_req *req, u64 sector,
-			    blk_opf_t opf)
+static int vduse_guest_blk_rw(struct vduse_guest_blk_req *req, u64 sector,
+			      blk_opf_t opf)
 {
-	struct uml_vduse_blk *blk = req->blk;
+	struct vduse_guest_blk *blk = req->blk;
 	struct block_device *bdev = blk->bdev;
 	size_t left = iov_iter_count(&req->data);
 	u64 capacity = bdev_nr_sectors(bdev);
@@ -254,20 +253,20 @@ static int uml_vduse_blk_rw(struct uml_vduse_blk_req *req, u64 sector,
 		return -EINVAL;
 
 	if (!left) {
-		uml_vduse_blk_finish(req, VIRTIO_BLK_S_OK, 1);
+		vduse_guest_blk_finish(req, VIRTIO_BLK_S_OK, 1);
 		return 0;
 	}
 
-	if (uml_vduse_blk_in_pages(req)) {
-		uml_vduse_blk_rw_pages(req, sector, opf);
+	if (vduse_guest_blk_in_pages(req)) {
+		vduse_guest_blk_rw_pages(req, sector, opf);
 		return 0;
 	}
 
-	err = uml_vduse_blk_alloc_pages(req);
+	err = vduse_guest_blk_alloc_pages(req);
 	if (err)
 		return err;
 
-	if (op_is_write(opf) && !uml_vduse_blk_copy(req, true))
+	if (op_is_write(opf) && !vduse_guest_blk_copy(req, true))
 		return -EFAULT;
 
 	nr_vecs = min_t(unsigned int, req->nr_pages, BIO_MAX_VECS);
@@ -289,24 +288,24 @@ static int uml_vduse_blk_rw(struct uml_vduse_blk_req *req, u64 sector,
 	}
 
 	bio->bi_private = req;
-	bio->bi_end_io = uml_vduse_blk_end_io;
+	bio->bi_end_io = vduse_guest_blk_end_io;
 	submit_bio(bio);
 	return 0;
 }
 
-static void uml_vduse_blk_flush(struct uml_vduse_blk_req *req)
+static void vduse_guest_blk_flush(struct vduse_guest_blk_req *req)
 {
 	struct bio *bio;
 
 	bio = bio_alloc(req->blk->bdev, 0, REQ_OP_WRITE | REQ_PREFLUSH,
 			GFP_KERNEL);
 	bio->bi_private = req;
-	bio->bi_end_io = uml_vduse_blk_end_io;
+	bio->bi_end_io = vduse_guest_blk_end_io;
 	submit_bio(bio);
 }
 
 /* Return a pointer to the last writable byte, which holds the status. */
-static u8 *uml_vduse_blk_status(struct vringh_kiov *wiov, size_t *len)
+static u8 *vduse_guest_blk_status(struct vringh_kiov *wiov, size_t *len)
 {
 	u8 *status = NULL;
 	size_t total = 0;
@@ -323,25 +322,25 @@ static u8 *uml_vduse_blk_status(struct vringh_kiov *wiov, size_t *len)
 	return status;
 }
 
-static void uml_vduse_blk_handle(struct uml_vduse_blk_req *req)
+static void vduse_guest_blk_handle(struct vduse_guest_blk_req *req)
 {
-	struct uml_vduse_blk *blk = req->blk;
+	struct vduse_guest_blk *blk = req->blk;
 	struct virtio_blk_outhdr hdr;
 	struct iov_iter riter;
 	size_t wlen, n;
 	u64 sector;
 	int err;
 
-	req->status = uml_vduse_blk_status(&req->wiov, &wlen);
+	req->status = vduse_guest_blk_status(&req->wiov, &wlen);
 	if (!req->status) {
-		uml_vduse_blk_finish(req, 0, 0);
+		vduse_guest_blk_finish(req, 0, 0);
 		return;
 	}
 
 	iov_iter_kvec(&riter, ITER_SOURCE, req->riov.iov, req->riov.used,
 		      vringh_kiov_length(&req->riov));
 	if (copy_from_iter(&hdr, sizeof(hdr), &riter) != sizeof(hdr)) {
-		uml_vduse_blk_finish(req, VIRTIO_BLK_S_IOERR, 1);
+		vduse_guest_blk_finish(req, VIRTIO_BLK_S_IOERR, 1);
 		return;
 	}
 
@@ -352,87 +351,87 @@ static void uml_vduse_blk_handle(struct uml_vduse_blk_req *req)
 	case VIRTIO_BLK_T_IN:
 		iov_iter_kvec(&req->data, ITER_DEST, req->wiov.iov,
 			      req->wiov.used, wlen);
-		err = uml_vduse_blk_rw(req, sector, REQ_OP_READ);
+		err = vduse_guest_blk_rw(req, sector, REQ_OP_READ);
 		break;
 	case VIRTIO_BLK_T_OUT:
 		req->data = riter;
-		err = uml_vduse_blk_rw(req, sector, REQ_OP_WRITE);
+		err = vduse_guest_blk_rw(req, sector, REQ_OP_WRITE);
 		break;
 	case VIRTIO_BLK_T_FLUSH:
-		uml_vduse_blk_flush(req);
+		vduse_guest_blk_flush(req);
 		return;
 	case VIRTIO_BLK_T_GET_ID:
 		iov_iter_kvec(&req->data, ITER_DEST, req->wiov.iov,
 			      req->wiov.used, wlen);
 		n = copy_to_iter(blk->id, min(wlen, sizeof(blk->id)),
 				 &req->data);
-		uml_vduse_blk_finish(req, VIRTIO_BLK_S_OK, n + 1);
+		vduse_guest_blk_finish(req, VIRTIO_BLK_S_OK, n + 1);
 		return;
 	default:
-		uml_vduse_blk_finish(req, VIRTIO_BLK_S_UNSUPP, 1);
+		vduse_guest_blk_finish(req, VIRTIO_BLK_S_UNSUPP, 1);
 		return;
 	}
 
 	if (err)
-		uml_vduse_blk_finish(req, VIRTIO_BLK_S_IOERR, 1);
+		vduse_guest_blk_finish(req, VIRTIO_BLK_S_IOERR, 1);
 }
 
-static void uml_vduse_blk_work(struct work_struct *work)
+static void vduse_guest_blk_work(struct work_struct *work)
 {
-	struct uml_vduse_blk_queue *q = container_of(to_delayed_work(work),
-						     struct uml_vduse_blk_queue,
-						     work);
-	struct uml_vduse_blk *blk = q->blk;
-	struct uml_vduse_blk_req *req;
+	struct vduse_guest_blk_queue *q =
+		container_of(to_delayed_work(work),
+			     struct vduse_guest_blk_queue, work);
+	struct vduse_guest_blk *blk = q->blk;
+	struct vduse_guest_blk_req *req;
 	int r;
 
 	do {
-		uml_vduse_notify_disable(blk->dev, q->index);
+		vduse_guest_notify_disable(blk->dev, q->index);
 		for (;;) {
 			/*
 			 * Notifications stay disabled until the retry, which
 			 * finds the requests that are still available.
 			 */
-			req = uml_vduse_blk_alloc(blk, q->index);
+			req = vduse_guest_blk_alloc(blk, q->index);
 			if (!req) {
 				schedule_delayed_work(&q->work,
-						      UML_VDUSE_BLK_RETRY_DELAY);
+						VDUSE_GUEST_BLK_RETRY_DELAY);
 				return;
 			}
 
-			r = uml_vduse_getdesc(blk->dev, q->index, &req->riov,
-					      &req->wiov, &req->head);
+			r = vduse_guest_getdesc(blk->dev, q->index, &req->riov,
+						&req->wiov, &req->head);
 			if (r <= 0) {
-				uml_vduse_blk_free(req);
+				vduse_guest_blk_free(req);
 				if (r < 0)
 					return;
-				if (uml_vduse_poll(blk->dev, q->index))
+				if (vduse_guest_poll(blk->dev, q->index))
 					continue;
 				break;
 			}
 
 			atomic_inc(&blk->inflight);
-			uml_vduse_blk_handle(req);
+			vduse_guest_blk_handle(req);
 		}
-	} while (!uml_vduse_notify_enable(blk->dev, q->index));
+	} while (!vduse_guest_notify_enable(blk->dev, q->index));
 }
 
 /* The kick handler runs on the queue's CPU, and so does the work it queues. */
-static void uml_vduse_blk_kick(void *priv, unsigned int index)
+static void vduse_guest_blk_kick(void *priv, unsigned int index)
 {
-	struct uml_vduse_blk *blk = priv;
+	struct vduse_guest_blk *blk = priv;
 
 	mod_delayed_work(system_percpu_wq, &blk->queues[index].work, 0);
 }
 
-static int uml_vduse_blk_start(void *priv)
+static int vduse_guest_blk_start(void *priv)
 {
 	return 0;
 }
 
-static void uml_vduse_blk_stop(void *priv)
+static void vduse_guest_blk_stop(void *priv)
 {
-	struct uml_vduse_blk *blk = priv;
+	struct vduse_guest_blk *blk = priv;
 	unsigned int i;
 
 	for (i = 0; i < blk->nr_queues; i++)
@@ -440,12 +439,13 @@ static void uml_vduse_blk_stop(void *priv)
 	wait_event(blk->idle, !atomic_read(&blk->inflight));
 }
 
-static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
-					struct uml_vduse_config *cfg)
+static void *__init vduse_guest_blk_setup(struct vduse_guest_dev *dev,
+					  char *opts,
+					  struct vduse_guest_config *cfg)
 {
-	const char *name = uml_vduse_name(dev);
+	const char *name = vduse_guest_name(dev);
 	unsigned int i, nr_queues = num_online_cpus();
-	struct uml_vduse_blk *blk;
+	struct vduse_guest_blk *blk;
 	char *disk = NULL, *opt;
 	dev_t devt;
 	int err;
@@ -460,7 +460,7 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 			return ERR_PTR(-EINVAL);
 		}
 	}
-	if (!disk || !nr_queues || nr_queues > UML_VDUSE_BLK_MAX_QUEUES)
+	if (!disk || !nr_queues || nr_queues > VDUSE_GUEST_BLK_MAX_QUEUES)
 		return ERR_PTR(-EINVAL);
 
 	err = early_lookup_bdev(disk, &devt);
@@ -493,7 +493,7 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 	for (i = 0; i < nr_queues; i++) {
 		blk->queues[i].blk = blk;
 		blk->queues[i].index = i;
-		INIT_DELAYED_WORK(&blk->queues[i].work, uml_vduse_blk_work);
+		INIT_DELAYED_WORK(&blk->queues[i].work, vduse_guest_blk_work);
 	}
 
 	blk->dev = dev;
@@ -507,7 +507,7 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 	blk->config.capacity = __cpu_to_virtio64(true,
 						 bdev_nr_sectors(blk->bdev));
 	blk->config.seg_max = __cpu_to_virtio32(true,
-						UML_VDUSE_BLK_QUEUE_SIZE - 2);
+						VDUSE_GUEST_BLK_QUEUE_SIZE - 2);
 	blk->config.blk_size =
 		__cpu_to_virtio32(true, bdev_logical_block_size(blk->bdev));
 	blk->config.num_queues = __cpu_to_virtio16(true, nr_queues);
@@ -518,7 +518,7 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 			BIT_ULL(VIRTIO_BLK_F_FLUSH) |
 			BIT_ULL(VIRTIO_BLK_F_MQ);
 	cfg->num_queues = nr_queues;
-	cfg->queue_size = UML_VDUSE_BLK_QUEUE_SIZE;
+	cfg->queue_size = VDUSE_GUEST_BLK_QUEUE_SIZE;
 	cfg->config = &blk->config;
 	cfg->config_size = sizeof(blk->config);
 
@@ -528,20 +528,20 @@ static void *__init uml_vduse_blk_setup(struct uml_vduse_dev *dev, char *opts,
 	return blk;
 }
 
-static void uml_vduse_blk_release(void *priv)
+static void vduse_guest_blk_release(void *priv)
 {
-	struct uml_vduse_blk *blk = priv;
+	struct vduse_guest_blk *blk = priv;
 
 	fput(blk->bdev_file);
 	kfree(blk->queues);
 	kfree(blk);
 }
 
-const struct uml_vduse_backend_ops uml_vduse_blk_ops = {
+const struct vduse_guest_backend_ops vduse_guest_blk_ops = {
 	.type = "blk",
-	.setup = uml_vduse_blk_setup,
-	.release = uml_vduse_blk_release,
-	.start = uml_vduse_blk_start,
-	.stop = uml_vduse_blk_stop,
-	.kick = uml_vduse_blk_kick,
+	.setup = vduse_guest_blk_setup,
+	.release = vduse_guest_blk_release,
+	.start = vduse_guest_blk_start,
+	.stop = vduse_guest_blk_stop,
+	.kick = vduse_guest_blk_kick,
 };

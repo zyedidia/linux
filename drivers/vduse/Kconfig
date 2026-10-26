@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VDUSE_GUEST
+	bool
+	select VHOST_RING
+	help
+	  The guest side of a VDUSE device: a transport that serves the
+	  virtqueues of a VDUSE device on the host, and backends that
+	  implement device types. A host, such as UML, selects this and
+	  gives the transport its access to VDUSE.
+
+config VDUSE_GUEST_BLK
+	bool "VDUSE virtio-blk backend"
+	depends on VDUSE_GUEST && BLOCK
+	default y
+	help
+	  Export a block device of the guest to the host as a virtio-blk
+	  device.

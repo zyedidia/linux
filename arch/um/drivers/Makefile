@@ -16,7 +16,6 @@ harddog-builtin-$(CONFIG_UML_WATCHDOG) := harddog_user.o harddog_user_exp.o
 rtc-objs := rtc_kern.o rtc_user.o
 vfio_uml-objs := vfio_kern.o vfio_user.o vfio_dma.o
 vduse_uml-objs := vduse_kern.o vduse_user.o
-vduse_uml-$(CONFIG_UML_VDUSE_BLK) += vduse_blk.o
 
 #XXX: The call below does not work because the flags are added before the
 # object name, so nothing from the library gets linked.

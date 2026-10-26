@@ -151,6 +151,8 @@ source "drivers/vdpa/Kconfig"
 
 source "drivers/vhost/Kconfig"
 
+source "drivers/vduse/Kconfig"
+
 source "drivers/hv/Kconfig"
 
 source "drivers/xen/Kconfig"
