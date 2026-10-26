@@ -426,6 +426,12 @@ static inline bool is_virtual_machine(void)
 	return boot_cpu_has(X86_FEATURE_HYPERVISOR);
 #elif defined(CONFIG_ARM64)
 	return !is_kernel_in_hyp_mode();
+#elif defined(CONFIG_UML)
+	/*
+	 * UML reaches a passed-through device only through its BARs, as a
+	 * virtual machine does.
+	 */
+	return true;
 #else
 	return false;
 #endif
