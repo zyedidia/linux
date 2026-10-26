@@ -10,9 +10,12 @@
 #include <linux/logic_iomem.h>
 #include <linux/mutex.h>
 #include <linux/kstrtox.h>
+#include <linux/log2.h>
 #include <linux/list.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <irq_kern.h>
@@ -102,6 +105,17 @@ struct uml_vfio_device {
 	bool msix_hidden;
 	u8 msix_ptr;
 	u8 msix_next;
+
+	/* The fd of the ROM image given on the command line, or -1. */
+	int rom_fd;
+	/*
+	 * The ROM image, padded to the size of the ROM BAR, and the emulated
+	 * ROM BAR register. When it is set, the image replaces the device's
+	 * ROM.
+	 */
+	void *rom;
+	u32 rom_size;
+	u32 rom_bar;
 	/* Protects the mask state of the device and its vectors. */
 	raw_spinlock_t irq_lock;
 
@@ -477,6 +491,39 @@ static int uml_vfio_update_msi_cap(struct uml_vfio_device *dev,
 	return 0;
 }
 
+static bool uml_vfio_is_rom_bar(struct uml_vfio_device *dev,
+				unsigned int offset, int size)
+{
+	return dev->rom && offset >= PCI_ROM_ADDRESS &&
+	       offset + size <= PCI_ROM_ADDRESS + 4;
+}
+
+static unsigned long uml_vfio_read_rom_bar(struct uml_vfio_device *dev,
+					   unsigned int offset, int size)
+{
+	u32 val = dev->rom_bar >> ((offset - PCI_ROM_ADDRESS) * 8);
+
+	if (size < 4)
+		val &= (1U << (size * 8)) - 1;
+	return val;
+}
+
+/*
+ * Only the address bits that fit the image's size and the enable bit can be
+ * written, so a sizing write reads back the size of the image.
+ */
+static void uml_vfio_write_rom_bar(struct uml_vfio_device *dev,
+				   unsigned int offset, int size,
+				   unsigned long val)
+{
+	unsigned int shift = (offset - PCI_ROM_ADDRESS) * 8;
+	u32 mask = size < 4 ? ((1U << (size * 8)) - 1) << shift : ~0U;
+	u32 bar = (dev->rom_bar & ~mask) | ((u32)(val << shift) & mask);
+
+	dev->rom_bar = bar & ((~(dev->rom_size - 1) & PCI_ROM_ADDRESS_MASK) |
+			      PCI_ROM_ADDRESS_ENABLE);
+}
+
 static unsigned long __uml_vfio_cfgspace_read(struct uml_vfio_device *dev,
 					      unsigned int offset, int size)
 {
@@ -507,9 +554,13 @@ static unsigned long uml_vfio_cfgspace_read(struct um_pci_device *pdev,
 					    unsigned int offset, int size)
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
-	unsigned long val = __uml_vfio_cfgspace_read(dev, offset, size);
+	unsigned long val;
 	int shift;
 
+	if (uml_vfio_is_rom_bar(dev, offset, size))
+		return uml_vfio_read_rom_bar(dev, offset, size);
+
+	val = __uml_vfio_cfgspace_read(dev, offset, size);
 	atomic64_inc(&dev->stats.cfg_reads);
 
 	if (dev->msix_hidden && dev->msix_ptr >= offset &&
@@ -564,6 +615,11 @@ static void uml_vfio_cfgspace_write(struct um_pci_device *pdev,
 {
 	struct uml_vfio_device *dev = to_vdev(pdev);
 
+	if (uml_vfio_is_rom_bar(dev, offset, size)) {
+		uml_vfio_write_rom_bar(dev, offset, size, val);
+		return;
+	}
+
 	atomic64_inc(&dev->stats.cfg_writes);
 
 	if (dev->msix_cap)
@@ -599,6 +655,14 @@ static void uml_vfio_bar_copy_from(struct um_pci_device *pdev, int bar,
 
 	if (shadow) {
 		memcpy(buffer, shadow, size);
+		return;
+	}
+
+	if (bar == PCI_ROM_RESOURCE && dev->rom) {
+		if (offset < dev->rom_size && size <= dev->rom_size - offset)
+			memcpy(buffer, dev->rom + offset, size);
+		else
+			memset(buffer, 0xff, size);
 		return;
 	}
 
@@ -641,6 +705,10 @@ static void uml_vfio_bar_copy_to(struct um_pci_device *pdev, int bar,
 		memcpy(shadow, buffer, size);
 		return;
 	}
+
+	/* A supplied ROM image is read-only, like a real ROM. */
+	if (bar == PCI_ROM_RESOURCE && dev->rom)
+		return;
 
 	atomic64_inc(&dev->stats.bar_writes);
 	uml_vfio_user_bar_write(&dev->udev, bar, offset, buffer, size);
@@ -698,9 +766,13 @@ static int uml_vfio_reset(struct um_pci_device *pdev, bool probe)
 
 static void __iomem *uml_vfio_bar_map(struct um_pci_device *pdev, int bar)
 {
+	struct uml_vfio_device *dev = to_vdev(pdev);
+
+	if (bar == PCI_ROM_RESOURCE)
+		return (void __iomem __force *)dev->rom;
 	if (bar >= PCI_STD_NUM_BARS)
 		return NULL;
-	return (void __iomem __force *)to_vdev(pdev)->bar_map[bar];
+	return (void __iomem __force *)dev->bar_map[bar];
 }
 
 /*
@@ -1032,10 +1104,66 @@ static int uml_vfio_map_bars(struct uml_vfio_device *dev)
 	return 0;
 }
 
+/*
+ * Read the ROM image from rom_fd, which is closed afterwards. The image is
+ * padded with zeros to the size of the ROM BAR, a power of two of at least
+ * 2K.
+ */
+static int uml_vfio_load_rom(struct uml_vfio_device *dev)
+{
+	unsigned long long off = 0;
+	struct uml_stat st;
+	int err, n;
+
+	err = os_stat_fd(dev->rom_fd, &st);
+	if (err)
+		goto out;
+
+	if (!st.ust_size || st.ust_size > SZ_16M) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	dev->rom_size = max(roundup_pow_of_two(st.ust_size), SZ_2K);
+	dev->rom = kvzalloc(dev->rom_size, GFP_KERNEL);
+	if (!dev->rom) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	while (off < st.ust_size) {
+		n = os_pread_file(dev->rom_fd, dev->rom + off,
+				  st.ust_size - off, off);
+		if (n == -EINTR)
+			continue;
+		if (n <= 0) {
+			err = n ?: -EIO;
+			kvfree(dev->rom);
+			dev->rom = NULL;
+			goto out;
+		}
+		off += n;
+	}
+
+out:
+	os_close_file(dev->rom_fd);
+	dev->rom_fd = -1;
+	return err;
+}
+
 static void uml_vfio_open_device(struct uml_vfio_device *dev)
 {
 	struct uml_vfio_intr_ctx *ctx;
 	int err, group_id = -1, i;
+
+	if (dev->rom_fd >= 0) {
+		err = uml_vfio_load_rom(dev);
+		if (err) {
+			pr_err("Failed to read ROM image (%s), error %d\n",
+			       dev->name, err);
+			goto free_dev;
+		}
+	}
 
 	if (dev->passed_group < 0) {
 		group_id = uml_vfio_user_get_group_id(dev->name);
@@ -1121,6 +1249,7 @@ release_group:
 free_dev:
 	scoped_guard(mutex, &uml_vfio_devices_mtx)
 		list_del(&dev->list);
+	kvfree(dev->rom);
 	kfree(dev->name);
 	kfree(dev);
 }
@@ -1144,6 +1273,7 @@ static void uml_vfio_release_device(struct uml_vfio_device *dev)
 	uml_vfio_release_group(dev->group);
 	scoped_guard(mutex, &uml_vfio_devices_mtx)
 		list_del(&dev->list);
+	kvfree(dev->rom);
 	kfree(dev->name);
 	kfree(dev);
 }
@@ -1159,26 +1289,43 @@ static struct uml_vfio_device *uml_vfio_find_device(const char *device)
 	return NULL;
 }
 
-/* Add a device given as <domain:bus:slot.function>[,group_fd=<n>]. */
+/* Parse an option of the form <key><n>, where n is an fd. */
+static int uml_vfio_parse_fd(const char *opt, const char *key, int *fd)
+{
+	if (!strstarts(opt, key))
+		return -ENOENT;
+	if (kstrtoint(opt + strlen(key), 10, fd) || *fd < 0)
+		return -EINVAL;
+	return 0;
+}
+
+/*
+ * Add a device given as
+ * <domain:bus:slot.function>[,group_fd=<n>][,rom_fd=<n>].
+ */
 static struct uml_vfio_device *uml_vfio_add_device(const char *arg)
 {
 	struct uml_vfio_device *dev;
-	const char *opt;
-	char *name;
-	int group_fd = -1;
+	int group_fd = -1, rom_fd = -1;
+	char *name, *opts, *opt;
+	int err;
 
-	opt = strchr(arg, ',');
-	if (opt) {
-		if (!strstarts(opt + 1, "group_fd=") ||
-		    kstrtoint(opt + 1 + strlen("group_fd="), 10, &group_fd) ||
-		    group_fd < 0)
-			return ERR_PTR(-EINVAL);
-		name = kstrndup(arg, opt - arg, GFP_KERNEL);
-	} else {
-		name = kstrdup(arg, GFP_KERNEL);
-	}
+	name = kstrdup(arg, GFP_KERNEL);
 	if (!name)
 		return ERR_PTR(-ENOMEM);
+
+	/* The name ends at the first comma, which strsep() overwrites. */
+	opts = name;
+	strsep(&opts, ",");
+	while ((opt = strsep(&opts, ","))) {
+		err = uml_vfio_parse_fd(opt, "group_fd=", &group_fd);
+		if (err == -ENOENT)
+			err = uml_vfio_parse_fd(opt, "rom_fd=", &rom_fd);
+		if (err) {
+			kfree(name);
+			return ERR_PTR(-EINVAL);
+		}
+	}
 
 	guard(mutex)(&uml_vfio_devices_mtx);
 
@@ -1195,6 +1342,7 @@ static struct uml_vfio_device *uml_vfio_add_device(const char *arg)
 
 	dev->name = name;
 	dev->passed_group = group_fd;
+	dev->rom_fd = rom_fd;
 
 	list_add_tail(&dev->list, &uml_vfio_devices);
 	return dev;
@@ -1222,12 +1370,15 @@ static const struct kernel_param_ops uml_vfio_cmdline_param_ops = {
 
 device_param_cb(device, &uml_vfio_cmdline_param_ops, NULL, 0400);
 __uml_help(uml_vfio_cmdline_param_ops,
-"vfio_uml.device=<domain:bus:slot.function>[,group_fd=<n>]\n"
+"vfio_uml.device=<domain:bus:slot.function>[,group_fd=<n>][,rom_fd=<n>]\n"
 "    Pass through a PCI device to UML via VFIO. The device must support\n"
 "    MSI-X or MSI. This parameter can be specified multiple times to pass\n"
 "    through multiple PCI devices to UML. With group_fd, the device's\n"
 "    group is the open host file descriptor <n> instead of the one opened\n"
-"    from /dev/vfio. Devices in the same group take the same fd.\n\n"
+"    from /dev/vfio. Devices in the same group take the same fd. With\n"
+"    rom_fd, the guest sees the image in the open host file descriptor <n>\n"
+"    as the device's expansion ROM, in place of any ROM the device has.\n"
+"    The fd is closed after it is read.\n\n"
 "vfio_uml.container_fd=<n>\n"
 "    Use the open host file descriptor <n> as the VFIO container instead\n"
 "    of opening /dev/vfio/vfio.\n\n"
@@ -1292,7 +1443,8 @@ static void uml_vfio_show_device(struct seq_file *m,
 	for (i = 0; i <= PCI_ROM_RESOURCE && i < dev->udev.num_regions; i++) {
 		char name[8];
 
-		if (!dev->udev.region[i].size)
+		if (!dev->udev.region[i].size ||
+		    (i == PCI_ROM_RESOURCE && dev->rom))
 			continue;
 		if (i == PCI_ROM_RESOURCE)
 			strscpy(name, "rom");
@@ -1302,6 +1454,8 @@ static void uml_vfio_show_device(struct seq_file *m,
 			   uml_vfio_bar_map(&dev->pdev, i) ? "direct" : "trapped",
 			   (unsigned long long)dev->udev.region[i].size);
 	}
+	if (dev->rom)
+		seq_printf(m, "  %-18s supplied 0x%x\n", "rom", dev->rom_size);
 
 	seq_printf(m, "  %-18s %lld\n", "cfg_reads",
 		   atomic64_read(&stats->cfg_reads));
