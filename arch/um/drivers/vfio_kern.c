@@ -1077,8 +1077,14 @@ static int uml_vfio_map_bars(struct uml_vfio_device *dev)
 
 		dev->bar_map[bar] = uml_vfio_user_map_bar(&dev->udev, bar,
 							  ranges, n);
-		if (!dev->bar_map[bar])
-			pr_warn("BAR %d of %s cannot be mapped, using trapped access\n",
+		if (dev->bar_map[bar])
+			continue;
+
+		pr_warn("BAR %d of %s cannot be mapped, using trapped access\n",
+			bar, dev->name);
+		/* logic_iomem reaches at most 16M of a trapped mapping. */
+		if (dev->udev.region[bar].size > SZ_16M)
+			pr_warn("BAR %d of %s is larger than 16M, and trapped accesses past 16M are not supported\n",
 				bar, dev->name);
 	}
 
