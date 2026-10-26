@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/pci_hotplug.h>
+#include <linux/sizes.h>
 #include <linux/dma-map-ops.h>
 #include <linux/logic_iomem.h>
 #include <linux/of_platform.h>
@@ -276,6 +277,20 @@ static struct resource virt_iomem_resource = {
 	.flags = IORESOURCE_MEM,
 };
 
+#ifdef CONFIG_64BIT
+/*
+ * BAR addresses only name the BARs to ioremap, so this window can be large
+ * without any memory behind it. It holds 64-bit prefetchable BARs, such as
+ * the VRAM BAR of a GPU.
+ */
+static struct resource virt_iomem64_resource = {
+	.name = "PCI iomem 64-bit",
+	.start = 1UL << 40,
+	.end = (1UL << 40) + SZ_64G - 1,
+	.flags = IORESOURCE_MEM | IORESOURCE_PREFETCH | IORESOURCE_MEM_64,
+};
+#endif
+
 struct um_pci_find_bar_data {
 	unsigned long addr;
 	size_t size;
@@ -319,12 +334,11 @@ static int um_pci_find_bar_walk(struct pci_dev *pdev, void *_data)
 	return 0;
 }
 
-static bool um_pci_find_bar(unsigned long offset, size_t size,
+static bool um_pci_find_bar(unsigned long addr, size_t size,
 			    struct um_pci_find_bar_data *data)
 {
 	*data = (struct um_pci_find_bar_data) {
-		/* we want the full address here */
-		.addr = offset + virt_iomem_resource.start,
+		.addr = addr,
 		.size = size,
 	};
 
@@ -332,13 +346,12 @@ static bool um_pci_find_bar(unsigned long offset, size_t size,
 	return data->dev;
 }
 
-static long um_pci_map_iomem(unsigned long offset, size_t size,
-			     const struct logic_iomem_ops **ops,
-			     void **priv)
+static long um_pci_map_bar(unsigned long addr, size_t size,
+			   const struct logic_iomem_ops **ops, void **priv)
 {
 	struct um_pci_find_bar_data data;
 
-	if (!um_pci_find_bar(offset, size, &data))
+	if (!um_pci_find_bar(addr, size, &data))
 		return -ENOENT;
 
 	*ops = &um_pci_device_bar_ops;
@@ -347,13 +360,12 @@ static long um_pci_map_iomem(unsigned long offset, size_t size,
 	return data.offset;
 }
 
-static void __iomem *um_pci_map_iomem_direct(unsigned long offset,
-					     size_t size)
+static void __iomem *um_pci_map_bar_direct(unsigned long addr, size_t size)
 {
 	struct um_pci_find_bar_data data;
 	void __iomem *base;
 
-	if (!um_pci_find_bar(offset, size, &data) || !data.dev->ops->bar_map)
+	if (!um_pci_find_bar(addr, size, &data) || !data.dev->ops->bar_map)
 		return NULL;
 
 	base = data.dev->ops->bar_map(data.dev, data.bar);
@@ -362,10 +374,46 @@ static void __iomem *um_pci_map_iomem_direct(unsigned long offset,
 	return base + data.offset;
 }
 
+static long um_pci_map_iomem(unsigned long offset, size_t size,
+			     const struct logic_iomem_ops **ops,
+			     void **priv)
+{
+	return um_pci_map_bar(virt_iomem_resource.start + offset, size, ops,
+			      priv);
+}
+
+static void __iomem *um_pci_map_iomem_direct(unsigned long offset,
+					     size_t size)
+{
+	return um_pci_map_bar_direct(virt_iomem_resource.start + offset, size);
+}
+
 static const struct logic_iomem_region_ops um_pci_iomem_ops = {
 	.map = um_pci_map_iomem,
 	.map_direct = um_pci_map_iomem_direct,
 };
+
+#ifdef CONFIG_64BIT
+static long um_pci_map_iomem64(unsigned long offset, size_t size,
+			       const struct logic_iomem_ops **ops,
+			       void **priv)
+{
+	return um_pci_map_bar(virt_iomem64_resource.start + offset, size, ops,
+			      priv);
+}
+
+static void __iomem *um_pci_map_iomem64_direct(unsigned long offset,
+					       size_t size)
+{
+	return um_pci_map_bar_direct(virt_iomem64_resource.start + offset,
+				     size);
+}
+
+static const struct logic_iomem_region_ops um_pci_iomem64_ops = {
+	.map = um_pci_map_iomem64,
+	.map_direct = um_pci_map_iomem64_direct,
+};
+#endif
 
 static void um_pci_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 {
@@ -742,6 +790,10 @@ static int __init um_pci_init(void)
 				       &um_pci_cfgspace_ops));
 	WARN_ON(logic_iomem_add_region(&virt_iomem_resource,
 				       &um_pci_iomem_ops));
+#ifdef CONFIG_64BIT
+	WARN_ON(logic_iomem_add_region(&virt_iomem64_resource,
+				       &um_pci_iomem64_ops));
+#endif
 	WARN_ON(logic_iomem_add_region(&virt_platform_resource,
 				       &um_pci_platform_ops));
 
@@ -770,6 +822,9 @@ static int __init um_pci_init(void)
 	}
 
 	pci_add_resource(&bridge->windows, &virt_iomem_resource);
+#ifdef CONFIG_64BIT
+	pci_add_resource(&bridge->windows, &virt_iomem64_resource);
+#endif
 	pci_add_resource(&bridge->windows, &busn_resource);
 	bridge->ops = &um_pci_ops;
 	bridge->map_irq = um_pci_map_irq;
