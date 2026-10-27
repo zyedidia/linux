@@ -1301,18 +1301,14 @@ unlock:
 
 static void vduse_vq_update_effective_cpu(struct vduse_virtqueue *vq)
 {
-	int curr_cpu = vq->irq_effective_cpu;
+	unsigned int cpu;
 
-	while (true) {
-		curr_cpu = cpumask_next(curr_cpu, &vq->irq_affinity);
-		if (cpu_online(curr_cpu))
-			break;
-
-		if (curr_cpu >= nr_cpu_ids)
-			curr_cpu = IRQ_UNBOUND;
-	}
-
-	vq->irq_effective_cpu = curr_cpu;
+	cpu = cpumask_next_and_wrap(vq->irq_effective_cpu, &vq->irq_affinity,
+				    cpu_online_mask);
+	if (cpu >= nr_cpu_ids)
+		vq->irq_effective_cpu = IRQ_UNBOUND;
+	else
+		vq->irq_effective_cpu = cpu;
 }
 
 static int vduse_dev_iotlb_entry(struct vduse_dev *dev,
