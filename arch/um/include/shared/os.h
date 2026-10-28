@@ -356,4 +356,7 @@ void os_start_secondary(void *arg, jmp_buf *switch_buf);
 int os_send_ipi(int cpu, int vector);
 #endif /* CONFIG_SMP */
 
+/* sandbox.c */
+void os_enter_sandbox(void);
+
 #endif

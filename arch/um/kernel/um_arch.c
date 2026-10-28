@@ -404,6 +404,8 @@ int __init linux_main(int argc, char **argv, char **envp)
 
 	os_flush_stdout();
 
+	os_enter_sandbox();
+
 	return start_uml();
 }
 
