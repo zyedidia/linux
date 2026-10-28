@@ -6,6 +6,7 @@
 #include <linux/slab.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
+#include <linux/workqueue.h>
 #include "chan.h"
 #include <os.h>
 #include <irq_kern.h>
@@ -207,7 +208,7 @@ int enable_chan(struct line *line)
 }
 
 /* Items are added in IRQ context, when free_irq can't be called, and
- * removed in process context, when it can.
+ * removed by a work item in process context, when it can.
  * This handles interrupt sources which disappear, and which need to
  * be permanently disabled.  This is discovered in IRQ context, but
  * the freeing of the IRQ must be done later.
@@ -215,7 +216,7 @@ int enable_chan(struct line *line)
 static DEFINE_RAW_SPINLOCK(irqs_to_free_lock);
 static LIST_HEAD(irqs_to_free);
 
-void free_irqs(void)
+static void free_irqs(struct work_struct *work)
 {
 	struct chan *chan;
 	LIST_HEAD(list);
@@ -238,6 +239,8 @@ void free_irqs(void)
 	}
 }
 
+static DECLARE_WORK(free_irqs_work, free_irqs);
+
 static void close_one_chan(struct chan *chan, int delay_free_irq)
 {
 	unsigned long flags;
@@ -249,6 +252,7 @@ static void close_one_chan(struct chan *chan, int delay_free_irq)
 		raw_spin_lock_irqsave(&irqs_to_free_lock, flags);
 		list_add(&chan->free_list, &irqs_to_free);
 		raw_spin_unlock_irqrestore(&irqs_to_free_lock, flags);
+		schedule_work(&free_irqs_work);
 	} else {
 		if (chan->input && chan->enabled)
 			um_free_irq(chan->line->read_irq, chan);

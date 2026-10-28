@@ -76,7 +76,6 @@ static inline bool um_irq_timetravel_handler_used(void)
 }
 
 void um_free_irq(int irq, void *dev_id);
-void free_irqs(void);
 bool um_idle_waits_for_irqs(void);
 void um_irq_set_cpu(int irq, unsigned int cpu);
 #endif
