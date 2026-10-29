@@ -172,6 +172,7 @@ static u32 allowed_device_id[] = {
 	VIRTIO_ID_NET,
 	VIRTIO_ID_FS,
 	VIRTIO_ID_GPU,
+	VIRTIO_ID_MAC80211_WLAN,
 };
 
 static inline struct vduse_dev *vdpa_to_vduse(struct vdpa_device *vdpa)
@@ -2191,7 +2192,9 @@ static int vduse_create_dev(struct vduse_dev_config *config,
 	struct vduse_dev *dev;
 
 	ret = -EPERM;
-	if ((config->device_id == VIRTIO_ID_NET) && !capable(CAP_NET_ADMIN))
+	if ((config->device_id == VIRTIO_ID_NET ||
+	     config->device_id == VIRTIO_ID_MAC80211_WLAN) &&
+	    !capable(CAP_NET_ADMIN))
 		goto err;
 	if ((config->device_id == VIRTIO_ID_GPU) && !capable(CAP_SYS_ADMIN))
 		goto err;
@@ -2477,6 +2480,7 @@ static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_BLOCK, VIRTIO_DEV_ANY_ID },
 	{ VIRTIO_ID_NET, VIRTIO_DEV_ANY_ID },
 	{ VIRTIO_ID_GPU, VIRTIO_DEV_ANY_ID },
+	{ VIRTIO_ID_MAC80211_WLAN, VIRTIO_DEV_ANY_ID },
 	{ 0 },
 };
 
