@@ -16,6 +16,17 @@ config VDUSE_GUEST_BLK
 	  Export a block device of the guest to the host as a virtio-blk
 	  device.
 
+config VDUSE_GUEST_WLAN
+	bool "VDUSE virtio-wlan backend"
+	depends on VDUSE_GUEST && CFG80211=y && CFG80211_CLIENT
+	default y
+	help
+	  Export a station interface of the guest to the host as a
+	  virtio-wlan device. The backend drives the interface through
+	  cfg80211's in-kernel client API. The interface must belong to a
+	  mac80211 driver, which reports the BSS with a connection result
+	  and reports a requested disconnection before the request returns.
+
 config VDUSE_GUEST_PCI
 	bool "VDUSE devices through a VMM's VDUSE proxy"
 	depends on PCI_MSI && 64BIT && !UML

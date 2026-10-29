@@ -47,6 +47,7 @@ struct vduse_guest_backend_ops {
 };
 
 extern const struct vduse_guest_backend_ops vduse_guest_blk_ops;
+extern const struct vduse_guest_backend_ops vduse_guest_wlan_ops;
 
 const char *vduse_guest_name(struct vduse_guest_dev *dev);
 unsigned int vduse_guest_num_queues(struct vduse_guest_dev *dev);

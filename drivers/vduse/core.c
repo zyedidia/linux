@@ -189,6 +189,9 @@ static const struct vduse_guest_backend_ops *const vduse_guest_backends[] = {
 #ifdef CONFIG_VDUSE_GUEST_BLK
 	&vduse_guest_blk_ops,
 #endif
+#ifdef CONFIG_VDUSE_GUEST_WLAN
+	&vduse_guest_wlan_ops,
+#endif
 };
 
 static const char *vduse_guest_args[VDUSE_GUEST_MAX_DEVICES];
