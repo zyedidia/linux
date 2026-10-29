@@ -11,6 +11,16 @@ config MAC80211_HWSIM
 	  To compile this driver as a module, choose M here: the module will be
 	  called mac80211_hwsim.  If unsure, say N.
 
+config VIRTIO_WLAN
+	tristate "Virtio WLAN driver"
+	depends on VIRTIO && CFG80211
+	help
+	  This driver supports virtio-wlan devices, FullMAC stations that
+	  appear as cfg80211 station interfaces.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called virtio_wlan.
+
 config VIRT_WIFI
 	tristate "Wifi wrapper for ethernet drivers"
 	depends on CFG80211
