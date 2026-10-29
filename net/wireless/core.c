@@ -1416,6 +1416,8 @@ static void _cfg80211_unregister_wdev(struct wireless_dev *wdev,
 
 	wdev->registered = false;
 
+	cfg80211_client_gone(wdev);
+
 	if (wdev->netdev) {
 		sysfs_remove_link(&wdev->netdev->dev.kobj, "phy80211");
 		if (unregister_netdev)

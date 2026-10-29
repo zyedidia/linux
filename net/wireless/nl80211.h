@@ -8,6 +8,12 @@
 
 #include "core.h"
 
+/* Limits of the nl80211 policy that the client API also applies. */
+#define NL80211_WPA_VERSIONS_VALID	(NL80211_WPA_VERSION_1 | \
+					 NL80211_WPA_VERSION_2 | \
+					 NL80211_WPA_VERSION_3)
+#define NL80211_KEY_SEQ_MAX_LEN		16
+
 int nl80211_init(void);
 void nl80211_exit(void);
 
@@ -29,6 +35,26 @@ int nl80211_parse_chandef(struct cfg80211_registered_device *rdev,
 			  bool npca_permitted);
 int nl80211_parse_random_mac(struct nlattr **attrs,
 			     u8 *mac_addr, u8 *mac_addr_mask);
+int nl80211_check_random_mac(u8 *mac_addr, u8 *mac_addr_mask);
+bool nl80211_valid_ies(const u8 *data, size_t len);
+int nl80211_check_scan_feat_flags(struct wiphy *wiphy,
+				  struct wireless_dev *wdev, u32 flags,
+				  enum nl80211_feature_flags randomness_flag);
+bool nl80211_scan_chan_usable(struct wireless_dev *wdev,
+			      struct ieee80211_channel *chan);
+unsigned int nl80211_scan_all_chans(struct wireless_dev *wdev,
+				    struct ieee80211_channel **channels);
+int nl80211_check_scan_chans(struct wireless_dev *wdev,
+			     struct cfg80211_scan_request *req);
+int nl80211_check_crypto_settings(struct cfg80211_registered_device *rdev,
+				  const struct cfg80211_crypto_settings *settings,
+				  int cipher_limit);
+bool nl80211_valid_auth_type(struct cfg80211_registered_device *rdev,
+			     enum nl80211_auth_type auth_type,
+			     enum nl80211_commands cmd);
+struct ieee80211_channel *nl80211_get_valid_chan(struct wiphy *wiphy, u32 freq);
+int nl80211_key_allowed(struct wireless_dev *wdev);
+void cfg80211_sta_set_mld_sinfo(struct station_info *sinfo);
 
 void nl80211_notify_wiphy(struct cfg80211_registered_device *rdev,
 			  enum nl80211_commands cmd);

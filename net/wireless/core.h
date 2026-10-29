@@ -653,4 +653,53 @@ size_t cfg80211_gen_new_ie(const u8 *ie, size_t ielen,
 #define VISIBLE_IF_CFG80211_KUNIT static
 #endif /* IS_ENABLED(CONFIG_CFG80211_KUNIT_TEST) */
 
+int cfg80211_bss_refs_since(struct cfg80211_registered_device *rdev,
+			    unsigned long since, struct cfg80211_bss ***bss);
+
+#ifdef CONFIG_CFG80211_CLIENT
+void cfg80211_client_scan_done(struct cfg80211_scan_request_int *req,
+			       bool aborted);
+void cfg80211_client_connect_result(struct wireless_dev *wdev,
+				    const struct cfg80211_connect_resp_params *cr);
+void cfg80211_client_disconnected(struct wireless_dev *wdev, u16 reason,
+				  const u8 *ie, size_t ie_len, bool from_ap);
+void cfg80211_client_mic_failure(struct wireless_dev *wdev, const u8 *addr,
+				 enum nl80211_key_type key_type, int key_id,
+				 const u8 *tsc);
+void cfg80211_client_reg_change(struct wiphy *wiphy);
+void cfg80211_client_gone(struct wireless_dev *wdev);
+#else
+static inline void
+cfg80211_client_scan_done(struct cfg80211_scan_request_int *req, bool aborted)
+{
+}
+
+static inline void
+cfg80211_client_connect_result(struct wireless_dev *wdev,
+			       const struct cfg80211_connect_resp_params *cr)
+{
+}
+
+static inline void
+cfg80211_client_disconnected(struct wireless_dev *wdev, u16 reason,
+			     const u8 *ie, size_t ie_len, bool from_ap)
+{
+}
+
+static inline void
+cfg80211_client_mic_failure(struct wireless_dev *wdev, const u8 *addr,
+			    enum nl80211_key_type key_type, int key_id,
+			    const u8 *tsc)
+{
+}
+
+static inline void cfg80211_client_reg_change(struct wiphy *wiphy)
+{
+}
+
+static inline void cfg80211_client_gone(struct wireless_dev *wdev)
+{
+}
+#endif
+
 #endif /* __NET_WIRELESS_CORE_H */

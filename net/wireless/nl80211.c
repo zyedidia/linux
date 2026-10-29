@@ -271,18 +271,21 @@ err:
 	return -EINVAL;
 }
 
-static int validate_ie_attr(const struct nlattr *attr,
-			    struct netlink_ext_ack *extack)
+bool nl80211_valid_ies(const u8 *data, size_t len)
 {
-	const u8 *data = nla_data(attr);
-	unsigned int len = nla_len(attr);
 	const struct element *elem;
 
 	for_each_element(elem, data, len) {
 		/* nothing */
 	}
 
-	if (for_each_element_completed(elem, data, len))
+	return for_each_element_completed(elem, data, len);
+}
+
+static int validate_ie_attr(const struct nlattr *attr,
+			    struct netlink_ext_ack *extack)
+{
+	if (nl80211_valid_ies(nla_data(attr), nla_len(attr)))
 		return 0;
 
 	NL_SET_ERR_MSG_ATTR(extack, attr, "malformed information elements");
@@ -738,7 +741,8 @@ static const struct nla_policy nl80211_policy[NUM_NL80211_ATTR] = {
 	[NL80211_ATTR_KEY_IDX] = NLA_POLICY_MAX(NLA_U8, 7),
 	[NL80211_ATTR_KEY_CIPHER] = { .type = NLA_U32 },
 	[NL80211_ATTR_KEY_DEFAULT] = { .type = NLA_FLAG },
-	[NL80211_ATTR_KEY_SEQ] = { .type = NLA_BINARY, .len = 16 },
+	[NL80211_ATTR_KEY_SEQ] = { .type = NLA_BINARY,
+				   .len = NL80211_KEY_SEQ_MAX_LEN },
 	[NL80211_ATTR_KEY_TYPE] =
 		NLA_POLICY_MAX(NLA_U32, NUM_NL80211_KEYTYPES),
 
@@ -811,10 +815,7 @@ static const struct nla_policy nl80211_policy[NUM_NL80211_ATTR] = {
 	[NL80211_ATTR_STATUS_CODE] = { .type = NLA_U16 },
 	[NL80211_ATTR_CIPHER_SUITE_GROUP] = { .type = NLA_U32 },
 	[NL80211_ATTR_WPA_VERSIONS] =
-		NLA_POLICY_RANGE(NLA_U32, 0,
-				 NL80211_WPA_VERSION_1 |
-				 NL80211_WPA_VERSION_2 |
-				 NL80211_WPA_VERSION_3),
+		NLA_POLICY_RANGE(NLA_U32, 0, NL80211_WPA_VERSIONS_VALID),
 	[NL80211_ATTR_PID] = { .type = NLA_U32 },
 	[NL80211_ATTR_4ADDR] = { .type = NLA_U8 },
 	[NL80211_ATTR_PMKID] = NLA_POLICY_EXACT_LEN_WARN(WLAN_PMKID_LEN),
@@ -1102,7 +1103,8 @@ static const struct nla_policy nl80211_key_policy[NL80211_KEY_MAX + 1] = {
 	[NL80211_KEY_DATA] = { .type = NLA_BINARY, .len = WLAN_MAX_KEY_LEN },
 	[NL80211_KEY_IDX] = { .type = NLA_U8 },
 	[NL80211_KEY_CIPHER] = { .type = NLA_U32 },
-	[NL80211_KEY_SEQ] = { .type = NLA_BINARY, .len = 16 },
+	[NL80211_KEY_SEQ] = { .type = NLA_BINARY,
+			      .len = NL80211_KEY_SEQ_MAX_LEN },
 	[NL80211_KEY_DEFAULT] = { .type = NLA_FLAG },
 	[NL80211_KEY_DEFAULT_MGMT] = { .type = NLA_FLAG },
 	[NL80211_KEY_TYPE] = NLA_POLICY_MAX(NLA_U32, NUM_NL80211_KEYTYPES - 1),
@@ -1855,7 +1857,7 @@ nl80211_parse_connkeys(struct cfg80211_registered_device *rdev,
 	return ERR_PTR(err);
 }
 
-static int nl80211_key_allowed(struct wireless_dev *wdev)
+int nl80211_key_allowed(struct wireless_dev *wdev)
 {
 	lockdep_assert_wiphy(wdev->wiphy);
 
@@ -1899,8 +1901,7 @@ static int nl80211_key_allowed(struct wireless_dev *wdev)
 	return 0;
 }
 
-static struct ieee80211_channel *nl80211_get_valid_chan(struct wiphy *wiphy,
-							u32 freq)
+struct ieee80211_channel *nl80211_get_valid_chan(struct wiphy *wiphy, u32 freq)
 {
 	struct ieee80211_channel *chan;
 
@@ -7031,9 +7032,9 @@ static bool nl80211_get_ap_channel(struct cfg80211_registered_device *rdev,
 	return false;
 }
 
-static bool nl80211_valid_auth_type(struct cfg80211_registered_device *rdev,
-				    enum nl80211_auth_type auth_type,
-				    enum nl80211_commands cmd)
+bool nl80211_valid_auth_type(struct cfg80211_registered_device *rdev,
+			     enum nl80211_auth_type auth_type,
+			     enum nl80211_commands cmd)
 {
 	if (auth_type > NL80211_AUTHTYPE_MAX)
 		return false;
@@ -8314,7 +8315,7 @@ static int nl80211_send_station(struct sk_buff *msg, u32 cmd, u32 portid,
 	return -EMSGSIZE;
 }
 
-static void cfg80211_sta_set_mld_sinfo(struct station_info *sinfo)
+void cfg80211_sta_set_mld_sinfo(struct station_info *sinfo)
 {
 	struct link_station_info *link_sinfo;
 	int link_id, init = 0;
@@ -10918,11 +10919,29 @@ static int parse_bss_select(struct nlattr *nla, struct wiphy *wiphy,
 	return 0;
 }
 
-int nl80211_parse_random_mac(struct nlattr **attrs,
-			     u8 *mac_addr, u8 *mac_addr_mask)
+int nl80211_check_random_mac(u8 *mac_addr, u8 *mac_addr_mask)
 {
 	int i;
 
+	/* don't allow or configure an mcast address */
+	if (!is_multicast_ether_addr(mac_addr_mask) ||
+	    is_multicast_ether_addr(mac_addr))
+		return -EINVAL;
+
+	/*
+	 * allow users to pass a MAC address that has bits set outside
+	 * of the mask, but don't bother drivers with having to deal
+	 * with such bits
+	 */
+	for (i = 0; i < ETH_ALEN; i++)
+		mac_addr[i] &= mac_addr_mask[i];
+
+	return 0;
+}
+
+int nl80211_parse_random_mac(struct nlattr **attrs,
+			     u8 *mac_addr, u8 *mac_addr_mask)
+{
 	if (!attrs[NL80211_ATTR_MAC] && !attrs[NL80211_ATTR_MAC_MASK]) {
 		eth_zero_addr(mac_addr);
 		eth_zero_addr(mac_addr_mask);
@@ -10939,20 +10958,7 @@ int nl80211_parse_random_mac(struct nlattr **attrs,
 	memcpy(mac_addr, nla_data(attrs[NL80211_ATTR_MAC]), ETH_ALEN);
 	memcpy(mac_addr_mask, nla_data(attrs[NL80211_ATTR_MAC_MASK]), ETH_ALEN);
 
-	/* don't allow or configure an mcast address */
-	if (!is_multicast_ether_addr(mac_addr_mask) ||
-	    is_multicast_ether_addr(mac_addr))
-		return -EINVAL;
-
-	/*
-	 * allow users to pass a MAC address that has bits set outside
-	 * of the mask, but don't bother drivers with having to deal
-	 * with such bits
-	 */
-	for (i = 0; i < ETH_ALEN; i++)
-		mac_addr[i] &= mac_addr_mask[i];
-
-	return 0;
+	return nl80211_check_random_mac(mac_addr, mac_addr_mask);
 }
 
 static bool cfg80211_off_channel_oper_allowed(struct wireless_dev *wdev,
@@ -11022,58 +11028,68 @@ static bool nl80211_check_scan_feat(struct wiphy *wiphy, u32 flags, u32 flag,
 	return false;
 }
 
+int nl80211_check_scan_feat_flags(struct wiphy *wiphy,
+				  struct wireless_dev *wdev, u32 flags,
+				  enum nl80211_feature_flags randomness_flag)
+{
+	if (((flags & NL80211_SCAN_FLAG_LOW_PRIORITY) &&
+	     !(wiphy->features & NL80211_FEATURE_LOW_PRIORITY_SCAN)) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_LOW_SPAN,
+				     NL80211_EXT_FEATURE_LOW_SPAN_SCAN) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_LOW_POWER,
+				     NL80211_EXT_FEATURE_LOW_POWER_SCAN) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_HIGH_ACCURACY,
+				     NL80211_EXT_FEATURE_HIGH_ACCURACY_SCAN) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_FILS_MAX_CHANNEL_TIME,
+				     NL80211_EXT_FEATURE_FILS_MAX_CHANNEL_TIME) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_ACCEPT_BCAST_PROBE_RESP,
+				     NL80211_EXT_FEATURE_ACCEPT_BCAST_PROBE_RESP) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION,
+				     NL80211_EXT_FEATURE_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_OCE_PROBE_REQ_HIGH_TX_RATE,
+				     NL80211_EXT_FEATURE_OCE_PROBE_REQ_HIGH_TX_RATE) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_RANDOM_SN,
+				     NL80211_EXT_FEATURE_SCAN_RANDOM_SN) ||
+	    !nl80211_check_scan_feat(wiphy, flags,
+				     NL80211_SCAN_FLAG_MIN_PREQ_CONTENT,
+				     NL80211_EXT_FEATURE_SCAN_MIN_PREQ_CONTENT))
+		return -EOPNOTSUPP;
+
+	if ((flags & NL80211_SCAN_FLAG_RANDOM_ADDR) &&
+	    (!(wiphy->features & randomness_flag) ||
+	     (wdev && wdev->connected)))
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static int
 nl80211_check_scan_flags(struct wiphy *wiphy, struct wireless_dev *wdev,
 			 struct nlattr **attrs, u8 *mac_addr, u8 *mac_addr_mask,
 			 u32 *flags, enum nl80211_feature_flags randomness_flag)
 {
+	int err;
+
 	if (!attrs[NL80211_ATTR_SCAN_FLAGS])
 		return 0;
 
 	*flags = nla_get_u32(attrs[NL80211_ATTR_SCAN_FLAGS]);
 
-	if (((*flags & NL80211_SCAN_FLAG_LOW_PRIORITY) &&
-	     !(wiphy->features & NL80211_FEATURE_LOW_PRIORITY_SCAN)) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_LOW_SPAN,
-				     NL80211_EXT_FEATURE_LOW_SPAN_SCAN) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_LOW_POWER,
-				     NL80211_EXT_FEATURE_LOW_POWER_SCAN) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_HIGH_ACCURACY,
-				     NL80211_EXT_FEATURE_HIGH_ACCURACY_SCAN) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_FILS_MAX_CHANNEL_TIME,
-				     NL80211_EXT_FEATURE_FILS_MAX_CHANNEL_TIME) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_ACCEPT_BCAST_PROBE_RESP,
-				     NL80211_EXT_FEATURE_ACCEPT_BCAST_PROBE_RESP) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION,
-				     NL80211_EXT_FEATURE_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_OCE_PROBE_REQ_HIGH_TX_RATE,
-				     NL80211_EXT_FEATURE_OCE_PROBE_REQ_HIGH_TX_RATE) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_RANDOM_SN,
-				     NL80211_EXT_FEATURE_SCAN_RANDOM_SN) ||
-	    !nl80211_check_scan_feat(wiphy, *flags,
-				     NL80211_SCAN_FLAG_MIN_PREQ_CONTENT,
-				     NL80211_EXT_FEATURE_SCAN_MIN_PREQ_CONTENT))
-		return -EOPNOTSUPP;
+	err = nl80211_check_scan_feat_flags(wiphy, wdev, *flags,
+					    randomness_flag);
+	if (err)
+		return err;
 
-	if (*flags & NL80211_SCAN_FLAG_RANDOM_ADDR) {
-		int err;
-
-		if (!(wiphy->features & randomness_flag) ||
-		    (wdev && wdev->connected))
-			return -EOPNOTSUPP;
-
-		err = nl80211_parse_random_mac(attrs, mac_addr, mac_addr_mask);
-		if (err)
-			return err;
-	}
+	if (*flags & NL80211_SCAN_FLAG_RANDOM_ADDR)
+		return nl80211_parse_random_mac(attrs, mac_addr, mac_addr_mask);
 
 	return 0;
 }
@@ -11100,6 +11116,56 @@ nl80211_check_scan_flags_reg(struct wiphy *wiphy, struct wireless_dev *wdev,
 					req->req.mac_addr_mask,
 					&req->req.flags,
 					NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR);
+}
+
+bool nl80211_scan_chan_usable(struct wireless_dev *wdev,
+			      struct ieee80211_channel *chan)
+{
+	return !(chan->flags & IEEE80211_CHAN_DISABLED) &&
+	       !(chan->flags & IEEE80211_CHAN_S1G_NO_PRIMARY) &&
+	       cfg80211_wdev_channel_allowed(wdev, chan);
+}
+
+unsigned int nl80211_scan_all_chans(struct wireless_dev *wdev,
+				    struct ieee80211_channel **channels)
+{
+	struct wiphy *wiphy = wdev->wiphy;
+	enum nl80211_band band;
+	unsigned int n = 0;
+	int i;
+
+	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+		if (!wiphy->bands[band])
+			continue;
+		for (i = 0; i < wiphy->bands[band]->n_channels; i++) {
+			struct ieee80211_channel *chan;
+
+			chan = &wiphy->bands[band]->channels[i];
+			if (nl80211_scan_chan_usable(wdev, chan))
+				channels[n++] = chan;
+		}
+	}
+
+	return n;
+}
+
+int nl80211_check_scan_chans(struct wireless_dev *wdev,
+			     struct cfg80211_scan_request *req)
+{
+	int i;
+
+	for (i = 0; i < req->n_channels; i++) {
+		struct ieee80211_channel *chan = req->channels[i];
+
+		/* if we can go off-channel to the target channel we're good */
+		if (cfg80211_off_channel_oper_allowed(wdev, chan))
+			continue;
+
+		if (!cfg80211_wdev_on_sub_chan(wdev, chan, true))
+			return -EBUSY;
+	}
+
+	return 0;
 }
 
 static int nl80211_trigger_scan(struct sk_buff *skb, struct genl_info *info)
@@ -11191,38 +11257,14 @@ static int nl80211_trigger_scan(struct sk_buff *skb, struct genl_info *info)
 			}
 
 			/* Ignore disabled / no primary channels */
-			if (chan->flags & IEEE80211_CHAN_DISABLED ||
-			    chan->flags & IEEE80211_CHAN_S1G_NO_PRIMARY ||
-			    !cfg80211_wdev_channel_allowed(wdev, chan))
+			if (!nl80211_scan_chan_usable(wdev, chan))
 				continue;
 
 			request->req.channels[i] = chan;
 			i++;
 		}
 	} else {
-		enum nl80211_band band;
-
-		/* all channels */
-		for (band = 0; band < NUM_NL80211_BANDS; band++) {
-			int j;
-
-			if (!wiphy->bands[band])
-				continue;
-			for (j = 0; j < wiphy->bands[band]->n_channels; j++) {
-				struct ieee80211_channel *chan;
-
-				chan = &wiphy->bands[band]->channels[j];
-
-				if (chan->flags & IEEE80211_CHAN_DISABLED ||
-				    chan->flags &
-					    IEEE80211_CHAN_S1G_NO_PRIMARY ||
-				    !cfg80211_wdev_channel_allowed(wdev, chan))
-					continue;
-
-				request->req.channels[i] = chan;
-				i++;
-			}
-		}
+		i = nl80211_scan_all_chans(wdev, request->req.channels);
 	}
 
 	if (!i) {
@@ -11232,18 +11274,9 @@ static int nl80211_trigger_scan(struct sk_buff *skb, struct genl_info *info)
 
 	request->req.n_channels = i;
 
-	for (i = 0; i < request->req.n_channels; i++) {
-		struct ieee80211_channel *chan = request->req.channels[i];
-
-		/* if we can go off-channel to the target channel we're good */
-		if (cfg80211_off_channel_oper_allowed(wdev, chan))
-			continue;
-
-		if (!cfg80211_wdev_on_sub_chan(wdev, chan, true)) {
-			err = -EBUSY;
-			goto out_free;
-		}
-	}
+	err = nl80211_check_scan_chans(wdev, &request->req);
+	if (err)
+		goto out_free;
 
 	i = 0;
 	if (n_ssids) {
@@ -12777,6 +12810,53 @@ static int validate_pae_over_nl80211(struct cfg80211_registered_device *rdev,
 	return 0;
 }
 
+int nl80211_check_crypto_settings(struct cfg80211_registered_device *rdev,
+				  const struct cfg80211_crypto_settings *settings,
+				  int cipher_limit)
+{
+	struct wiphy *wiphy = &rdev->wiphy;
+	int i;
+
+	if (!(wiphy->flags & WIPHY_FLAG_CONTROL_PORT_PROTOCOL) &&
+	    settings->control_port_ethertype != cpu_to_be16(ETH_P_PAE))
+		return -EINVAL;
+
+	if (settings->control_port_over_nl80211 &&
+	    (!rdev->ops->tx_control_port ||
+	     !wiphy_ext_feature_isset(wiphy,
+				      NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211)))
+		return -EOPNOTSUPP;
+
+	if (settings->n_ciphers_pairwise > cipher_limit)
+		return -EINVAL;
+
+	for (i = 0; i < settings->n_ciphers_pairwise; i++)
+		if (!cfg80211_supported_cipher_suite(wiphy,
+						     settings->ciphers_pairwise[i]))
+			return -EINVAL;
+
+	if (settings->cipher_group &&
+	    !cfg80211_supported_cipher_suite(wiphy, settings->cipher_group))
+		return -EINVAL;
+
+	if (settings->n_akm_suites > wiphy->max_num_akm_suites)
+		return -EINVAL;
+
+	if (settings->psk &&
+	    !wiphy_ext_feature_isset(wiphy,
+				     NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK) &&
+	    !wiphy_ext_feature_isset(wiphy,
+				     NL80211_EXT_FEATURE_4WAY_HANDSHAKE_AP_PSK))
+		return -EINVAL;
+
+	if (settings->sae_pwd &&
+	    !wiphy_ext_feature_isset(wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD) &&
+	    !wiphy_ext_feature_isset(wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD_AP))
+		return -EINVAL;
+
+	return 0;
+}
+
 static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
 				   struct genl_info *info,
 				   struct cfg80211_crypto_settings *settings,
@@ -12792,9 +12872,6 @@ static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
 		proto = nla_get_u16(
 			info->attrs[NL80211_ATTR_CONTROL_PORT_ETHERTYPE]);
 		settings->control_port_ethertype = cpu_to_be16(proto);
-		if (!(rdev->wiphy.flags & WIPHY_FLAG_CONTROL_PORT_PROTOCOL) &&
-		    proto != ETH_P_PAE)
-			return -EINVAL;
 		if (info->attrs[NL80211_ATTR_CONTROL_PORT_NO_ENCRYPT])
 			settings->control_port_no_encrypt = true;
 	} else
@@ -12814,7 +12891,7 @@ static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
 
 	if (info->attrs[NL80211_ATTR_CIPHER_SUITES_PAIRWISE]) {
 		void *data;
-		int len, i;
+		int len;
 
 		data = nla_data(info->attrs[NL80211_ATTR_CIPHER_SUITES_PAIRWISE]);
 		len = nla_len(info->attrs[NL80211_ATTR_CIPHER_SUITES_PAIRWISE]);
@@ -12827,19 +12904,12 @@ static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
 			return -EINVAL;
 
 		memcpy(settings->ciphers_pairwise, data, len);
-
-		for (i = 0; i < settings->n_ciphers_pairwise; i++)
-			if (!cfg80211_supported_cipher_suite(
-					&rdev->wiphy,
-					settings->ciphers_pairwise[i]))
-				return -EINVAL;
 	}
 
 	if (info->attrs[NL80211_ATTR_CIPHER_SUITE_GROUP]) {
 		settings->cipher_group =
 			nla_get_u32(info->attrs[NL80211_ATTR_CIPHER_SUITE_GROUP]);
-		if (!cfg80211_supported_cipher_suite(&rdev->wiphy,
-						     settings->cipher_group))
+		if (!settings->cipher_group)
 			return -EINVAL;
 	}
 
@@ -12867,20 +12937,10 @@ static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
 	if (info->attrs[NL80211_ATTR_PMK]) {
 		if (nla_len(info->attrs[NL80211_ATTR_PMK]) != WLAN_PMK_LEN)
 			return -EINVAL;
-		if (!wiphy_ext_feature_isset(&rdev->wiphy,
-					     NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK) &&
-		    !wiphy_ext_feature_isset(&rdev->wiphy,
-					     NL80211_EXT_FEATURE_4WAY_HANDSHAKE_AP_PSK))
-			return -EINVAL;
 		settings->psk = nla_data(info->attrs[NL80211_ATTR_PMK]);
 	}
 
 	if (info->attrs[NL80211_ATTR_SAE_PASSWORD]) {
-		if (!wiphy_ext_feature_isset(&rdev->wiphy,
-					     NL80211_EXT_FEATURE_SAE_OFFLOAD) &&
-		    !wiphy_ext_feature_isset(&rdev->wiphy,
-					     NL80211_EXT_FEATURE_SAE_OFFLOAD_AP))
-			return -EINVAL;
 		settings->sae_pwd =
 			nla_data(info->attrs[NL80211_ATTR_SAE_PASSWORD]);
 		settings->sae_pwd_len =
@@ -12891,7 +12951,7 @@ static int nl80211_crypto_settings(struct cfg80211_registered_device *rdev,
 		nla_get_u8_default(info->attrs[NL80211_ATTR_SAE_PWE],
 				   NL80211_SAE_PWE_UNSPECIFIED);
 
-	return 0;
+	return nl80211_check_crypto_settings(rdev, settings, cipher_limit);
 }
 
 static struct cfg80211_bss *nl80211_assoc_bss(struct cfg80211_registered_device *rdev,

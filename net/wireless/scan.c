@@ -1162,6 +1162,7 @@ void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev,
 	}
 
 	msg = nl80211_build_scan_msg(rdev, wdev, request->info.aborted);
+	cfg80211_client_scan_done(rdev_req, request->info.aborted);
 
 #ifdef CONFIG_CFG80211_WEXT
 	if (wdev->netdev && !request->info.aborted) {
@@ -1183,6 +1184,35 @@ void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev,
 		rdev->scan_msg = msg;
 	else
 		nl80211_send_scan_msg(rdev, msg);
+}
+
+int cfg80211_bss_refs_since(struct cfg80211_registered_device *rdev,
+			    unsigned long since, struct cfg80211_bss ***bss)
+{
+	struct cfg80211_internal_bss *entry;
+	struct cfg80211_bss **res;
+	int max, n = 0;
+
+	spin_lock_bh(&rdev->bss_lock);
+	max = rdev->bss_entries;
+	res = kmalloc_array(max ?: 1, sizeof(*res), GFP_ATOMIC);
+	if (!res) {
+		spin_unlock_bh(&rdev->bss_lock);
+		return -ENOMEM;
+	}
+
+	list_for_each_entry(entry, &rdev->bss_list, list) {
+		if (n == max)
+			break;
+		if (time_before(entry->ts, since))
+			continue;
+		bss_ref_get(rdev, entry);
+		res[n++] = &entry->pub;
+	}
+	spin_unlock_bh(&rdev->bss_lock);
+
+	*bss = res;
+	return n;
 }
 
 void __cfg80211_scan_done(struct wiphy *wiphy, struct wiphy_work *wk)

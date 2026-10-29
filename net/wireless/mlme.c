@@ -298,6 +298,8 @@ void cfg80211_michael_mic_failure(struct net_device *dev, const u8 *addr,
 
 	trace_cfg80211_michael_mic_failure(dev, addr, key_type, key_id, tsc);
 	nl80211_michael_mic_failure(rdev, dev, addr, key_type, key_id, tsc, gfp);
+	cfg80211_client_mic_failure(dev->ieee80211_ptr, addr, key_type, key_id,
+				    tsc);
 }
 EXPORT_SYMBOL(cfg80211_michael_mic_failure);
 

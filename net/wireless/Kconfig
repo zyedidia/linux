@@ -191,6 +191,28 @@ config CFG80211_WEXT
 	  Enable this option if you need old userspace for wireless
 	  extensions with cfg80211-based drivers.
 
+config CFG80211_CLIENT
+	bool "cfg80211 in-kernel client API"
+	depends on CFG80211
+	help
+	  An API for kernel code that drives a station interface as
+	  wpa_supplicant does through nl80211. It serves backends that
+	  export a wireless interface to another system.
+
+	  If unsure, say N.
+
+config CFG80211_CLIENT_TEST
+	tristate "Test of the cfg80211 in-kernel client API"
+	depends on CFG80211 && CFG80211_CLIENT && DEBUG_FS
+	help
+	  A test that scans, connects to an open network and disconnects
+	  through the client API. It runs when an interface, an SSID and a
+	  frequency in MHz are written to cfg80211_client_test/run in
+	  debugfs, for example "wlan0 my-network 2412". The write fails if
+	  the test fails, and the kernel log has the details.
+
+	  If unsure, say N.
+
 config CFG80211_KUNIT_TEST
 	tristate "KUnit tests for cfg80211" if !KUNIT_ALL_TESTS
 	depends on KUNIT

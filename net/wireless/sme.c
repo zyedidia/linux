@@ -770,6 +770,7 @@ void __cfg80211_connect_result(struct net_device *dev,
 	wdev->unprot_beacon_reported = 0;
 	nl80211_send_connect_result(wiphy_to_rdev(wdev->wiphy), dev, cr,
 				    GFP_KERNEL);
+	cfg80211_client_connect_result(wdev, cr);
 	connected_addr = cr->valid_links ? cr->ap_mld_addr : cr->links[0].bssid;
 
 #ifdef CONFIG_CFG80211_WEXT
@@ -1365,6 +1366,7 @@ void __cfg80211_disconnected(struct net_device *dev, const u8 *ie,
 	wdev->connect_keys = NULL;
 
 	nl80211_send_disconnected(rdev, dev, reason, ie, ie_len, from_ap);
+	cfg80211_client_disconnected(wdev, reason, ie, ie_len, from_ap);
 
 	/* stop critical protocol if supported */
 	if (rdev->ops->crit_proto_stop && rdev->crit_proto_nlportid) {

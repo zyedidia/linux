@@ -2143,6 +2143,7 @@ static void reg_call_notifier(struct wiphy *wiphy,
 {
 	if (wiphy->reg_notifier)
 		wiphy->reg_notifier(wiphy, request);
+	cfg80211_client_reg_change(wiphy);
 }
 
 static void handle_reg_beacon(struct wiphy *wiphy, unsigned int chan_idx,

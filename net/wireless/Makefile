@@ -12,6 +12,8 @@ cfg80211-y += michael-mic.o pmsr.o
 cfg80211-$(CONFIG_OF) += of.o
 cfg80211-$(CONFIG_CFG80211_DEBUGFS) += debugfs.o
 cfg80211-$(CONFIG_CFG80211_WEXT) += wext-compat.o wext-sme.o
+cfg80211-$(CONFIG_CFG80211_CLIENT) += client.o
+obj-$(CONFIG_CFG80211_CLIENT_TEST) += cfg80211_client_test.o
 
 CFLAGS_trace.o := -I$(src)
 

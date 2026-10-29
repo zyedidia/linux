@@ -7195,6 +7195,7 @@ enum ieee80211_ap_reg_power {
  * @pmsr_free_wk: (private) peer measurements cleanup work
  * @unprot_beacon_reported: (private) timestamp of last
  *	unprotected beacon report
+ * @client: (private) The in-kernel client of the interface.
  * @links: array of %IEEE80211_MLD_MAX_NUM_LINKS elements containing @addr
  *	@ap and @client for each link
  * @links.cac_started: true if DFS channel availability check has been
@@ -7268,6 +7269,10 @@ struct wireless_dev {
 	struct wiphy_work pmsr_free_wk;
 
 	unsigned long unprot_beacon_reported;
+
+#ifdef CONFIG_CFG80211_CLIENT
+	struct cfg80211_client __rcu *client;
+#endif
 
 	union {
 		struct {
@@ -10991,5 +10996,196 @@ void cfg80211_incumbent_signal_notify(struct wiphy *wiphy,
 				      const struct cfg80211_chan_def *chandef,
 				      u32 signal_interference_bitmap,
 				      gfp_t gfp);
+
+#ifdef CONFIG_CFG80211_CLIENT
+/*
+ * An in-kernel client drives one station interface as wpa_supplicant does
+ * through nl80211. The calls run the checks of the matching nl80211
+ * commands. Opening and closing the interface, setting its MAC address and
+ * setting the country take the RTNL. The other calls take the wiphy lock.
+ * All calls but opening the interface, setting its MAC address and setting
+ * the country fail with -ENETDOWN while the interface is down, and every call
+ * fails with -ENODEV once the interface is gone. None of them may be called
+ * with the RTNL or the wiphy lock held.
+ */
+struct cfg80211_client;
+
+/**
+ * struct cfg80211_client_ops - notifications to an in-kernel client
+ *
+ * cfg80211 calls these where it sends the matching nl80211 events. A client
+ * must not call the client API from them.
+ *
+ * @scan_done: The scan that the client started has completed. It is called
+ *	with the wiphy lock held.
+ * @connect_result: A connection attempt has completed. It is called with
+ *	the wiphy lock held, and the parameters are valid only during the call.
+ * @disconnected: The connection has ended. It is called with the wiphy lock
+ *	held, and the IEs are valid only during the call.
+ * @mic_failure: A Michael MIC failure was detected. It may be called in
+ *	atomic context.
+ * @reg_change: The regulatory settings of the wiphy have changed. It is
+ *	called with the RTNL held, and may also be called with the wiphy lock
+ *	held or in atomic context.
+ * @gone: The interface is being unregistered. It is called with the RTNL
+ *	and the wiphy lock held.
+ */
+struct cfg80211_client_ops {
+	void (*scan_done)(void *priv, bool aborted);
+	void (*connect_result)(void *priv,
+			       const struct cfg80211_connect_resp_params *cr);
+	void (*disconnected)(void *priv, u16 reason, const u8 *ie,
+			     size_t ie_len, bool locally_generated);
+	void (*mic_failure)(void *priv, const u8 *addr,
+			    enum nl80211_key_type key_type, int key_id,
+			    const u8 *tsc);
+	void (*reg_change)(void *priv);
+	void (*gone)(void *priv);
+};
+
+/**
+ * struct cfg80211_client_scan_params - a scan started by a client
+ *
+ * @ssids: The SSIDs to scan for actively, or %NULL for a passive scan.
+ * @n_ssids: The number of SSIDs.
+ * @freqs: The frequencies in MHz, or %NULL for every usable channel.
+ * @n_freqs: The number of frequencies.
+ * @ie: Extra IEs for the Probe Requests.
+ * @ie_len: The length of @ie.
+ * @flags: The %NL80211_SCAN_FLAG_* flags.
+ * @bssid: The BSSID to scan for, or %NULL for any.
+ * @mac_addr: The address to scan from with %NL80211_SCAN_FLAG_RANDOM_ADDR.
+ * @mac_addr_mask: The bits of @mac_addr to keep. The others are random.
+ */
+struct cfg80211_client_scan_params {
+	const struct cfg80211_ssid *ssids;
+	int n_ssids;
+	const u32 *freqs;
+	int n_freqs;
+	const u8 *ie;
+	size_t ie_len;
+	u32 flags;
+	const u8 *bssid;
+	u8 mac_addr[ETH_ALEN];
+	u8 mac_addr_mask[ETH_ALEN];
+};
+
+/**
+ * cfg80211_client_register - become the client of a station interface
+ * @dev: The interface.
+ * @ops: The client's notifications.
+ * @priv: The value passed to each notification.
+ *
+ * An interface has at most one client. The registration keeps the wiphy's
+ * registered device alive until cfg80211_client_unregister().
+ *
+ * Return: the client, or an ERR_PTR() value.
+ */
+struct cfg80211_client *
+cfg80211_client_register(struct net_device *dev,
+			 const struct cfg80211_client_ops *ops, void *priv);
+
+/**
+ * cfg80211_client_unregister - stop being the client of an interface
+ * @client: The client.
+ *
+ * No notification runs after this returns.
+ */
+void cfg80211_client_unregister(struct cfg80211_client *client);
+
+int cfg80211_client_open(struct cfg80211_client *client);
+int cfg80211_client_close(struct cfg80211_client *client);
+
+/**
+ * cfg80211_client_scan - start a scan
+ * @client: The client.
+ * @params: The scan.
+ *
+ * Its completion is reported through @scan_done. Scans that cfg80211 or
+ * anyone else starts are not reported.
+ *
+ * Return: 0 on success, -EBUSY while another scan runs, or another error.
+ */
+int cfg80211_client_scan(struct cfg80211_client *client,
+			 const struct cfg80211_client_scan_params *params);
+
+/**
+ * cfg80211_client_abort_scan - abort the client's scan
+ * @client: The client.
+ *
+ * Return: 0 on success, -ENOENT if the client's scan is not running.
+ */
+int cfg80211_client_abort_scan(struct cfg80211_client *client);
+
+/**
+ * cfg80211_client_get_scan_bss - collect the results of the client's scan
+ * @client: The client.
+ * @bss: Set to an array of references to every BSS entry that was updated
+ *	since the client's last scan started, or since the client registered
+ *	if it has not scanned.
+ *
+ * The caller puts each entry with cfg80211_put_bss() and frees the array
+ * with kfree().
+ *
+ * Return: the number of entries, or a negative error.
+ */
+int cfg80211_client_get_scan_bss(struct cfg80211_client *client,
+				 struct cfg80211_bss ***bss);
+
+/**
+ * cfg80211_client_connect - connect with cfg80211's SME
+ * @client: The client.
+ * @params: The connection, as a driver's connect operation receives it.
+ *	The channels, if set, are channels of the interface's wiphy. A
+ *	static WEP key is given in @params->key, @params->key_len and
+ *	@params->key_idx.
+ *
+ * The outcome is reported through @connect_result.
+ *
+ * Return: 0 if the attempt started, or an error.
+ */
+int cfg80211_client_connect(struct cfg80211_client *client,
+			    const struct cfg80211_connect_params *params);
+int cfg80211_client_disconnect(struct cfg80211_client *client, u16 reason);
+
+int cfg80211_client_add_key(struct cfg80211_client *client, u8 key_idx,
+			    bool pairwise, const u8 *mac_addr,
+			    struct key_params *params);
+int cfg80211_client_del_key(struct cfg80211_client *client, u8 key_idx,
+			    bool pairwise, const u8 *mac_addr);
+int cfg80211_client_set_default_key(struct cfg80211_client *client,
+				    u8 key_idx, bool unicast, bool multicast);
+int cfg80211_client_set_default_mgmt_key(struct cfg80211_client *client,
+					 u8 key_idx);
+
+/**
+ * cfg80211_client_authorize - open or close the port of a peer
+ * @client: The client.
+ * @mac_addr: The peer.
+ * @authorized: Whether frames other than the control port's may pass.
+ *
+ * Return: 0 on success, or an error.
+ */
+int cfg80211_client_authorize(struct cfg80211_client *client,
+			      const u8 *mac_addr, bool authorized);
+
+/**
+ * cfg80211_client_get_station - get information about a peer
+ * @client: The client.
+ * @mac_addr: The peer.
+ * @sinfo: Filled with the information. On success, the caller releases it
+ *	with cfg80211_sinfo_release_content().
+ *
+ * Return: 0 on success, or an error.
+ */
+int cfg80211_client_get_station(struct cfg80211_client *client,
+				const u8 *mac_addr, struct station_info *sinfo);
+
+int cfg80211_client_set_power_mgmt(struct cfg80211_client *client,
+				   bool enabled, int timeout);
+int cfg80211_client_set_mac(struct cfg80211_client *client, const u8 *addr);
+int cfg80211_client_set_country(struct cfg80211_client *client,
+				const char *alpha2);
+#endif
 
 #endif /* __NET_CFG80211_H */
