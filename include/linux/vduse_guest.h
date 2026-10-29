@@ -7,15 +7,22 @@
 #include <linux/vringh.h>
 
 struct page;
+struct seq_file;
 struct vduse_guest_dev;
 struct vduse_guest_host;
 
-/* The device that a backend describes at setup. */
+/*
+ * The device that a backend describes at setup. Queue_sizes gives the size
+ * of each of the num_queues queues, each a power of 2. Allow_reconnect lets
+ * the device take over a device that an earlier guest left in use, and
+ * without it setup fails when it finds one.
+ */
 struct vduse_guest_config {
 	u32 device_id;
 	u64 features;
 	u32 num_queues;
-	u16 queue_size;
+	const u16 *queue_sizes;
+	bool allow_reconnect;
 	const void *config;
 	u32 config_size;
 };
@@ -25,7 +32,8 @@ struct vduse_guest_config {
  * data, and release frees it if the device cannot be created. Start runs
  * when the host's driver sets DRIVER_OK, and stop when it resets the
  * device. After stop returns, the backend makes no more calls on the queues
- * until the next start. Kick can run in interrupt context.
+ * until the next start. Kick can run in interrupt context. Show, if set,
+ * prints the backend's counters into /proc/vduse_guest.
  */
 struct vduse_guest_backend_ops {
 	const char *type;
@@ -35,6 +43,7 @@ struct vduse_guest_backend_ops {
 	int (*start)(void *priv);
 	void (*stop)(void *priv);
 	void (*kick)(void *priv, unsigned int index);
+	void (*show)(void *priv, struct seq_file *m);
 };
 
 extern const struct vduse_guest_backend_ops vduse_guest_blk_ops;

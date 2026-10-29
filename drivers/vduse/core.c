@@ -24,20 +24,20 @@
 
 #define VDUSE_GUEST_MAX_DEVICES 8
 #define VDUSE_GUEST_LOG_MAGIC 0x676f6c76
-#define VDUSE_GUEST_LOG_VERSION 1
+#define VDUSE_GUEST_LOG_VERSION 2
 
 /*
  * The in-flight log lives in host storage that outlives the guest, so that
  * the next guest can tell which requests were outstanding. A header is
- * followed by one area per queue, with an entry for each descriptor. The
- * header names the host device, which is new each time the device is
- * created.
+ * followed by one area per queue, with an entry for each descriptor. Each
+ * area starts where the previous one ends. The header names the host device,
+ * which is new each time the device is created.
  */
 struct vduse_guest_log_header {
 	u32 magic;
 	u32 version;
 	u32 num_queues;
-	u32 queue_size;
+	u32 pad;
 	u64 node_dev;
 	u64 node_ino;
 };
@@ -53,7 +53,9 @@ struct vduse_guest_log_queue {
 	/* The used index and the head of the last completion. */
 	u16 used_idx;
 	u16 last_head;
-	u8 pad[12];
+	/* The number of entries, which is the queue's size. */
+	u16 size;
+	u8 pad[10];
 	struct vduse_guest_log_desc desc[];
 };
 
@@ -101,6 +103,8 @@ struct vduse_guest_dev_stats {
 struct vduse_guest_vq {
 	struct vduse_guest_dev *dev;
 	unsigned int index;
+	/* The largest size that the driver may give the queue. */
+	u16 size;
 	struct vringh vrh;
 	/*
 	 * Protects the used ring and the log. The available ring is only
@@ -134,7 +138,6 @@ struct vduse_guest_dev {
 	void *host_data;
 	struct work_struct msg_work;
 
-	u16 queue_size;
 	unsigned int num_queues;
 	struct vduse_guest_vq *vqs;
 
@@ -628,10 +631,9 @@ bool vduse_guest_poll(struct vduse_guest_dev *dev, unsigned int index)
 	return false;
 }
 
-static size_t vduse_guest_log_queue_size(struct vduse_guest_dev *dev)
+static size_t vduse_guest_log_queue_size(struct vduse_guest_vq *vq)
 {
-	return struct_size_t(struct vduse_guest_log_queue, desc,
-			     dev->queue_size);
+	return struct_size_t(struct vduse_guest_log_queue, desc, vq->size);
 }
 
 static void vduse_guest_clear_log(struct vduse_guest_dev *dev)
@@ -641,7 +643,10 @@ static void vduse_guest_clear_log(struct vduse_guest_dev *dev)
 	for (i = 0; i < dev->num_queues; i++) {
 		struct vduse_guest_vq *vq = &dev->vqs[i];
 
-		memset(vq->log, 0, vduse_guest_log_queue_size(dev));
+		/* The size stays, so that a crash here leaves a valid log. */
+		vq->log->used_idx = 0;
+		vq->log->last_head = 0;
+		memset(vq->log->desc, 0, vq->size * sizeof(*vq->log->desc));
 		vq->counter = 0;
 		vduse_guest_free_replay(vq);
 	}
@@ -691,7 +696,7 @@ static int vduse_guest_recover_vq(struct vduse_guest_dev *dev,
 	if (!in)
 		return -ENOMEM;
 
-	for (i = 0; i < dev->queue_size; i++) {
+	for (i = 0; i < vq->size; i++) {
 		if (!log->desc[i].inflight)
 			continue;
 		if (i >= num) {
@@ -738,7 +743,10 @@ static int vduse_guest_start_vq(struct vduse_guest_dev *dev,
 	if (!vq->ready)
 		return 0;
 
+	/* The queue's area of the log has an entry for each possible head. */
 	num = info.num;
+	if (!num || num > vq->size)
+		return -EINVAL;
 	desc = vduse_guest_translate(dev, info.desc_addr,
 				     num * sizeof(struct vring_desc), false);
 	avail = vduse_guest_translate(dev, info.driver_addr,
@@ -1040,7 +1048,7 @@ static int __init vduse_guest_check_reconnect(struct vduse_guest_dev *dev,
 
 	for (i = 0; i < dev->num_queues; i++) {
 		err = dev->hops->vq_get_info(dev, i, &info);
-		if (err || info.num > dev->queue_size)
+		if (err || info.num > dev->vqs[i].size)
 			goto mismatch;
 	}
 	if (!dev->hops->vq_get_info(dev, dev->num_queues, &info))
@@ -1053,16 +1061,26 @@ mismatch:
 	return -EINVAL;
 }
 
+/*
+ * Each queue's area is checked only after the areas before it have matched,
+ * since a different size would move every area after it.
+ */
 static bool __init vduse_guest_log_matches(struct vduse_guest_dev *dev,
 					   u64 node_dev, u64 node_ino)
 {
 	struct vduse_guest_log_header *hdr = dev->log;
+	unsigned int i;
 
-	return hdr->magic == VDUSE_GUEST_LOG_MAGIC &&
-	       hdr->version == VDUSE_GUEST_LOG_VERSION &&
-	       hdr->num_queues == dev->num_queues &&
-	       hdr->queue_size == dev->queue_size &&
-	       hdr->node_dev == node_dev && hdr->node_ino == node_ino;
+	if (hdr->magic != VDUSE_GUEST_LOG_MAGIC ||
+	    hdr->version != VDUSE_GUEST_LOG_VERSION ||
+	    hdr->num_queues != dev->num_queues ||
+	    hdr->node_dev != node_dev || hdr->node_ino != node_ino)
+		return false;
+
+	for (i = 0; i < dev->num_queues; i++)
+		if (dev->vqs[i].log->size != dev->vqs[i].size)
+			return false;
+	return true;
 }
 
 /*
@@ -1072,9 +1090,9 @@ static bool __init vduse_guest_log_matches(struct vduse_guest_dev *dev,
  */
 static int __init vduse_guest_open_log(struct vduse_guest_dev *dev)
 {
-	size_t qsize = vduse_guest_log_queue_size(dev);
 	struct vduse_guest_log_header *hdr;
 	u64 node_dev, node_ino;
+	size_t offset;
 	unsigned int i;
 	int err;
 
@@ -1082,12 +1100,13 @@ static int __init vduse_guest_open_log(struct vduse_guest_dev *dev)
 	if (err)
 		return err;
 
-	dev->log_size = sizeof(*hdr) + dev->num_queues * qsize;
+	dev->log_size = sizeof(*hdr);
+	for (i = 0; i < dev->num_queues; i++)
+		dev->log_size += vduse_guest_log_queue_size(&dev->vqs[i]);
+
 	err = dev->hops->map_log(dev, dev->log_size, !dev->reconnect,
 				 &dev->log);
-	if (err == -EINVAL ||
-	    (!err && dev->reconnect &&
-	     !vduse_guest_log_matches(dev, node_dev, node_ino))) {
+	if (err == -EINVAL) {
 		pr_err("%s: the in-flight log does not describe this device\n",
 		       dev->name);
 		return -EINVAL;
@@ -1095,19 +1114,30 @@ static int __init vduse_guest_open_log(struct vduse_guest_dev *dev)
 	if (err)
 		return err;
 
-	hdr = dev->log;
-	if (!dev->reconnect) {
-		memset(dev->log, 0, dev->log_size);
-		hdr->magic = VDUSE_GUEST_LOG_MAGIC;
-		hdr->version = VDUSE_GUEST_LOG_VERSION;
-		hdr->num_queues = dev->num_queues;
-		hdr->queue_size = dev->queue_size;
-		hdr->node_dev = node_dev;
-		hdr->node_ino = node_ino;
+	offset = sizeof(*hdr);
+	for (i = 0; i < dev->num_queues; i++) {
+		dev->vqs[i].log = dev->log + offset;
+		offset += vduse_guest_log_queue_size(&dev->vqs[i]);
 	}
 
+	if (dev->reconnect) {
+		if (!vduse_guest_log_matches(dev, node_dev, node_ino)) {
+			pr_err("%s: the in-flight log does not describe this device\n",
+			       dev->name);
+			return -EINVAL;
+		}
+		return 0;
+	}
+
+	memset(dev->log, 0, dev->log_size);
+	hdr = dev->log;
+	hdr->magic = VDUSE_GUEST_LOG_MAGIC;
+	hdr->version = VDUSE_GUEST_LOG_VERSION;
+	hdr->num_queues = dev->num_queues;
+	hdr->node_dev = node_dev;
+	hdr->node_ino = node_ino;
 	for (i = 0; i < dev->num_queues; i++)
-		dev->vqs[i].log = dev->log + sizeof(*hdr) + i * qsize;
+		dev->vqs[i].log->size = dev->vqs[i].size;
 	return 0;
 }
 
@@ -1136,7 +1166,7 @@ static int __init vduse_guest_open_vqs(struct vduse_guest_dev *dev)
 
 	for (i = 0; i < dev->num_queues; i++) {
 		if (!dev->reconnect) {
-			err = dev->hops->vq_setup(dev, i, dev->queue_size);
+			err = dev->hops->vq_setup(dev, i, dev->vqs[i].size);
 			if (err)
 				goto close;
 		}
@@ -1184,11 +1214,13 @@ static int __init vduse_guest_setup(struct vduse_guest_dev *dev)
 	if (IS_ERR(dev->priv))
 		return PTR_ERR(dev->priv);
 
-	if (!cfg.num_queues || !is_power_of_2(cfg.queue_size))
+	if (!cfg.num_queues || !cfg.queue_sizes)
 		return -EINVAL;
+	for (i = 0; i < cfg.num_queues; i++)
+		if (!is_power_of_2(cfg.queue_sizes[i]))
+			return -EINVAL;
 
 	dev->num_queues = cfg.num_queues;
-	dev->queue_size = cfg.queue_size;
 	dev->vqs = kzalloc_objs(*dev->vqs, dev->num_queues);
 	if (!dev->vqs)
 		return -ENOMEM;
@@ -1196,6 +1228,7 @@ static int __init vduse_guest_setup(struct vduse_guest_dev *dev)
 	for (i = 0; i < dev->num_queues; i++) {
 		dev->vqs[i].dev = dev;
 		dev->vqs[i].index = i;
+		dev->vqs[i].size = cfg.queue_sizes[i];
 		spin_lock_init(&dev->vqs[i].lock);
 	}
 
@@ -1210,6 +1243,14 @@ static int __init vduse_guest_setup(struct vduse_guest_dev *dev)
 			pr_err("%s: another process serves the device\n",
 			       dev->name);
 		goto destroy;
+	}
+
+	/* Once the open succeeds, no other process serves the device. */
+	if (dev->reconnect && !cfg.allow_reconnect) {
+		pr_err("%s: an earlier guest left the device in use, and a %s device cannot take it over, run 'vdpa dev del %s' on the host\n",
+		       dev->name, dev->type, dev->name);
+		err = -EBUSY;
+		goto close;
 	}
 
 	if (dev->reconnect) {
@@ -1426,6 +1467,8 @@ static void vduse_guest_show_device(struct seq_file *m,
 	vduse_guest_show_counter(m, 2, "iova_map_errors", &stats->map_errors);
 	vduse_guest_show_counter(m, 2, "reconnects", &stats->reconnects);
 	vduse_guest_show_counter(m, 2, "umem_regs", &stats->umem_regs);
+	if (dev->ops->show)
+		dev->ops->show(dev->priv, m);
 
 	for (i = 0; i < dev->num_queues; i++) {
 		struct vduse_guest_vq_stats *q = &dev->vqs[i].stats;

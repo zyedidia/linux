@@ -439,6 +439,11 @@ static void vduse_guest_blk_stop(void *priv)
 	wait_event(blk->idle, !atomic_read(&blk->inflight));
 }
 
+/* Every queue has the same size. */
+static const u16 vduse_guest_blk_queue_sizes[VDUSE_GUEST_BLK_MAX_QUEUES] = {
+	[0 ... VDUSE_GUEST_BLK_MAX_QUEUES - 1] = VDUSE_GUEST_BLK_QUEUE_SIZE,
+};
+
 static void *__init vduse_guest_blk_setup(struct vduse_guest_dev *dev,
 					  char *opts,
 					  struct vduse_guest_config *cfg)
@@ -518,7 +523,9 @@ static void *__init vduse_guest_blk_setup(struct vduse_guest_dev *dev,
 			BIT_ULL(VIRTIO_BLK_F_FLUSH) |
 			BIT_ULL(VIRTIO_BLK_F_MQ);
 	cfg->num_queues = nr_queues;
-	cfg->queue_size = VDUSE_GUEST_BLK_QUEUE_SIZE;
+	cfg->queue_sizes = vduse_guest_blk_queue_sizes;
+	/* Replaying a read, write or flush is harmless. */
+	cfg->allow_reconnect = true;
 	cfg->config = &blk->config;
 	cfg->config_size = sizeof(blk->config);
 
