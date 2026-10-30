@@ -5,6 +5,7 @@
  * everything it sends is checked before it reaches cfg80211.
  */
 
+#include <linux/ctype.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
@@ -27,6 +28,7 @@
 #define VIRTIO_WLAN_MAX_SCAN_SSIDS	16
 #define VIRTIO_WLAN_MAX_SCAN_IE_LEN	2048
 #define VIRTIO_WLAN_TX_TIMEOUT		(5 * HZ)
+#define VIRTIO_WLAN_TX_WATCH		(5 * HZ)
 #define VIRTIO_WLAN_EAPOL_TXQ_LEN	64
 
 /*
@@ -107,8 +109,15 @@ static const u32 virtio_wlan_ciphers[] = {
 	WLAN_CIPHER_SUITE_BIP_GMAC_256,
 };
 
+/*
+ * For each channel, reg_flags holds the flags that cfg80211 computed at the
+ * latest regulatory update, and country_flags the restrictions of the
+ * device's latest COUNTRY event, which apply on top of them.
+ */
 struct virtio_wlan_band_data {
 	struct ieee80211_supported_band sband;
+	u32 *reg_flags;
+	u32 *country_flags;
 	struct ieee80211_rate rates[ARRAY_SIZE(virtio_wlan_rates)];
 	struct ieee80211_sband_iftype_data iftd;
 };
@@ -204,6 +213,21 @@ struct virtio_wlan {
 	struct wiphy_delayed_work event_work;
 	struct wiphy_delayed_work scan_timeout;
 	struct wiphy_delayed_work conn_timeout;
+	/*
+	 * Country_work sends the host's country to the device. Country holds
+	 * its two letters and is written under the RTNL. Country_apply
+	 * applies the device's restrictions under the RTNL. While the
+	 * interface is up, tx_watch checks that the device sends the frames
+	 * in the ring, by tx_reclaimed, which counts the frames reclaimed
+	 * under the tx lock, and otherwise asks the device about the
+	 * connection, so that a device that has stopped answering is found.
+	 */
+	struct wiphy_work country_work;
+	u16 country;
+	struct work_struct country_apply;
+	struct wiphy_delayed_work tx_watch;
+	u64 tx_reclaimed;
+	u64 tx_watched;
 	/* These are changed under the wiphy lock. */
 	bool removing;
 	bool broken;
@@ -214,6 +238,7 @@ struct virtio_wlan {
 	u32 conn_id;
 	u8 conn_ssid[IEEE80211_MAX_SSID_LEN];
 	u8 conn_ssid_len;
+	u8 conn_bssid[ETH_ALEN];
 	/*
 	 * Control_port is the connection's control port ethertype, which
 	 * connect sets and the data path reads without a lock. Eapol_pending
@@ -383,13 +408,24 @@ static int virtio_wlan_cmd(struct virtio_wlan *vw, u16 type, const void *req,
 	return 0;
 }
 
+static u32 virtio_wlan_wire_flags(__le32 in)
+{
+	u32 wire = le32_to_cpu(in), flags = 0;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(virtio_wlan_chan_flags); i++)
+		if (wire & virtio_wlan_chan_flags[i].wire)
+			flags |= virtio_wlan_chan_flags[i].kernel;
+	return flags;
+}
+
 static int virtio_wlan_add_channels(struct ieee80211_supported_band *sband,
 				    u8 band,
 				    const struct virtio_wlan_channel *in,
 				    unsigned int n)
 {
 	struct ieee80211_channel *chans;
-	unsigned int i, j;
+	unsigned int i;
 	u16 prev = 0;
 
 	chans = kcalloc(n, sizeof(*chans), GFP_KERNEL);
@@ -398,7 +434,6 @@ static int virtio_wlan_add_channels(struct ieee80211_supported_band *sband,
 
 	for (i = 0; i < n; i++) {
 		u16 freq = le16_to_cpu(in[i].freq);
-		u32 flags = le32_to_cpu(in[i].flags);
 		struct cfg80211_chan_def def;
 
 		chans[i].band = sband->band;
@@ -421,9 +456,7 @@ static int virtio_wlan_add_channels(struct ieee80211_supported_band *sband,
 
 		chans[i].max_power = min_t(u16, le16_to_cpu(in[i].max_power),
 					   VIRTIO_WLAN_MAX_POWER);
-		for (j = 0; j < ARRAY_SIZE(virtio_wlan_chan_flags); j++)
-			if (flags & virtio_wlan_chan_flags[j].wire)
-				chans[i].flags |= virtio_wlan_chan_flags[j].kernel;
+		chans[i].flags = virtio_wlan_wire_flags(in[i].flags);
 	}
 
 	sband->channels = chans;
@@ -495,7 +528,7 @@ static int virtio_wlan_add_band(struct virtio_wlan *vw,
 	struct virtio_wlan_band_data *data = &vw->bands[in->band];
 	struct ieee80211_supported_band *sband = &data->sband;
 	unsigned int first = virtio_wlan_bands[in->band].first_rate;
-	unsigned int n = le16_to_cpu(in->n_channels);
+	unsigned int n = le16_to_cpu(in->n_channels), i;
 	int err;
 
 	if (!n) {
@@ -513,6 +546,13 @@ static int virtio_wlan_add_band(struct virtio_wlan *vw,
 				       n);
 	if (err)
 		return err;
+	data->reg_flags = kcalloc(n, sizeof(*data->reg_flags), GFP_KERNEL);
+	data->country_flags = kcalloc(n, sizeof(*data->country_flags),
+				      GFP_KERNEL);
+	if (!data->reg_flags || !data->country_flags)
+		return -ENOMEM;
+	for (i = 0; i < sband->n_channels; i++)
+		data->reg_flags[i] = sband->channels[i].flags;
 
 	memcpy(data->rates, &virtio_wlan_rates[first],
 	       sizeof(virtio_wlan_rates) - first * sizeof(virtio_wlan_rates[0]));
@@ -1430,6 +1470,7 @@ static void virtio_wlan_event_connect_result(struct virtio_wlan *vw,
 			return;
 		}
 		cr.links[0].bssid = cr.links[0].bss->bssid;
+		ether_addr_copy(vw->conn_bssid, cr.links[0].bssid);
 		vw->conn_state = VIRTIO_WLAN_CONNECTED;
 		wiphy_delayed_work_cancel(vw->wiphy, &vw->conn_timeout);
 		netif_carrier_on(vw->netdev);
@@ -1526,6 +1567,157 @@ static void virtio_wlan_event_mic_failure(struct virtio_wlan *vw,
 				     key_id, NULL, GFP_KERNEL);
 }
 
+/* Add the device's restrictions to the flags that cfg80211 computed. */
+static void virtio_wlan_apply_country(struct virtio_wlan *vw)
+{
+	struct virtio_wlan_band_data *data;
+	unsigned int b, i;
+
+	ASSERT_RTNL();
+
+	for (b = 0; b < ARRAY_SIZE(vw->bands); b++) {
+		data = &vw->bands[b];
+		for (i = 0; data->country_flags && i < data->sband.n_channels;
+		     i++)
+			data->sband.channels[i].flags = data->reg_flags[i] |
+				READ_ONCE(data->country_flags[i]);
+	}
+}
+
+static void virtio_wlan_country_apply(struct work_struct *work)
+{
+	struct virtio_wlan *vw = container_of(work, struct virtio_wlan,
+					      country_apply);
+
+	rtnl_lock();
+	virtio_wlan_apply_country(vw);
+	rtnl_unlock();
+}
+
+/*
+ * The flags that a COUNTRY event may add. IR_CONCURRENT would lift a
+ * restriction, so it is not taken.
+ */
+#define VIRTIO_WLAN_COUNTRY_FLAGS	(~IEEE80211_CHAN_IR_CONCURRENT)
+
+/*
+ * The device reports the restrictions of its own regulatory domain, which
+ * can be stricter than the host's, for example those of its firmware. They
+ * must name the device's channels, and replace the earlier report. The
+ * event work holds the wiphy lock, which nests inside the RTNL, so the
+ * flags are applied by a work of their own.
+ */
+static void virtio_wlan_event_country(struct virtio_wlan *vw, const void *p,
+				      size_t len)
+{
+	const struct virtio_wlan_event_country *e = p;
+	const struct virtio_wlan_channel *in = (const void *)(e + 1);
+	unsigned int n, i, b, c;
+	u32 flags;
+
+	if (len < sizeof(*e)) {
+		vw->stats.bad_events++;
+		return;
+	}
+	n = le16_to_cpu(e->n_channels);
+	if (len != sizeof(*e) + n * sizeof(*in)) {
+		vw->stats.bad_events++;
+		return;
+	}
+
+	/*
+	 * Each channel's restrictions are written once, so that the notifier
+	 * never sees a channel without them.
+	 */
+	for (b = 0; b < ARRAY_SIZE(vw->bands); b++) {
+		struct virtio_wlan_band_data *data = &vw->bands[b];
+
+		for (c = 0; data->country_flags && c < data->sband.n_channels;
+		     c++) {
+			struct ieee80211_channel *chan = &data->sband.channels[c];
+
+			flags = 0;
+			for (i = 0; i < n; i++)
+				if (le16_to_cpu(in[i].freq) == chan->center_freq)
+					flags = virtio_wlan_wire_flags(in[i].flags);
+			WRITE_ONCE(data->country_flags[c],
+				   flags & VIRTIO_WLAN_COUNTRY_FLAGS);
+		}
+	}
+	schedule_work(&vw->country_apply);
+}
+
+static void virtio_wlan_country_work(struct wiphy *wiphy,
+				     struct wiphy_work *work)
+{
+	struct virtio_wlan *vw = wiphy_priv(wiphy);
+	struct virtio_wlan_set_country c = {};
+	u16 country = READ_ONCE(vw->country);
+
+	c.alpha2[0] = country >> 8;
+	c.alpha2[1] = country & 0xff;
+	virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_SET_COUNTRY, &c, sizeof(c), NULL,
+			0, NULL);
+}
+
+/*
+ * cfg80211 calls this under the RTNL, after it has computed the channels'
+ * flags again from their original ones. A country that the user sets goes
+ * to the device as well, from a work, since this does not hold the wiphy
+ * lock. The world domain and the intersections are not countries.
+ */
+static void virtio_wlan_reg_notifier(struct wiphy *wiphy,
+				     struct regulatory_request *request)
+{
+	struct virtio_wlan *vw = wiphy_priv(wiphy);
+	struct virtio_wlan_band_data *data;
+	unsigned int b, i;
+
+	for (b = 0; b < ARRAY_SIZE(vw->bands); b++) {
+		data = &vw->bands[b];
+		for (i = 0; data->reg_flags && i < data->sband.n_channels; i++)
+			data->reg_flags[i] = data->sband.channels[i].flags;
+	}
+	virtio_wlan_apply_country(vw);
+	if (request->initiator == NL80211_REGDOM_SET_BY_USER &&
+	    isupper(request->alpha2[0]) && isupper(request->alpha2[1])) {
+		WRITE_ONCE(vw->country,
+			   request->alpha2[0] << 8 | request->alpha2[1]);
+		wiphy_work_queue(wiphy, &vw->country_work);
+	}
+}
+
+/*
+ * TCP stops sending long before the ring is full, so a tx timeout alone
+ * would not find a dead device. A command that times out marks the device
+ * broken and ends the connection. A device that answers costs one command
+ * per stall.
+ */
+static void virtio_wlan_tx_watch(struct wiphy *wiphy, struct wiphy_work *work)
+{
+	struct virtio_wlan *vw = wiphy_priv(wiphy);
+	struct virtio_wlan_station_info sta;
+	struct virtio_wlan_get_station g = {};
+	u64 reclaimed;
+	bool stuck;
+
+	if (vw->removing || vw->broken)
+		return;
+	reclaimed = READ_ONCE(vw->tx_reclaimed);
+	stuck = READ_ONCE(vw->tx_vq->num_free) <
+		virtqueue_get_vring_size(vw->tx_vq) &&
+		reclaimed == vw->tx_watched;
+	vw->tx_watched = reclaimed;
+	if (stuck && vw->conn_state == VIRTIO_WLAN_CONNECTED) {
+		ether_addr_copy(g.peer, vw->conn_bssid);
+		virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_GET_STATION, &g, sizeof(g),
+				&sta, sizeof(sta), NULL);
+	}
+	if (!vw->broken)
+		wiphy_delayed_work_queue(wiphy, &vw->tx_watch,
+					 VIRTIO_WLAN_TX_WATCH);
+}
+
 static void virtio_wlan_handle_event(struct virtio_wlan *vw, const void *buf,
 				     unsigned int len)
 {
@@ -1552,6 +1744,9 @@ static void virtio_wlan_handle_event(struct virtio_wlan *vw, const void *buf,
 		break;
 	case VIRTIO_WLAN_EVENT_DISCONNECTED:
 		virtio_wlan_event_disconnected(vw, hdr + 1, n);
+		break;
+	case VIRTIO_WLAN_EVENT_COUNTRY:
+		virtio_wlan_event_country(vw, hdr + 1, n);
 		break;
 	case VIRTIO_WLAN_EVENT_MIC_FAILURE:
 		virtio_wlan_event_mic_failure(vw, hdr + 1, n);
@@ -1786,8 +1981,10 @@ static void virtio_wlan_free_tx(struct virtio_wlan *vw, int budget)
 			virtio_wlan_eapol_done(vw);
 		napi_consume_skb(skb, budget);
 	}
-	if (packets)
+	if (packets) {
 		dev_sw_netstats_tx_add(vw->netdev, packets, bytes);
+		WRITE_ONCE(vw->tx_reclaimed, vw->tx_reclaimed + packets);
+	}
 }
 
 /*
@@ -1924,6 +2121,35 @@ static void virtio_wlan_tx_timeout(struct net_device *dev, unsigned int txqueue)
 
 	vw->stats.tx_timeouts++;
 	virtio_wlan_napi_schedule(&vw->tx_napi, vw->tx_vq);
+	wiphy_delayed_work_queue(vw->wiphy, &vw->tx_watch, 0);
+}
+
+/*
+ * The device takes a new address only while it is closed, as mac80211
+ * does.
+ */
+static int virtio_wlan_set_mac_address(struct net_device *dev, void *p)
+{
+	struct virtio_wlan *vw = wiphy_priv(dev->ieee80211_ptr->wiphy);
+	struct virtio_wlan_set_mac m = {};
+	struct sockaddr *sa = p;
+	int err;
+
+	if (!virtio_has_feature(vw->vdev, VIRTIO_WLAN_F_SET_MAC))
+		return -EOPNOTSUPP;
+	if (netif_running(dev))
+		return -EBUSY;
+	if (!is_valid_ether_addr(sa->sa_data))
+		return -EADDRNOTAVAIL;
+
+	ether_addr_copy(m.addr, sa->sa_data);
+	wiphy_lock(vw->wiphy);
+	err = virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_SET_MAC, &m, sizeof(m), NULL,
+			      0, NULL);
+	wiphy_unlock(vw->wiphy);
+	if (!err)
+		eth_hw_addr_set(dev, sa->sa_data);
+	return err;
 }
 
 /* Buffers that the device used while the interface was down are polled now. */
@@ -1934,6 +2160,11 @@ static int virtio_wlan_open(struct net_device *dev)
 
 	wiphy_lock(vw->wiphy);
 	err = virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_OPEN, NULL, 0, NULL, 0, NULL);
+	if (!err) {
+		vw->tx_watched = READ_ONCE(vw->tx_reclaimed);
+		wiphy_delayed_work_queue(vw->wiphy, &vw->tx_watch,
+					 VIRTIO_WLAN_TX_WATCH);
+	}
 	wiphy_unlock(vw->wiphy);
 	if (err)
 		return err;
@@ -1967,6 +2198,7 @@ static int virtio_wlan_stop(struct net_device *dev)
 	 * after the purge.
 	 */
 	guard(wiphy)(vw->wiphy);
+	wiphy_delayed_work_cancel(vw->wiphy, &vw->tx_watch);
 	__netif_tx_lock_bh(netdev_get_tx_queue(dev, 0));
 	virtio_wlan_purge_eapol(vw);
 	__netif_tx_unlock_bh(netdev_get_tx_queue(dev, 0));
@@ -2040,8 +2272,30 @@ static const struct net_device_ops virtio_wlan_netdev_ops = {
 	.ndo_stop = virtio_wlan_stop,
 	.ndo_start_xmit = virtio_wlan_start_xmit,
 	.ndo_tx_timeout = virtio_wlan_tx_timeout,
+	.ndo_set_mac_address = virtio_wlan_set_mac_address,
 	.ndo_validate_addr = eth_validate_addr,
 };
+
+/*
+ * While the interface is down, the setting is only kept, since cfg80211
+ * applies it again when the interface comes up.
+ */
+static int virtio_wlan_set_power_mgmt(struct wiphy *wiphy,
+				      struct net_device *dev, bool enabled,
+				      int timeout)
+{
+	struct virtio_wlan *vw = wiphy_priv(wiphy);
+	struct virtio_wlan_set_power_mgmt pm = {
+		.enabled = enabled,
+		.timeout = cpu_to_le32(timeout < 0 ?
+				       VIRTIO_WLAN_PS_TIMEOUT_DEFAULT : timeout),
+	};
+
+	if (!netif_running(dev))
+		return 0;
+	return virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_SET_POWER_MGMT, &pm,
+			       sizeof(pm), NULL, 0, NULL);
+}
 
 static const struct cfg80211_ops virtio_wlan_cfg80211_ops = {
 	.scan = virtio_wlan_scan,
@@ -2053,6 +2307,7 @@ static const struct cfg80211_ops virtio_wlan_cfg80211_ops = {
 	.set_default_key = virtio_wlan_set_default_key,
 	.set_default_mgmt_key = virtio_wlan_set_default_mgmt_key,
 	.change_station = virtio_wlan_change_station,
+	.set_power_mgmt = virtio_wlan_set_power_mgmt,
 	.get_station = virtio_wlan_get_station,
 	.tx_control_port = virtio_wlan_tx_control_port,
 	.dump_station = virtio_wlan_dump_station,
@@ -2168,8 +2423,11 @@ static void virtio_wlan_free(struct virtio_wlan *vw)
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(vw->bands); i++)
+	for (i = 0; i < ARRAY_SIZE(vw->bands); i++) {
 		kfree(vw->bands[i].sband.channels);
+		kfree(vw->bands[i].reg_flags);
+		kfree(vw->bands[i].country_flags);
+	}
 	for (i = 0; i < vw->n_event_bufs; i++)
 		kfree(vw->event_bufs[i]);
 	kfree(vw->event_bufs);
@@ -2223,6 +2481,9 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	wiphy_delayed_work_init(&vw->event_work, virtio_wlan_event_work);
 	wiphy_delayed_work_init(&vw->scan_timeout, virtio_wlan_scan_timeout);
 	wiphy_delayed_work_init(&vw->conn_timeout, virtio_wlan_conn_timeout);
+	wiphy_work_init(&vw->country_work, virtio_wlan_country_work);
+	wiphy_delayed_work_init(&vw->tx_watch, virtio_wlan_tx_watch);
+	INIT_WORK(&vw->country_apply, virtio_wlan_country_apply);
 
 	err = -ENOMEM;
 	vw->cmd_size = sizeof(struct virtio_wlan_cmd_hdr);
@@ -2272,6 +2533,7 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 			      NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211);
 	wiphy_ext_feature_set(wiphy,
 			      NL80211_EXT_FEATURE_CONTROL_PORT_NO_PREAUTH);
+	wiphy->reg_notifier = virtio_wlan_reg_notifier;
 	/* The device cannot lift restrictions through hints of its own. */
 	wiphy->regulatory_flags = REGULATORY_COUNTRY_IE_IGNORE |
 				  REGULATORY_DISABLE_BEACON_HINTS;
@@ -2346,12 +2608,16 @@ static void virtio_wlan_remove(struct virtio_device *vdev)
 	wiphy_delayed_work_cancel(wiphy, &vw->event_work);
 	wiphy_delayed_work_cancel(wiphy, &vw->scan_timeout);
 	wiphy_delayed_work_cancel(wiphy, &vw->conn_timeout);
+	wiphy_work_cancel(wiphy, &vw->country_work);
+	wiphy_delayed_work_cancel(wiphy, &vw->tx_watch);
 	wiphy_unlock(wiphy);
 
 	/* Unregistering closes the interface, which takes the wiphy lock. */
 	unregister_netdev(vw->netdev);
 	virtio_wlan_del_vqs(vw);
 	wiphy_unregister(wiphy);
+	/* No event can queue it again once the device is reset. */
+	cancel_work_sync(&vw->country_apply);
 	free_netdev(vw->netdev);
 	virtio_wlan_free(vw);
 	wiphy_free(wiphy);
@@ -2362,8 +2628,14 @@ static const struct virtio_device_id virtio_wlan_id_table[] = {
 	{ 0 },
 };
 
+static unsigned int virtio_wlan_features[] = {
+	VIRTIO_WLAN_F_SET_MAC,
+};
+
 static struct virtio_driver virtio_wlan_driver = {
 	.driver.name = KBUILD_MODNAME,
+	.feature_table = virtio_wlan_features,
+	.feature_table_size = ARRAY_SIZE(virtio_wlan_features),
 	.id_table = virtio_wlan_id_table,
 	.probe = virtio_wlan_probe,
 	.remove = virtio_wlan_remove,
