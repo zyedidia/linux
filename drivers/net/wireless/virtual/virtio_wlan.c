@@ -27,6 +27,7 @@
 #define VIRTIO_WLAN_MAX_SCAN_SSIDS	16
 #define VIRTIO_WLAN_MAX_SCAN_IE_LEN	2048
 #define VIRTIO_WLAN_TX_TIMEOUT		(5 * HZ)
+#define VIRTIO_WLAN_EAPOL_TXQ_LEN	64
 
 /*
  * An rx buffer holds the virtio header and the largest frame, which can have
@@ -112,7 +113,10 @@ struct virtio_wlan_band_data {
 	struct ieee80211_sband_iftype_data iftd;
 };
 
-/* The counters of misbehavior by the device, shown in debugfs. */
+/*
+ * The counters of misbehavior by the device, shown in debugfs, and of the
+ * frames that pass through the control port in either direction.
+ */
 struct virtio_wlan_stats {
 	u32 cmd_timeouts;
 	u32 bad_responses;
@@ -126,6 +130,9 @@ struct virtio_wlan_stats {
 	u32 bad_rx_frames;
 	u32 tx_timeouts;
 	u32 rx_post_errors;
+	u32 eapol_timeouts;
+	u32 control_port_frames;
+	u32 control_port_rx_frames;
 };
 
 static const struct {
@@ -146,6 +153,12 @@ static const struct {
 	{ "bad_rx_frames", offsetof(struct virtio_wlan_stats, bad_rx_frames) },
 	{ "tx_timeouts", offsetof(struct virtio_wlan_stats, tx_timeouts) },
 	{ "rx_post_errors", offsetof(struct virtio_wlan_stats, rx_post_errors) },
+	{ "eapol_timeouts",
+	  offsetof(struct virtio_wlan_stats, eapol_timeouts) },
+	{ "control_port_frames",
+	  offsetof(struct virtio_wlan_stats, control_port_frames) },
+	{ "control_port_rx_frames",
+	  offsetof(struct virtio_wlan_stats, control_port_rx_frames) },
 };
 
 enum virtio_wlan_conn_state {
@@ -201,8 +214,41 @@ struct virtio_wlan {
 	u32 conn_id;
 	u8 conn_ssid[IEEE80211_MAX_SSID_LEN];
 	u8 conn_ssid_len;
+	/*
+	 * Control_port is the connection's control port ethertype, which
+	 * connect sets and the data path reads without a lock. Eapol_pending
+	 * counts the frames sent through the control port, and the others of
+	 * that ethertype, that the driver has not reclaimed yet. It changes
+	 * only under the tx lock. Eapol_stuck is set when add_key gives up
+	 * waiting, and is cleared when the count reaches zero, so that later
+	 * keys do not wait for a frame that the device keeps.
+	 */
+	__be16 control_port;
+	atomic_t eapol_pending;
+	bool eapol_stuck;
+	/*
+	 * Control_port_nl80211 is set while the connection's control port
+	 * frames go through nl80211, and control_port_no_preauth while its
+	 * pre-authentication frames do not. Eapol_txq holds the frames that
+	 * tx_control_port counted but that have no room in the ring yet,
+	 * under the tx lock.
+	 */
+	bool control_port_nl80211;
+	bool control_port_no_preauth;
+	struct sk_buff_head eapol_txq;
+	wait_queue_head_t eapol_wait;
 	struct virtio_wlan_stats stats;
 };
+
+/* The tx state of a frame in the ring or in eapol_txq. */
+struct virtio_wlan_tx_cb {
+	bool eapol;
+};
+
+static struct virtio_wlan_tx_cb *virtio_wlan_tx_cb(struct sk_buff *skb)
+{
+	return (struct virtio_wlan_tx_cb *)skb->cb;
+}
 
 static void virtio_wlan_cmd_done(struct virtqueue *vq)
 {
@@ -871,6 +917,17 @@ static int virtio_wlan_connect(struct wiphy *wiphy, struct net_device *dev,
 	c->mfp = mfp;
 	virtio_wlan_fill_connect(c, sme);
 
+	/*
+	 * The rx poll reads these without the wiphy lock, and frames of the
+	 * attempt can arrive before the command returns. No connection is
+	 * live here, so they can change first.
+	 */
+	WRITE_ONCE(vw->control_port, sme->crypto.control_port_ethertype);
+	WRITE_ONCE(vw->control_port_nl80211,
+		   sme->crypto.control_port_over_nl80211);
+	WRITE_ONCE(vw->control_port_no_preauth,
+		   sme->crypto.control_port_no_preauth);
+
 	err = virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_CONNECT, c, len, NULL, 0,
 			      NULL);
 	kfree_sensitive(c);
@@ -933,6 +990,31 @@ static int virtio_wlan_add_key(struct wiphy *wiphy, struct wireless_dev *wdev,
 	if (params->key_len > VIRTIO_WLAN_KEY_LEN ||
 	    params->seq_len > VIRTIO_WLAN_SEQ_LEN)
 		return -EINVAL;
+	if (vw->removing || vw->broken)
+		return -ENODEV;
+
+	/*
+	 * The device picks a frame's key when it sends the frame, so the EAPOL
+	 * frames that it holds, such as message 4 of the 4-way handshake, are
+	 * sent before a new key reaches it. A device that keeps them delays
+	 * one key, and later keys do not wait until the frames are reclaimed.
+	 */
+	if (!READ_ONCE(vw->eapol_stuck) &&
+	    !wait_event_timeout(vw->eapol_wait,
+				!atomic_read(&vw->eapol_pending),
+				VIRTIO_WLAN_CMD_TIMEOUT)) {
+		WRITE_ONCE(vw->eapol_stuck, true);
+		/*
+		 * The count can reach zero before the flag is set, and the
+		 * barrier pairs with the one in atomic_dec_and_test().
+		 */
+		smp_mb();
+		if (!atomic_read(&vw->eapol_pending))
+			WRITE_ONCE(vw->eapol_stuck, false);
+		vw->stats.eapol_timeouts++;
+		dev_warn(&vw->vdev->dev,
+			 "the device did not send EAPOL frames before a key\n");
+	}
 
 	k.cipher = cpu_to_le32(params->cipher);
 	k.index = idx;
@@ -1625,6 +1707,22 @@ static void virtio_wlan_receive(struct virtio_wlan *vw, void *buf,
 	skb_put_data(skb, hdr + 1, frame_len);
 	skb->protocol = eth_type_trans(skb, dev);
 	dev_sw_netstats_rx_add(dev, frame_len);
+
+	/*
+	 * The device does not report whether a frame was protected, so a
+	 * control port frame is passed on as a protected one. Pre-auth frames
+	 * go the same way unless the connection asked otherwise, as in
+	 * mac80211.
+	 */
+	if (READ_ONCE(vw->control_port_nl80211) &&
+	    (skb->protocol == READ_ONCE(vw->control_port) ||
+	     (skb->protocol == htons(ETH_P_PREAUTH) &&
+	      !READ_ONCE(vw->control_port_no_preauth)))) {
+		vw->stats.control_port_rx_frames++;
+		cfg80211_rx_control_port(dev, skb, false, -1);
+		napi_consume_skb(skb, 1);
+		return;
+	}
 	napi_gro_receive(&vw->rx_napi, skb);
 }
 
@@ -1667,6 +1765,14 @@ static int virtio_wlan_rx_poll(struct napi_struct *napi, int budget)
 	return done;
 }
 
+static void virtio_wlan_eapol_done(struct virtio_wlan *vw)
+{
+	if (atomic_dec_and_test(&vw->eapol_pending)) {
+		WRITE_ONCE(vw->eapol_stuck, false);
+		wake_up(&vw->eapol_wait);
+	}
+}
+
 /* Free the frames that the device has sent, with the queue's lock held. */
 static void virtio_wlan_free_tx(struct virtio_wlan *vw, int budget)
 {
@@ -1676,10 +1782,49 @@ static void virtio_wlan_free_tx(struct virtio_wlan *vw, int budget)
 	while ((skb = virtqueue_get_buf(vw->tx_vq, &len))) {
 		packets++;
 		bytes += skb->len - sizeof(struct virtio_net_hdr_v1);
+		if (virtio_wlan_tx_cb(skb)->eapol)
+			virtio_wlan_eapol_done(vw);
 		napi_consume_skb(skb, budget);
 	}
 	if (packets)
 		dev_sw_netstats_tx_add(vw->netdev, packets, bytes);
+}
+
+/*
+ * Move the counted control port frames into the ring, ahead of the data
+ * frames, with the queue's lock held.
+ */
+static void virtio_wlan_flush_eapol(struct virtio_wlan *vw)
+{
+	struct virtio_net_hdr_v1 *hdr;
+	struct scatterlist sg;
+	struct sk_buff *skb;
+	bool added = false;
+
+	while (vw->tx_vq->num_free && (skb = __skb_dequeue(&vw->eapol_txq))) {
+		hdr = skb_push(skb, sizeof(*hdr));
+		memset(hdr, 0, sizeof(*hdr));
+		sg_init_one(&sg, skb->data, skb->len);
+		if (virtqueue_add_outbuf(vw->tx_vq, &sg, 1, skb, GFP_ATOMIC)) {
+			virtio_wlan_eapol_done(vw);
+			dev_core_stats_tx_dropped_inc(vw->netdev);
+			dev_kfree_skb_any(skb);
+			continue;
+		}
+		added = true;
+	}
+	if (added)
+		virtqueue_kick(vw->tx_vq);
+}
+
+static void virtio_wlan_purge_eapol(struct virtio_wlan *vw)
+{
+	struct sk_buff *skb;
+
+	while ((skb = __skb_dequeue(&vw->eapol_txq))) {
+		virtio_wlan_eapol_done(vw);
+		dev_kfree_skb_any(skb);
+	}
 }
 
 static int virtio_wlan_tx_poll(struct napi_struct *napi, int budget)
@@ -1692,6 +1837,7 @@ static int virtio_wlan_tx_poll(struct napi_struct *napi, int budget)
 	__netif_tx_lock(txq, raw_smp_processor_id());
 	virtqueue_disable_cb(vw->tx_vq);
 	virtio_wlan_free_tx(vw, budget);
+	virtio_wlan_flush_eapol(vw);
 	if (netif_tx_queue_stopped(txq) && vw->tx_vq->num_free)
 		netif_tx_wake_queue(txq);
 
@@ -1730,6 +1876,7 @@ static netdev_tx_t virtio_wlan_start_xmit(struct sk_buff *skb,
 	struct scatterlist sg;
 
 	virtio_wlan_free_tx(vw, 0);
+	virtio_wlan_flush_eapol(vw);
 	if (unlikely(!vw->tx_vq->num_free)) {
 		netif_stop_queue(dev);
 		return NETDEV_TX_BUSY;
@@ -1742,11 +1889,18 @@ static netdev_tx_t virtio_wlan_start_xmit(struct sk_buff *skb,
 	skb_tx_timestamp(skb);
 	if (skb_cow_head(skb, sizeof(*hdr)) || skb_linearize(skb))
 		goto drop;
+	/* The MAC header is not set on every path to the driver. */
+	virtio_wlan_tx_cb(skb)->eapol =
+		skb->len >= ETH_HLEN &&
+		((struct ethhdr *)skb->data)->h_proto ==
+		READ_ONCE(vw->control_port);
 	hdr = skb_push(skb, sizeof(*hdr));
 	memset(hdr, 0, sizeof(*hdr));
 	sg_init_one(&sg, skb->data, skb->len);
 	if (virtqueue_add_outbuf(vw->tx_vq, &sg, 1, skb, GFP_ATOMIC))
 		goto drop;
+	if (virtio_wlan_tx_cb(skb)->eapol)
+		atomic_inc(&vw->eapol_pending);
 
 	if (!vw->tx_vq->num_free)
 		netif_stop_queue(dev);
@@ -1807,13 +1961,77 @@ static int virtio_wlan_stop(struct net_device *dev)
 	napi_disable(&vw->rx_napi);
 	napi_disable(&vw->tx_napi);
 
+	/*
+	 * Tx_control_port runs under the wiphy lock and finds the interface
+	 * no longer running once this has the lock, so no frame is queued
+	 * after the purge.
+	 */
 	guard(wiphy)(vw->wiphy);
+	__netif_tx_lock_bh(netdev_get_tx_queue(dev, 0));
+	virtio_wlan_purge_eapol(vw);
+	__netif_tx_unlock_bh(netdev_get_tx_queue(dev, 0));
 	virtio_wlan_drop_conn(vw);
 	if (vw->scan_req) {
 		virtio_wlan_send_abort_scan(vw, vw->scan_id);
 		virtio_wlan_finish_scan(vw, true);
 	}
 	virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_CLOSE, NULL, 0, NULL, 0, NULL);
+	return 0;
+}
+
+/*
+ * A control port frame is counted before this returns, and so before
+ * userspace can install the key that the frame must precede, and it waits
+ * for room in the ring outside the qdisc. A device that keeps the ring full
+ * would make that queue grow, so it is bounded. The device has no way to
+ * send a frame unencrypted, so noencrypt is ignored, and the frame is
+ * encrypted only if the device holds a key, which userspace installs after
+ * it asks for an unencrypted frame.
+ */
+static int virtio_wlan_tx_control_port(struct wiphy *wiphy,
+				       struct net_device *dev, const u8 *buf,
+				       size_t len, const u8 *dest,
+				       const __be16 proto, const bool noencrypt,
+				       int link_id, u64 *cookie)
+{
+	struct virtio_wlan *vw = wiphy_priv(wiphy);
+	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
+	struct sk_buff *skb;
+	struct ethhdr *eth;
+
+	if (link_id >= 0)
+		return -EOPNOTSUPP;
+	if (proto != READ_ONCE(vw->control_port) &&
+	    proto != htons(ETH_P_PREAUTH))
+		return -EINVAL;
+	if (len > dev->mtu)
+		return -EMSGSIZE;
+	if (!netif_running(dev))
+		return -ENETDOWN;
+
+	skb = alloc_skb(sizeof(struct virtio_net_hdr_v1) + ETH_HLEN + len,
+			GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	skb_reserve(skb, sizeof(struct virtio_net_hdr_v1));
+	eth = skb_put(skb, ETH_HLEN);
+	ether_addr_copy(eth->h_dest, dest);
+	ether_addr_copy(eth->h_source, dev->dev_addr);
+	eth->h_proto = proto;
+	skb_put_data(skb, buf, len);
+	virtio_wlan_tx_cb(skb)->eapol = true;
+
+	__netif_tx_lock_bh(txq);
+	if (skb_queue_len(&vw->eapol_txq) >= VIRTIO_WLAN_EAPOL_TXQ_LEN) {
+		__netif_tx_unlock_bh(txq);
+		kfree_skb(skb);
+		return -ENOBUFS;
+	}
+	vw->stats.control_port_frames++;
+	atomic_inc(&vw->eapol_pending);
+	__skb_queue_tail(&vw->eapol_txq, skb);
+	virtio_wlan_flush_eapol(vw);
+	__netif_tx_unlock_bh(txq);
 	return 0;
 }
 
@@ -1836,6 +2054,7 @@ static const struct cfg80211_ops virtio_wlan_cfg80211_ops = {
 	.set_default_mgmt_key = virtio_wlan_set_default_mgmt_key,
 	.change_station = virtio_wlan_change_station,
 	.get_station = virtio_wlan_get_station,
+	.tx_control_port = virtio_wlan_tx_control_port,
 	.dump_station = virtio_wlan_dump_station,
 };
 
@@ -1998,6 +2217,9 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	vw->max_event_size = max_event_size;
 	vw->resp_size = max_wiphy_size;
 	init_completion(&vw->cmd_done);
+	init_waitqueue_head(&vw->eapol_wait);
+	skb_queue_head_init(&vw->eapol_txq);
+	vw->control_port = htons(ETH_P_PAE);
 	wiphy_delayed_work_init(&vw->event_work, virtio_wlan_event_work);
 	wiphy_delayed_work_init(&vw->scan_timeout, virtio_wlan_scan_timeout);
 	wiphy_delayed_work_init(&vw->conn_timeout, virtio_wlan_conn_timeout);
@@ -2044,6 +2266,10 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	memcpy(wiphy->perm_addr, mac, ETH_ALEN);
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+	wiphy_ext_feature_set(wiphy,
+			      NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211);
+	wiphy_ext_feature_set(wiphy,
+			      NL80211_EXT_FEATURE_CONTROL_PORT_NO_PREAUTH);
 	/* The device cannot lift restrictions through hints of its own. */
 	wiphy->regulatory_flags = REGULATORY_COUNTRY_IE_IGNORE |
 				  REGULATORY_DISABLE_BEACON_HINTS;
