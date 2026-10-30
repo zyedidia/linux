@@ -52,7 +52,8 @@ static const u16 vduse_guest_wlan_queue_sizes[VIRTIO_WLAN_VQ_MAX] = {
  * that found no memory or no interface. Rx_no_buffer counts the received
  * frames that found no buffer from the host, and rx_oversized those larger
  * than the MTU allows. Rx_bad_buffers counts the host's buffers that are too
- * small for a frame or cannot be written.
+ * small for a frame or cannot be written. Tx_chained counts the control port
+ * frames whose destructor completed their chain.
  */
 struct vduse_guest_wlan_stats {
 	atomic64_t commands;
@@ -64,10 +65,18 @@ struct vduse_guest_wlan_stats {
 	atomic64_t tx_invalid;
 	atomic64_t tx_spoofed;
 	atomic64_t tx_dropped;
+	atomic64_t tx_chained;
 	atomic64_t rx_frames;
 	atomic64_t rx_no_buffer;
 	atomic64_t rx_oversized;
 	atomic64_t rx_bad_buffers;
+};
+
+/* A control port frame's chain on the tx queue, completed by its destructor. */
+struct vduse_guest_wlan_tx_chain {
+	struct vduse_guest_wlan *wlan;
+	u16 head;
+	u32 gen;
 };
 
 /* A buffer that the host posted on the rx queue, waiting for a frame. */
@@ -159,7 +168,10 @@ struct vduse_guest_wlan {
 	 * the tx queue, tells that the drain can start before the next kick.
 	 * Tx_pending counts the frames that the guest's stack still holds. At
 	 * the limit the tx work sets tx_wake and stops, and the destructor
-	 * that next runs clears it and queues the work again.
+	 * that next runs clears it and queues the work again. Control_port is
+	 * the connection's control port ethertype, and tx_gen, under
+	 * data_lock, changes when the device stops, so that a control port
+	 * frame of an earlier start does not complete its chain.
 	 */
 	struct delayed_work rx_work;
 	struct work_struct tx_work;
@@ -170,6 +182,8 @@ struct vduse_guest_wlan {
 	atomic_t tx_pending;
 	unsigned long tx_wake;
 	unsigned long tx_kicked;
+	__be16 control_port;
+	u32 tx_gen;
 
 	struct vduse_guest_wlan_stats stats;
 };
@@ -777,13 +791,12 @@ static bool vduse_guest_wlan_data_running(struct vduse_guest_wlan *wlan)
 
 /*
  * A driver can free a frame at any time, also after the device has stopped.
- * It reads data_running, clears tx_wake and queues the work under data_lock,
- * so that stopping the data path either cancels the work or keeps it from
- * being queued.
+ * This reads data_running, clears tx_wake and queues the work under
+ * data_lock, so that stopping the data path either cancels the work or keeps
+ * it from being queued.
  */
-static void vduse_guest_wlan_tx_destructor(struct sk_buff *skb)
+static void vduse_guest_wlan_tx_release(struct vduse_guest_wlan *wlan)
 {
-	struct vduse_guest_wlan *wlan = skb_shinfo(skb)->destructor_arg;
 	unsigned long flags;
 
 	atomic_dec(&wlan->tx_pending);
@@ -797,6 +810,35 @@ static void vduse_guest_wlan_tx_destructor(struct sk_buff *skb)
 	spin_unlock_irqrestore(&wlan->data_lock, flags);
 }
 
+static void vduse_guest_wlan_tx_destructor(struct sk_buff *skb)
+{
+	vduse_guest_wlan_tx_release(skb_shinfo(skb)->destructor_arg);
+}
+
+/*
+ * A control port frame completes its chain once it leaves the guest's stack,
+ * so that the host sends a new key only after message 4 of the 4-way
+ * handshake has been sent with the old one.
+ */
+static void vduse_guest_wlan_tx_chain_destructor(struct sk_buff *skb)
+{
+	struct vduse_guest_wlan_tx_chain *chain =
+		skb_shinfo(skb)->destructor_arg;
+	struct vduse_guest_wlan *wlan = chain->wlan;
+	unsigned long flags;
+
+	spin_lock_irqsave(&wlan->data_lock, flags);
+	if ((wlan->data_running || wlan->tx_drain) &&
+	    chain->gen == wlan->tx_gen) {
+		vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_TX, chain->head,
+				     0);
+		atomic64_inc(&wlan->stats.tx_chained);
+	}
+	spin_unlock_irqrestore(&wlan->data_lock, flags);
+	kfree(chain);
+	vduse_guest_wlan_tx_release(wlan);
+}
+
 /*
  * The largest frame in either direction, as the configuration's MTU allows.
  * A VLAN tag can take a frame past the MTU.
@@ -808,14 +850,18 @@ static size_t vduse_guest_wlan_max_frame(struct vduse_guest_wlan *wlan)
 
 /*
  * Send a frame from the host. No offload is offered, so its header is zero,
- * and its source must be the interface's own address.
+ * and its source must be the interface's own address. Return whether the
+ * frame's destructor owns the chain's completion, as a control port frame's
+ * does while the data path runs and its chain could be allocated.
  */
-static void vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
-				    struct vringh_kiov *riov)
+static bool vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
+				    struct vringh_kiov *riov, u16 head)
 {
 	struct net_device *netdev = wlan->netdev;
 	size_t len = vringh_kiov_length(riov);
+	struct vduse_guest_wlan_tx_chain *chain = NULL;
 	struct virtio_net_hdr_v1 hdr;
+	bool chained;
 	struct sk_buff *skb;
 	struct iov_iter it;
 	size_t frame_len;
@@ -823,35 +869,35 @@ static void vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
 	if (len < sizeof(hdr) + ETH_HLEN ||
 	    len > sizeof(hdr) + vduse_guest_wlan_max_frame(wlan)) {
 		atomic64_inc(&wlan->stats.tx_invalid);
-		return;
+		return false;
 	}
 	frame_len = len - sizeof(hdr);
 	iov_iter_kvec(&it, ITER_SOURCE, riov->iov, riov->used, len);
 	if (copy_from_iter(&hdr, sizeof(hdr), &it) != sizeof(hdr) ||
 	    hdr.flags || hdr.gso_type != VIRTIO_NET_HDR_GSO_NONE) {
 		atomic64_inc(&wlan->stats.tx_invalid);
-		return;
+		return false;
 	}
 
 	skb = alloc_skb(LL_RESERVED_SPACE(netdev) + frame_len +
 			netdev->needed_tailroom, GFP_KERNEL);
 	if (!skb) {
 		atomic64_inc(&wlan->stats.tx_dropped);
-		return;
+		return false;
 	}
 	skb_reserve(skb, LL_RESERVED_SPACE(netdev));
 	if (copy_from_iter(skb_put(skb, frame_len), frame_len, &it) !=
 	    frame_len) {
 		kfree_skb(skb);
 		atomic64_inc(&wlan->stats.tx_invalid);
-		return;
+		return false;
 	}
 
 	skb_reset_mac_header(skb);
 	if (!ether_addr_equal(eth_hdr(skb)->h_source, netdev->dev_addr)) {
 		kfree_skb(skb);
 		atomic64_inc(&wlan->stats.tx_spoofed);
-		return;
+		return false;
 	}
 
 	/*
@@ -866,15 +912,36 @@ static void vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
 	     frame_len < ETH_HLEN + sizeof(struct ipv6hdr))) {
 		kfree_skb(skb);
 		atomic64_inc(&wlan->stats.tx_invalid);
-		return;
+		return false;
 	}
 	skb->dev = netdev;
 
-	skb_shinfo(skb)->destructor_arg = wlan;
-	skb->destructor = vduse_guest_wlan_tx_destructor;
+	if (skb->protocol == READ_ONCE(wlan->control_port))
+		chain = kmalloc_obj(*chain);
+	if (chain) {
+		chain->wlan = wlan;
+		chain->head = head;
+		spin_lock_bh(&wlan->data_lock);
+		chain->gen = wlan->tx_gen;
+		if (!wlan->data_running) {
+			kfree(chain);
+			chain = NULL;
+		}
+		spin_unlock_bh(&wlan->data_lock);
+	}
+	/* The destructor can free the chain before dev_queue_xmit() returns. */
+	chained = chain;
+	if (chain) {
+		skb_shinfo(skb)->destructor_arg = chain;
+		skb->destructor = vduse_guest_wlan_tx_chain_destructor;
+	} else {
+		skb_shinfo(skb)->destructor_arg = wlan;
+		skb->destructor = vduse_guest_wlan_tx_destructor;
+	}
 	atomic_inc(&wlan->tx_pending);
 	atomic64_inc(&wlan->stats.tx_frames);
 	dev_queue_xmit(skb);
+	return chained;
 }
 
 /*
@@ -953,8 +1020,8 @@ static void vduse_guest_wlan_tx_work(struct work_struct *work)
 
 		if (drain)
 			atomic64_inc(&wlan->stats.tx_dropped);
-		else
-			vduse_guest_wlan_tx_one(wlan, &riov);
+		else if (vduse_guest_wlan_tx_one(wlan, &riov, head))
+			continue;
 		vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_TX, head, 0);
 	}
 
@@ -1139,6 +1206,8 @@ static void vduse_guest_wlan_stop_data(struct vduse_guest_wlan *wlan,
 	drain = drain && wlan->data_running;
 	wlan->tx_drain = drain;
 	wlan->data_running = false;
+	if (!drain)
+		wlan->tx_gen++;
 	list_splice_init(&wlan->rx_bufs, &bufs);
 	spin_unlock_bh(&wlan->data_lock);
 
@@ -1459,6 +1528,9 @@ static int vduse_guest_wlan_cmd_connect(struct vduse_guest_wlan *wlan,
 	wlan->conn_active = true;
 	wlan->conn_id = id;
 	spin_unlock_irq(&wlan->lock);
+	/* The client API takes an ethertype of 0 as ETH_P_PAE. */
+	WRITE_ONCE(wlan->control_port,
+		   params.crypto.control_port_ethertype ?: htons(ETH_P_PAE));
 
 	err = cfg80211_client_connect(wlan->client, &params);
 	if (err) {
@@ -2263,6 +2335,7 @@ static void *__init vduse_guest_wlan_setup(struct vduse_guest_dev *dev,
 	INIT_WORK(&wlan->tx_work, vduse_guest_wlan_tx_work);
 	spin_lock_init(&wlan->data_lock);
 	INIT_LIST_HEAD(&wlan->rx_bufs);
+	wlan->control_port = htons(ETH_P_PAE);
 
 	wlan->wq = alloc_ordered_workqueue("vduse-wlan-%s", 0, name);
 	if (!wlan->wq) {
@@ -2346,6 +2419,8 @@ static void vduse_guest_wlan_show(void *priv, struct seq_file *m)
 		   atomic64_read(&s->tx_spoofed));
 	seq_printf(m, "  %-18s %lld\n", "tx_dropped",
 		   atomic64_read(&s->tx_dropped));
+	seq_printf(m, "  %-18s %lld\n", "tx_chained",
+		   atomic64_read(&s->tx_chained));
 	seq_printf(m, "  %-18s %d\n", "tx_pending",
 		   atomic_read(&wlan->tx_pending));
 	seq_printf(m, "  %-18s %lld\n", "rx_frames",

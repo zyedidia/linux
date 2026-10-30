@@ -1508,7 +1508,7 @@ static int __maybe_unused vduse_guest_proc_show(struct seq_file *m, void *v)
 }
 
 /*
- * Stop the backend, which completes the requests it has taken, disconnect
+ * Stop the backend, which then makes no more calls on the queues, disconnect
  * from the device and destroy it on the host. A device that is still on the
  * host's vDPA bus cannot be destroyed, and the next guest reconnects to it.
  */
