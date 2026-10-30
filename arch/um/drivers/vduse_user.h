@@ -49,12 +49,16 @@ int uml_vduse_user_reply(int fd, const struct uml_vduse_user_msg *msg,
 			 int ok, uint16_t avail_index);
 
 int uml_vduse_user_get_features(int fd, uint64_t *features);
+int uml_vduse_user_set_config(int fd, uint32_t offset, const void *buf,
+			      uint32_t len);
+int uml_vduse_user_inject_config_irq(int fd);
 int uml_vduse_user_vq_setup(int fd, uint32_t index, uint16_t max_size);
 int uml_vduse_user_vq_get_info(int fd, uint32_t index,
 			       struct uml_vduse_user_vq_info *info);
 int uml_vduse_user_vq_set_kickfd(int fd, uint32_t index, int kickfd);
 int uml_vduse_user_vq_inject_irq(int fd, uint32_t index);
 int uml_vduse_user_create_kickfd(void);
+int uml_vduse_user_kick_pending(int kickfd);
 
 int uml_vduse_user_map(int fd, uint64_t iova,
 		       struct uml_vduse_user_region *region);

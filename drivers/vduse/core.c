@@ -24,7 +24,7 @@
 
 #define VDUSE_GUEST_MAX_DEVICES 8
 #define VDUSE_GUEST_LOG_MAGIC 0x676f6c76
-#define VDUSE_GUEST_LOG_VERSION 2
+#define VDUSE_GUEST_LOG_VERSION 3
 
 /*
  * The in-flight log lives in host storage that outlives the guest, so that
@@ -50,9 +50,9 @@ struct vduse_guest_log_desc {
 };
 
 struct vduse_guest_log_queue {
-	/* The used index and the head of the last completion. */
+	/* The used index of the last completion that was logged. */
 	u16 used_idx;
-	u16 last_head;
+	u8 pad0[2];
 	/* The number of entries, which is the queue's size. */
 	u16 size;
 	u8 pad[10];
@@ -211,6 +211,31 @@ const char *vduse_guest_name(struct vduse_guest_dev *dev)
 unsigned int vduse_guest_num_queues(struct vduse_guest_dev *dev)
 {
 	return dev->num_queues;
+}
+
+u64 vduse_guest_driver_features(struct vduse_guest_dev *dev)
+{
+	return dev->features;
+}
+
+/* Hosts without configuration updates return -EOPNOTSUPP. */
+int vduse_guest_set_config(struct vduse_guest_dev *dev, u32 offset,
+			   const void *buf, u32 len)
+{
+	if (!dev->hops->set_config)
+		return -EOPNOTSUPP;
+	return dev->hops->set_config(dev, offset, buf, len);
+}
+
+/*
+ * Raise the configuration interrupt. VDUSE refuses it with -EINVAL until the
+ * driver's DRIVER_OK has been answered.
+ */
+int vduse_guest_config_irq(struct vduse_guest_dev *dev)
+{
+	if (!dev->hops->inject_config)
+		return -EOPNOTSUPP;
+	return dev->hops->inject_config(dev);
 }
 
 void *vduse_guest_host_data(struct vduse_guest_dev *dev)
@@ -560,33 +585,64 @@ int vduse_guest_getdesc(struct vduse_guest_dev *dev, unsigned int index,
 	}
 }
 
-void vduse_guest_complete(struct vduse_guest_dev *dev, unsigned int index,
-			  u16 head, u32 len)
+/* Fill a used element of the queue in the ring's byte order. */
+void vduse_guest_used_elem(struct vduse_guest_dev *dev, unsigned int index,
+			   struct vring_used_elem *elem, u16 head, u32 len)
+{
+	struct vringh *vrh = &dev->vqs[index].vrh;
+
+	elem->id = cpu_to_vringh32(vrh, head);
+	elem->len = cpu_to_vringh32(vrh, len);
+}
+
+/*
+ * Publish the completions in used, filled by vduse_guest_used_elem(), with
+ * one update of the used index, so that the driver sees all of them or none.
+ */
+void vduse_guest_complete_n(struct vduse_guest_dev *dev, unsigned int index,
+			    const struct vring_used_elem *used, unsigned int n)
 {
 	struct vduse_guest_vq *vq = &dev->vqs[index];
 	unsigned long flags;
+	unsigned int i;
+	u64 bytes = 0;
 	int notify;
+	u32 head;
+
+	for (i = 0; i < n; i++)
+		bytes += vringh32_to_cpu(&vq->vrh, used[i].len);
 
 	/*
 	 * The log's used index trails the ring's only between publishing the
-	 * completion and clearing its flag, and then the head is last_head.
+	 * completions and clearing their flags, and then the used ring holds
+	 * the heads whose flags may still be set.
 	 */
 	spin_lock_irqsave(&vq->lock, flags);
-	WRITE_ONCE(vq->log->last_head, head);
-	smp_wmb();
-	vringh_complete_kern(&vq->vrh, head, len);
-	WRITE_ONCE(vq->log->desc[head].inflight, 0);
+	vringh_complete_multi_kern(&vq->vrh, used, n);
+	for (i = 0; i < n; i++) {
+		head = vringh32_to_cpu(&vq->vrh, used[i].id);
+		WRITE_ONCE(vq->log->desc[head].inflight, 0);
+	}
 	smp_wmb();
 	WRITE_ONCE(vq->log->used_idx,
 		   vq->vrh.last_used_idx + vq->vrh.completed);
 	notify = vringh_need_notify_kern(&vq->vrh);
 	spin_unlock_irqrestore(&vq->lock, flags);
 
-	atomic64_add(len, &vq->stats.in_bytes);
+	atomic64_add(bytes, &vq->stats.in_bytes);
 	if (notify <= 0)
 		atomic64_inc(&vq->stats.suppressed);
 	else
 		vduse_guest_inject(dev, index);
+}
+
+void vduse_guest_complete(struct vduse_guest_dev *dev, unsigned int index,
+			  u16 head, u32 len)
+{
+	struct vring_used_elem used;
+
+	vduse_guest_used_elem(dev, index, &used, head, len);
+	vduse_guest_complete_n(dev, index, &used, 1);
 }
 
 void vduse_guest_notify_disable(struct vduse_guest_dev *dev,
@@ -648,7 +704,6 @@ static void vduse_guest_clear_log(struct vduse_guest_dev *dev)
 
 		/* The size stays, so that a crash here leaves a valid log. */
 		vq->log->used_idx = 0;
-		vq->log->last_head = 0;
 		memset(vq->log->desc, 0, vq->size * sizeof(*vq->log->desc));
 		vq->counter = 0;
 		vduse_guest_free_replay(vq);
@@ -680,7 +735,8 @@ static int vduse_guest_recover_vq(struct vduse_guest_dev *dev,
 	unsigned int num = vq->vrh.vring.num;
 	struct vduse_guest_inflight *in;
 	unsigned int i, n = 0;
-	u16 used;
+	u16 used, idx;
+	u32 head;
 
 	vduse_guest_free_replay(vq);
 	vq->counter = 0;
@@ -688,12 +744,18 @@ static int vduse_guest_recover_vq(struct vduse_guest_dev *dev,
 	used = vduse_guest_used_idx(vq);
 	vq->vrh.last_used_idx = used;
 
-	/* The earlier guest stopped between publishing and logging. */
-	if (log->used_idx != used) {
-		if (log->last_head < num)
-			log->desc[log->last_head].inflight = 0;
-		log->used_idx = used;
+	/*
+	 * The earlier guest stopped between publishing completions and
+	 * logging them, and the used ring holds their heads.
+	 */
+	for (idx = log->used_idx; idx != used && (u16)(idx - log->used_idx) < num;
+	     idx++) {
+		head = vringh32_to_cpu(&vq->vrh,
+				       READ_ONCE(vq->vrh.vring.used->ring[idx % num].id));
+		if (head < vq->size)
+			log->desc[head].inflight = 0;
 	}
+	log->used_idx = used;
 
 	in = kmalloc_objs(*in, num);
 	if (!in)
@@ -1445,6 +1507,38 @@ static void vduse_guest_show_counter(struct seq_file *m, int indent,
 		   atomic64_read(v));
 }
 
+/*
+ * The state of a running queue: whether a kick is waiting unread, the
+ * driver's available index and the device's next one, the used index, and
+ * the event indices that each side publishes for the other with EVENT_IDX.
+ */
+static void vduse_guest_show_ring(struct seq_file *m, struct vduse_guest_vq *vq)
+{
+	struct vringh *vrh = &vq->vrh;
+	struct vduse_guest_dev *dev = vq->dev;
+
+	/* A reset unmaps the rings under map_lock after the queue stops. */
+	guard(mutex)(&dev->map_lock);
+	if (!READ_ONCE(vq->running))
+		return;
+	if (dev->hops->kick_pending)
+		seq_printf(m, "    %-16s %d\n", "kick_pending",
+			   dev->hops->kick_pending(dev, vq->index));
+	seq_printf(m, "    %-16s %u\n", "avail_idx",
+		   vringh16_to_cpu(vrh, READ_ONCE(vrh->vring.avail->idx)));
+	seq_printf(m, "    %-16s %u\n", "last_avail_idx", vrh->last_avail_idx);
+	seq_printf(m, "    %-16s %u\n", "used_idx",
+		   vringh16_to_cpu(vrh, READ_ONCE(vrh->vring.used->idx)));
+	if (!vrh->event_indices)
+		return;
+	seq_printf(m, "    %-16s %u\n", "avail_event",
+		   vringh16_to_cpu(vrh,
+				   READ_ONCE(vring_avail_event(&vrh->vring))));
+	seq_printf(m, "    %-16s %u\n", "used_event",
+		   vringh16_to_cpu(vrh,
+				   READ_ONCE(vring_used_event(&vrh->vring))));
+}
+
 static void vduse_guest_show_device(struct seq_file *m,
 				    struct vduse_guest_dev *dev)
 {
@@ -1494,6 +1588,7 @@ static void vduse_guest_show_device(struct seq_file *m,
 		vduse_guest_show_counter(m, 4, "polled", &q->polled);
 		vduse_guest_show_counter(m, 4, "poll_timeouts",
 					 &q->poll_timeouts);
+		vduse_guest_show_ring(m, &dev->vqs[i]);
 	}
 }
 

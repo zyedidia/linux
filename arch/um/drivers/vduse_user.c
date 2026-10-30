@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
@@ -152,6 +153,32 @@ int uml_vduse_user_get_features(int fd, uint64_t *features)
 	return 0;
 }
 
+int uml_vduse_user_set_config(int fd, uint32_t offset, const void *buf,
+			      uint32_t len)
+{
+	struct vduse_config_data *data;
+	int err = 0;
+
+	data = uml_kmalloc(sizeof(*data) + len, UM_GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	data->offset = offset;
+	data->length = len;
+	memcpy(data->buffer, buf, len);
+
+	if (ioctl(fd, VDUSE_DEV_SET_CONFIG, data) < 0)
+		err = -errno;
+	kfree(data);
+	return err;
+}
+
+int uml_vduse_user_inject_config_irq(int fd)
+{
+	if (ioctl(fd, VDUSE_DEV_INJECT_CONFIG_IRQ) < 0)
+		return -errno;
+	return 0;
+}
+
 int uml_vduse_user_vq_setup(int fd, uint32_t index, uint16_t max_size)
 {
 	struct vduse_vq_config cfg;
@@ -202,6 +229,17 @@ int uml_vduse_user_vq_inject_irq(int fd, uint32_t index)
 	if (ioctl(fd, VDUSE_VQ_INJECT_IRQ, &index) < 0)
 		return -errno;
 	return 0;
+}
+
+int uml_vduse_user_kick_pending(int kickfd)
+{
+	struct pollfd p = { .fd = kickfd, .events = POLLIN };
+	int r;
+
+	r = poll(&p, 1, 0);
+	if (r < 0)
+		return -errno;
+	return r > 0 && (p.revents & POLLIN);
 }
 
 int uml_vduse_user_create_kickfd(void)

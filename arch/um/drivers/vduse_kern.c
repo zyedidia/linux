@@ -245,6 +245,18 @@ static int uml_vduse_get_features(struct vduse_guest_dev *dev, u64 *features)
 	return uml_vduse_user_get_features(uml_vduse_of(dev)->fd, features);
 }
 
+static int uml_vduse_set_config(struct vduse_guest_dev *dev, u32 offset,
+				const void *buf, u32 len)
+{
+	return uml_vduse_user_set_config(uml_vduse_of(dev)->fd, offset, buf,
+					 len);
+}
+
+static int uml_vduse_inject_config(struct vduse_guest_dev *dev)
+{
+	return uml_vduse_user_inject_config_irq(uml_vduse_of(dev)->fd);
+}
+
 static int uml_vduse_vq_setup(struct vduse_guest_dev *dev, unsigned int index,
 			      u16 max_size)
 {
@@ -314,6 +326,12 @@ static void uml_vduse_close_vq(struct vduse_guest_dev *dev, unsigned int index)
 
 	uml_vduse_free_irq(vq->kickfd, vq->irq, vq);
 	os_close_file(vq->kickfd);
+}
+
+static int uml_vduse_kick_pending(struct vduse_guest_dev *dev,
+				  unsigned int index)
+{
+	return uml_vduse_user_kick_pending(uml_vduse_of(dev)->vqs[index].kickfd);
 }
 
 static int uml_vduse_enable_kick(struct vduse_guest_dev *dev,
@@ -480,12 +498,15 @@ static const struct vduse_guest_host_ops uml_vduse_host_ops = {
 	.read_msg = uml_vduse_read_msg,
 	.reply = uml_vduse_reply,
 	.get_features = uml_vduse_get_features,
+	.set_config = uml_vduse_set_config,
+	.inject_config = uml_vduse_inject_config,
 	.vq_setup = uml_vduse_vq_setup,
 	.vq_get_info = uml_vduse_vq_get_info,
 	.open_vq = uml_vduse_open_vq,
 	.close_vq = uml_vduse_close_vq,
 	.enable_kick = uml_vduse_enable_kick,
 	.sync_kick = uml_vduse_sync_kick,
+	.kick_pending = uml_vduse_kick_pending,
 	.inject = uml_vduse_inject,
 	.map = uml_vduse_map,
 	.unmap = uml_vduse_unmap,

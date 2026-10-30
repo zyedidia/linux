@@ -51,12 +51,20 @@ extern const struct vduse_guest_backend_ops vduse_guest_wlan_ops;
 
 const char *vduse_guest_name(struct vduse_guest_dev *dev);
 unsigned int vduse_guest_num_queues(struct vduse_guest_dev *dev);
+u64 vduse_guest_driver_features(struct vduse_guest_dev *dev);
+int vduse_guest_set_config(struct vduse_guest_dev *dev, u32 offset,
+			   const void *buf, u32 len);
+int vduse_guest_config_irq(struct vduse_guest_dev *dev);
 
 int vduse_guest_getdesc(struct vduse_guest_dev *dev, unsigned int index,
 			struct vringh_kiov *riov, struct vringh_kiov *wiov,
 			u16 *head);
 void vduse_guest_complete(struct vduse_guest_dev *dev, unsigned int index,
 			  u16 head, u32 len);
+void vduse_guest_used_elem(struct vduse_guest_dev *dev, unsigned int index,
+			   struct vring_used_elem *elem, u16 head, u32 len);
+void vduse_guest_complete_n(struct vduse_guest_dev *dev, unsigned int index,
+			    const struct vring_used_elem *used, unsigned int n);
 void vduse_guest_notify_disable(struct vduse_guest_dev *dev,
 				unsigned int index);
 bool vduse_guest_notify_enable(struct vduse_guest_dev *dev,
@@ -117,11 +125,16 @@ struct vduse_guest_region {
  * control messages arrive, until disable_msgs returns. Read_msg returns
  * -EAGAIN when there is none left.
  *
+ * Set_config writes len bytes of the configuration space at offset, and
+ * inject_config raises the configuration interrupt. Both are optional.
+ *
  * Open_vq prepares a queue's kicks, which the host passes to
  * vduse_guest_kick() on the given CPU once enable_kick has handed them to
  * VDUSE. Each call gives the number of kicks that it covers, which is 0 for
  * a wakeup that found none. Sync_kick waits for calls of vduse_guest_kick()
- * that are running. Inject raises the queue's interrupt on the host.
+ * that are running. Kick_pending, which is optional, returns 1 if a kick
+ * has arrived that was not yet passed on, without taking it. Inject raises
+ * the queue's interrupt on the host.
  *
  * Map gives the region of the IOVA space that holds an IOVA, and unmap
  * releases it. Map_umem prepares the chunks of guest pages that back the
@@ -157,6 +170,9 @@ struct vduse_guest_host_ops {
 		     u16 avail_index);
 
 	int (*get_features)(struct vduse_guest_dev *dev, u64 *features);
+	int (*set_config)(struct vduse_guest_dev *dev, u32 offset,
+			  const void *buf, u32 len);
+	int (*inject_config)(struct vduse_guest_dev *dev);
 	int (*vq_setup)(struct vduse_guest_dev *dev, unsigned int index,
 			u16 max_size);
 	int (*vq_get_info)(struct vduse_guest_dev *dev, unsigned int index,
@@ -166,6 +182,7 @@ struct vduse_guest_host_ops {
 	void (*close_vq)(struct vduse_guest_dev *dev, unsigned int index);
 	int (*enable_kick)(struct vduse_guest_dev *dev, unsigned int index);
 	void (*sync_kick)(struct vduse_guest_dev *dev, unsigned int index);
+	int (*kick_pending)(struct vduse_guest_dev *dev, unsigned int index);
 	int (*inject)(struct vduse_guest_dev *dev, unsigned int index);
 
 	int (*map)(struct vduse_guest_dev *dev, u64 iova,
