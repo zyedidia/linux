@@ -5,11 +5,15 @@
 #include <linux/completion.h>
 #include <linux/device/driver.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/jiffies.h>
 #include <linux/kstrtox.h>
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
+#include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -20,12 +24,15 @@
 #include <net/cfg80211.h>
 #include <net/netdev_lock.h>
 #include <uapi/linux/virtio_ids.h>
+#include <uapi/linux/virtio_net.h>
 
 #define VDUSE_GUEST_WLAN_EVENT_SIZE 4096
 #define VDUSE_GUEST_WLAN_WIPHY_SIZE 16384
 #define VDUSE_GUEST_WLAN_BACKLOG 512
 #define VDUSE_GUEST_WLAN_INLINE_IOVS 4
 #define VDUSE_GUEST_WLAN_TIMEOUT 30
+#define VDUSE_GUEST_WLAN_TX_LIMIT 256
+#define VDUSE_GUEST_WLAN_RETRY_DELAY msecs_to_jiffies(10)
 
 static const u16 vduse_guest_wlan_queue_sizes[VIRTIO_WLAN_VQ_MAX] = {
 	[VIRTIO_WLAN_VQ_RX] = 1024,
@@ -39,6 +46,13 @@ static const u16 vduse_guest_wlan_queue_sizes[VIRTIO_WLAN_VQ_MAX] = {
  * or by cfg80211. Bss_dropped counts the scan results that did not fit in an
  * event or in the backlog. Events_dropped counts the events that did not fit
  * in a buffer that the host posted.
+ *
+ * Tx_invalid counts the host's frames with a bad length or header, and
+ * tx_spoofed those with another source address. Tx_dropped counts the frames
+ * that found no memory or no interface. Rx_no_buffer counts the received
+ * frames that found no buffer from the host, and rx_oversized those larger
+ * than the MTU allows. Rx_bad_buffers counts the host's buffers that are too
+ * small for a frame or cannot be written.
  */
 struct vduse_guest_wlan_stats {
 	atomic64_t commands;
@@ -46,7 +60,22 @@ struct vduse_guest_wlan_stats {
 	atomic64_t events;
 	atomic64_t bss_dropped;
 	atomic64_t events_dropped;
-	atomic64_t rx_dropped;
+	atomic64_t tx_frames;
+	atomic64_t tx_invalid;
+	atomic64_t tx_spoofed;
+	atomic64_t tx_dropped;
+	atomic64_t rx_frames;
+	atomic64_t rx_no_buffer;
+	atomic64_t rx_oversized;
+	atomic64_t rx_bad_buffers;
+};
+
+/* A buffer that the host posted on the rx queue, waiting for a frame. */
+struct vduse_guest_wlan_rx_buf {
+	struct list_head list;
+	u16 head;
+	struct vringh_kiov wiov;
+	struct kvec kvec[VDUSE_GUEST_WLAN_INLINE_IOVS];
 };
 
 /* An event, with its header, waiting for a buffer on the event queue. */
@@ -120,6 +149,27 @@ struct vduse_guest_wlan {
 	/* Set under the RTNL. */
 	bool gone;
 	bool rx_registered;
+
+	/*
+	 * Kicks queue the data works on the CPU that handles them. Data_lock
+	 * protects data_running, tx_drain and the rx buffers. Once the
+	 * interface is gone, tx_drain makes the tx work complete the host's
+	 * frames unsent until the device stops. The core kicks only a queue
+	 * that the driver made ready, so tx_kicked, set by the first kick of
+	 * the tx queue, tells that the drain can start before the next kick.
+	 * Tx_pending counts the frames that the guest's stack still holds. At
+	 * the limit the tx work sets tx_wake and stops, and the destructor
+	 * that next runs clears it and queues the work again.
+	 */
+	struct delayed_work rx_work;
+	struct work_struct tx_work;
+	spinlock_t data_lock;
+	bool data_running;
+	bool tx_drain;
+	struct list_head rx_bufs;
+	atomic_t tx_pending;
+	unsigned long tx_wake;
+	unsigned long tx_kicked;
 
 	struct vduse_guest_wlan_stats stats;
 };
@@ -715,6 +765,400 @@ static void vduse_guest_wlan_note_mic_failure(void *priv, const u8 *addr,
 	vduse_guest_wlan_add_note(wlan, note);
 }
 
+static bool vduse_guest_wlan_data_running(struct vduse_guest_wlan *wlan)
+{
+	bool running;
+
+	spin_lock_bh(&wlan->data_lock);
+	running = wlan->data_running;
+	spin_unlock_bh(&wlan->data_lock);
+	return running;
+}
+
+/*
+ * A driver can free a frame at any time, also after the device has stopped.
+ * It reads data_running, clears tx_wake and queues the work under data_lock,
+ * so that stopping the data path either cancels the work or keeps it from
+ * being queued.
+ */
+static void vduse_guest_wlan_tx_destructor(struct sk_buff *skb)
+{
+	struct vduse_guest_wlan *wlan = skb_shinfo(skb)->destructor_arg;
+	unsigned long flags;
+
+	atomic_dec(&wlan->tx_pending);
+	/* This pairs with the barrier in vduse_guest_wlan_tx_full(). */
+	smp_mb__after_atomic();
+	if (!test_bit(0, &wlan->tx_wake))
+		return;
+	spin_lock_irqsave(&wlan->data_lock, flags);
+	if (wlan->data_running && test_and_clear_bit(0, &wlan->tx_wake))
+		queue_work(system_percpu_wq, &wlan->tx_work);
+	spin_unlock_irqrestore(&wlan->data_lock, flags);
+}
+
+/*
+ * The largest frame in either direction, as the configuration's MTU allows.
+ * A VLAN tag can take a frame past the MTU.
+ */
+static size_t vduse_guest_wlan_max_frame(struct vduse_guest_wlan *wlan)
+{
+	return VLAN_ETH_HLEN + le16_to_cpu(wlan->config.mtu);
+}
+
+/*
+ * Send a frame from the host. No offload is offered, so its header is zero,
+ * and its source must be the interface's own address.
+ */
+static void vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
+				    struct vringh_kiov *riov)
+{
+	struct net_device *netdev = wlan->netdev;
+	size_t len = vringh_kiov_length(riov);
+	struct virtio_net_hdr_v1 hdr;
+	struct sk_buff *skb;
+	struct iov_iter it;
+	size_t frame_len;
+
+	if (len < sizeof(hdr) + ETH_HLEN ||
+	    len > sizeof(hdr) + vduse_guest_wlan_max_frame(wlan)) {
+		atomic64_inc(&wlan->stats.tx_invalid);
+		return;
+	}
+	frame_len = len - sizeof(hdr);
+	iov_iter_kvec(&it, ITER_SOURCE, riov->iov, riov->used, len);
+	if (copy_from_iter(&hdr, sizeof(hdr), &it) != sizeof(hdr) ||
+	    hdr.flags || hdr.gso_type != VIRTIO_NET_HDR_GSO_NONE) {
+		atomic64_inc(&wlan->stats.tx_invalid);
+		return;
+	}
+
+	skb = alloc_skb(LL_RESERVED_SPACE(netdev) + frame_len +
+			netdev->needed_tailroom, GFP_KERNEL);
+	if (!skb) {
+		atomic64_inc(&wlan->stats.tx_dropped);
+		return;
+	}
+	skb_reserve(skb, LL_RESERVED_SPACE(netdev));
+	if (copy_from_iter(skb_put(skb, frame_len), frame_len, &it) !=
+	    frame_len) {
+		kfree_skb(skb);
+		atomic64_inc(&wlan->stats.tx_invalid);
+		return;
+	}
+
+	skb_reset_mac_header(skb);
+	if (!ether_addr_equal(eth_hdr(skb)->h_source, netdev->dev_addr)) {
+		kfree_skb(skb);
+		atomic64_inc(&wlan->stats.tx_spoofed);
+		return;
+	}
+
+	/*
+	 * Classification reads the IP header through the network header and
+	 * the protocol, so an IP frame must hold one.
+	 */
+	skb_set_network_header(skb, ETH_HLEN);
+	skb->protocol = eth_hdr(skb)->h_proto;
+	if ((skb->protocol == htons(ETH_P_IP) &&
+	     frame_len < ETH_HLEN + sizeof(struct iphdr)) ||
+	    (skb->protocol == htons(ETH_P_IPV6) &&
+	     frame_len < ETH_HLEN + sizeof(struct ipv6hdr))) {
+		kfree_skb(skb);
+		atomic64_inc(&wlan->stats.tx_invalid);
+		return;
+	}
+	skb->dev = netdev;
+
+	skb_shinfo(skb)->destructor_arg = wlan;
+	skb->destructor = vduse_guest_wlan_tx_destructor;
+	atomic_inc(&wlan->tx_pending);
+	atomic64_inc(&wlan->stats.tx_frames);
+	dev_queue_xmit(skb);
+}
+
+/*
+ * Stop at the limit of frames in mac80211, with notifications disabled, so
+ * that the destructor that frees room restarts the work.
+ */
+static bool vduse_guest_wlan_tx_full(struct vduse_guest_wlan *wlan)
+{
+	if (atomic_read(&wlan->tx_pending) < VDUSE_GUEST_WLAN_TX_LIMIT)
+		return false;
+	set_bit(0, &wlan->tx_wake);
+	/*
+	 * A destructor that ran before the flag was set is seen in the count
+	 * read below, and one after it sees the flag.
+	 */
+	smp_mb__after_atomic();
+	if (atomic_read(&wlan->tx_pending) < VDUSE_GUEST_WLAN_TX_LIMIT &&
+	    test_and_clear_bit(0, &wlan->tx_wake))
+		return false;
+	return true;
+}
+
+/* Return whether the tx work may use the queue, and whether it only drains. */
+static bool vduse_guest_wlan_tx_usable(struct vduse_guest_wlan *wlan,
+				       bool *drain)
+{
+	bool usable;
+
+	spin_lock_bh(&wlan->data_lock);
+	usable = wlan->data_running || wlan->tx_drain;
+	*drain = !wlan->data_running;
+	spin_unlock_bh(&wlan->data_lock);
+	return usable;
+}
+
+/*
+ * The host's queue would stop for good once the interface is gone, so the
+ * frames are then completed unsent until the device stops.
+ */
+static void vduse_guest_wlan_tx_work(struct work_struct *work)
+{
+	struct vduse_guest_wlan *wlan =
+		container_of(work, struct vduse_guest_wlan, tx_work);
+	struct kvec rkvec[VDUSE_GUEST_WLAN_INLINE_IOVS];
+	struct kvec wkvec[VDUSE_GUEST_WLAN_INLINE_IOVS];
+	struct vringh_kiov riov, wiov;
+	bool drain;
+	u16 head;
+	int r;
+
+	if (!vduse_guest_wlan_tx_usable(wlan, &drain))
+		return;
+
+	vringh_kiov_init(&riov, rkvec, ARRAY_SIZE(rkvec));
+	vringh_kiov_init(&wiov, wkvec, ARRAY_SIZE(wkvec));
+
+	vduse_guest_notify_disable(wlan->dev, VIRTIO_WLAN_VQ_TX);
+	for (;;) {
+		if (!vduse_guest_wlan_tx_usable(wlan, &drain) ||
+		    (!drain && vduse_guest_wlan_tx_full(wlan)))
+			break;
+
+		r = vduse_guest_getdesc(wlan->dev, VIRTIO_WLAN_VQ_TX, &riov,
+					&wiov, &head);
+		if (r < 0)
+			break;
+		if (!r) {
+			if (vduse_guest_poll(wlan->dev, VIRTIO_WLAN_VQ_TX))
+				continue;
+			if (vduse_guest_notify_enable(wlan->dev,
+						      VIRTIO_WLAN_VQ_TX))
+				break;
+			vduse_guest_notify_disable(wlan->dev, VIRTIO_WLAN_VQ_TX);
+			continue;
+		}
+
+		if (drain)
+			atomic64_inc(&wlan->stats.tx_dropped);
+		else
+			vduse_guest_wlan_tx_one(wlan, &riov);
+		vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_TX, head, 0);
+	}
+
+	vringh_kiov_cleanup(&riov);
+	vringh_kiov_cleanup(&wiov);
+}
+
+static void vduse_guest_wlan_free_rx_buf(struct vduse_guest_wlan_rx_buf *buf)
+{
+	vringh_kiov_cleanup(&buf->wiov);
+	kfree(buf);
+}
+
+/*
+ * Take the buffers that the host posts, which can sleep, so that the rx
+ * handler only copies into them. A buffer too small for the largest frame
+ * is returned unused. An allocation that fails is retried later, with
+ * notifications still disabled.
+ */
+static void vduse_guest_wlan_rx_work(struct work_struct *work)
+{
+	struct vduse_guest_wlan *wlan =
+		container_of(to_delayed_work(work), struct vduse_guest_wlan,
+			     rx_work);
+	struct kvec rkvec[VDUSE_GUEST_WLAN_INLINE_IOVS];
+	struct vduse_guest_wlan_rx_buf *buf;
+	struct vringh_kiov riov;
+	bool running;
+	int r;
+
+	if (!vduse_guest_wlan_data_running(wlan))
+		return;
+
+	vringh_kiov_init(&riov, rkvec, ARRAY_SIZE(rkvec));
+
+	vduse_guest_notify_disable(wlan->dev, VIRTIO_WLAN_VQ_RX);
+	for (;;) {
+		if (!vduse_guest_wlan_data_running(wlan))
+			break;
+
+		buf = kzalloc_obj(*buf);
+		if (!buf) {
+			schedule_delayed_work(&wlan->rx_work,
+					      VDUSE_GUEST_WLAN_RETRY_DELAY);
+			break;
+		}
+		vringh_kiov_init(&buf->wiov, buf->kvec, ARRAY_SIZE(buf->kvec));
+
+		r = vduse_guest_getdesc(wlan->dev, VIRTIO_WLAN_VQ_RX, &riov,
+					&buf->wiov, &buf->head);
+		if (r <= 0) {
+			vduse_guest_wlan_free_rx_buf(buf);
+			if (r < 0)
+				break;
+			if (vduse_guest_notify_enable(wlan->dev,
+						      VIRTIO_WLAN_VQ_RX))
+				break;
+			vduse_guest_notify_disable(wlan->dev, VIRTIO_WLAN_VQ_RX);
+			continue;
+		}
+
+		if (vringh_kiov_length(&buf->wiov) <
+		    sizeof(struct virtio_net_hdr_v1) +
+		    vduse_guest_wlan_max_frame(wlan)) {
+			atomic64_inc(&wlan->stats.rx_bad_buffers);
+			vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_RX,
+					     buf->head, 0);
+			vduse_guest_wlan_free_rx_buf(buf);
+			continue;
+		}
+
+		/* The data path can stop while the buffer is taken. */
+		spin_lock_bh(&wlan->data_lock);
+		running = wlan->data_running;
+		if (running)
+			list_add_tail(&buf->list, &wlan->rx_bufs);
+		spin_unlock_bh(&wlan->data_lock);
+		if (!running) {
+			vduse_guest_wlan_free_rx_buf(buf);
+			break;
+		}
+	}
+
+	vringh_kiov_cleanup(&riov);
+}
+
+/*
+ * Copy a frame from its MAC header. The stack has already moved a VLAN tag
+ * out of the frame, so the tag goes back after the addresses.
+ */
+static int vduse_guest_wlan_copy_frame(struct sk_buff *skb,
+				       struct iov_iter *it, size_t frame_len)
+{
+	int offset = skb_mac_offset(skb);
+	__be16 tag[2];
+
+	if (!skb_vlan_tag_present(skb))
+		return skb_copy_datagram_iter(skb, offset, it, frame_len);
+
+	tag[0] = skb->vlan_proto;
+	tag[1] = htons(skb_vlan_tag_get(skb));
+	if (skb_copy_datagram_iter(skb, offset, it, 2 * ETH_ALEN) ||
+	    copy_to_iter(tag, sizeof(tag), it) != sizeof(tag))
+		return -EFAULT;
+	return skb_copy_datagram_iter(skb, offset + 2 * ETH_ALEN, it,
+				      frame_len - VLAN_HLEN - 2 * ETH_ALEN);
+}
+
+/*
+ * Every frame received on the interface is consumed, and the guest's own
+ * stack sees none. A frame is copied into the next buffer, which holds the
+ * largest frame, and completed at once. A stopping device waits for this
+ * handler to return.
+ */
+static rx_handler_result_t vduse_guest_wlan_rx(struct sk_buff **pskb)
+{
+	struct sk_buff *skb = *pskb;
+	struct vduse_guest_wlan *wlan =
+		rcu_dereference(skb->dev->rx_handler_data);
+	struct virtio_net_hdr_v1 hdr = {
+		.num_buffers = cpu_to_le16(1),
+	};
+	struct vduse_guest_wlan_rx_buf *buf;
+	size_t frame_len = skb->len - skb_mac_offset(skb);
+	struct iov_iter it;
+
+	if (skb_vlan_tag_present(skb))
+		frame_len += VLAN_HLEN;
+	if (frame_len > vduse_guest_wlan_max_frame(wlan)) {
+		atomic64_inc(&wlan->stats.rx_oversized);
+		goto drop;
+	}
+
+	spin_lock(&wlan->data_lock);
+	buf = wlan->data_running ?
+		list_first_entry_or_null(&wlan->rx_bufs,
+					 struct vduse_guest_wlan_rx_buf, list) :
+		NULL;
+	if (buf)
+		list_del(&buf->list);
+	spin_unlock(&wlan->data_lock);
+	if (!buf) {
+		atomic64_inc(&wlan->stats.rx_no_buffer);
+		goto drop;
+	}
+
+	iov_iter_kvec(&it, ITER_DEST, buf->wiov.iov, buf->wiov.used,
+		      vringh_kiov_length(&buf->wiov));
+	if (copy_to_iter(&hdr, sizeof(hdr), &it) != sizeof(hdr) ||
+	    vduse_guest_wlan_copy_frame(skb, &it, frame_len)) {
+		atomic64_inc(&wlan->stats.rx_bad_buffers);
+		vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_RX, buf->head, 0);
+		vduse_guest_wlan_free_rx_buf(buf);
+		goto drop;
+	}
+	atomic64_inc(&wlan->stats.rx_frames);
+	vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_RX, buf->head,
+			     sizeof(hdr) + frame_len);
+	vduse_guest_wlan_free_rx_buf(buf);
+	consume_skb(skb);
+	return RX_HANDLER_CONSUMED;
+drop:
+	kfree_skb(skb);
+	return RX_HANDLER_CONSUMED;
+}
+
+/*
+ * Stop the data path. Frames that mac80211 still holds keep their count, and
+ * the tx work of the next start sets tx_wake again if they still fill the
+ * limit. The buffers that the host posted are dropped without being
+ * completed, and a reset returns them to the driver. With drain set, a
+ * running device keeps draining the tx queue until it stops, from now on if
+ * the queue has been kicked and from its first kick otherwise.
+ */
+static void vduse_guest_wlan_stop_data(struct vduse_guest_wlan *wlan,
+				       bool drain)
+{
+	struct vduse_guest_wlan_rx_buf *buf, *tmp;
+	LIST_HEAD(bufs);
+
+	spin_lock_bh(&wlan->data_lock);
+	drain = drain && wlan->data_running;
+	wlan->tx_drain = drain;
+	wlan->data_running = false;
+	list_splice_init(&wlan->rx_bufs, &bufs);
+	spin_unlock_bh(&wlan->data_lock);
+
+	cancel_delayed_work_sync(&wlan->rx_work);
+	cancel_work_sync(&wlan->tx_work);
+	/* A tx work that was still running can have set the flag again. */
+	clear_bit(0, &wlan->tx_wake);
+	list_for_each_entry_safe(buf, tmp, &bufs, list)
+		vduse_guest_wlan_free_rx_buf(buf);
+
+	/*
+	 * A stopping device forgets the kick, and a draining one starts the
+	 * drain now if the queue has been kicked.
+	 */
+	if (!drain)
+		clear_bit(0, &wlan->tx_kicked);
+	else if (test_bit(0, &wlan->tx_kicked))
+		queue_work(system_percpu_wq, &wlan->tx_work);
+}
+
 /* The interface is being unregistered, with the RTNL and the wiphy lock. */
 static void vduse_guest_wlan_gone(void *priv)
 {
@@ -725,6 +1169,7 @@ static void vduse_guest_wlan_gone(void *priv)
 		netdev_rx_handler_unregister(wlan->netdev);
 		wlan->rx_registered = false;
 	}
+	vduse_guest_wlan_stop_data(wlan, true);
 	pr_warn("%s: interface %s is gone\n", vduse_guest_name(wlan->dev),
 		wlan->netdev->name);
 }
@@ -1418,21 +1863,21 @@ static void vduse_guest_wlan_kick(void *priv, unsigned int index)
 {
 	struct vduse_guest_wlan *wlan = priv;
 
-	if (index == VIRTIO_WLAN_VQ_CMD)
+	switch (index) {
+	case VIRTIO_WLAN_VQ_RX:
+		mod_delayed_work(system_percpu_wq, &wlan->rx_work, 0);
+		break;
+	case VIRTIO_WLAN_VQ_TX:
+		set_bit(0, &wlan->tx_kicked);
+		queue_work(system_percpu_wq, &wlan->tx_work);
+		break;
+	case VIRTIO_WLAN_VQ_CMD:
 		queue_work(wlan->wq, &wlan->cmd_work);
-	else if (index == VIRTIO_WLAN_VQ_EVENT)
+		break;
+	case VIRTIO_WLAN_VQ_EVENT:
 		queue_work(wlan->wq, &wlan->event_work);
-}
-
-/* Frames received on the interface are consumed and counted as dropped. */
-static rx_handler_result_t vduse_guest_wlan_rx(struct sk_buff **pskb)
-{
-	struct vduse_guest_wlan *wlan =
-		rcu_dereference((*pskb)->dev->rx_handler_data);
-
-	atomic64_inc(&wlan->stats.rx_dropped);
-	kfree_skb(*pskb);
-	return RX_HANDLER_CONSUMED;
+		break;
+	}
 }
 
 static int vduse_guest_wlan_start(void *priv)
@@ -1455,17 +1900,17 @@ static int vduse_guest_wlan_start(void *priv)
 			netdev_unlock_ops(netdev);
 		}
 	}
+	/* The gone notification, which stops the data path, takes the RTNL. */
+	if (!err) {
+		spin_lock_irq(&wlan->lock);
+		wlan->running = true;
+		spin_unlock_irq(&wlan->lock);
+		spin_lock_bh(&wlan->data_lock);
+		wlan->data_running = true;
+		spin_unlock_bh(&wlan->data_lock);
+	}
 	rtnl_unlock();
-	if (err)
-		return err;
-
-	spin_lock_irq(&wlan->lock);
-	wlan->running = true;
-	spin_unlock_irq(&wlan->lock);
-
-	queue_work(wlan->wq, &wlan->cmd_work);
-	queue_work(wlan->wq, &wlan->event_work);
-	return 0;
+	return err;
 }
 
 /*
@@ -1486,6 +1931,7 @@ static void vduse_guest_wlan_stop(void *priv)
 	wlan->running = false;
 	spin_unlock_irq(&wlan->lock);
 	flush_workqueue(wlan->wq);
+	vduse_guest_wlan_stop_data(wlan, false);
 
 	cfg80211_client_abort_scan(wlan->client);
 	cfg80211_client_disconnect(wlan->client, WLAN_REASON_DEAUTH_LEAVING);
@@ -1813,6 +2259,10 @@ static void *__init vduse_guest_wlan_setup(struct vduse_guest_dev *dev,
 	INIT_WORK(&wlan->cmd_work, vduse_guest_wlan_cmd_work);
 	INIT_WORK(&wlan->note_work, vduse_guest_wlan_note_work);
 	INIT_WORK(&wlan->event_work, vduse_guest_wlan_event_work);
+	INIT_DELAYED_WORK(&wlan->rx_work, vduse_guest_wlan_rx_work);
+	INIT_WORK(&wlan->tx_work, vduse_guest_wlan_tx_work);
+	spin_lock_init(&wlan->data_lock);
+	INIT_LIST_HEAD(&wlan->rx_bufs);
 
 	wlan->wq = alloc_ordered_workqueue("vduse-wlan-%s", 0, name);
 	if (!wlan->wq) {
@@ -1888,8 +2338,24 @@ static void vduse_guest_wlan_show(void *priv, struct seq_file *m)
 		   atomic64_read(&s->bss_dropped));
 	seq_printf(m, "  %-18s %lld\n", "events_dropped",
 		   atomic64_read(&s->events_dropped));
-	seq_printf(m, "  %-18s %lld\n", "rx_dropped",
-		   atomic64_read(&s->rx_dropped));
+	seq_printf(m, "  %-18s %lld\n", "tx_frames",
+		   atomic64_read(&s->tx_frames));
+	seq_printf(m, "  %-18s %lld\n", "tx_invalid",
+		   atomic64_read(&s->tx_invalid));
+	seq_printf(m, "  %-18s %lld\n", "tx_spoofed",
+		   atomic64_read(&s->tx_spoofed));
+	seq_printf(m, "  %-18s %lld\n", "tx_dropped",
+		   atomic64_read(&s->tx_dropped));
+	seq_printf(m, "  %-18s %d\n", "tx_pending",
+		   atomic_read(&wlan->tx_pending));
+	seq_printf(m, "  %-18s %lld\n", "rx_frames",
+		   atomic64_read(&s->rx_frames));
+	seq_printf(m, "  %-18s %lld\n", "rx_no_buffer",
+		   atomic64_read(&s->rx_no_buffer));
+	seq_printf(m, "  %-18s %lld\n", "rx_oversized",
+		   atomic64_read(&s->rx_oversized));
+	seq_printf(m, "  %-18s %lld\n", "rx_bad_buffers",
+		   atomic64_read(&s->rx_bad_buffers));
 }
 
 const struct vduse_guest_backend_ops vduse_guest_wlan_ops = {
