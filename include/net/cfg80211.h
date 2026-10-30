@@ -11186,6 +11186,16 @@ int cfg80211_client_set_power_mgmt(struct cfg80211_client *client,
 int cfg80211_client_set_mac(struct cfg80211_client *client, const u8 *addr);
 int cfg80211_client_set_country(struct cfg80211_client *client,
 				const char *alpha2);
+
+/**
+ * cfg80211_client_get_country - get the country that applies to the wiphy
+ * @client: The client.
+ * @alpha2: Filled with the alpha2 of the wiphy's own regulatory domain, or
+ *	else of the global one.
+ *
+ * Return: 0 on success, or -ENOENT if there is no regulatory domain yet.
+ */
+int cfg80211_client_get_country(struct cfg80211_client *client, char *alpha2);
 #endif
 
 #endif /* __NET_CFG80211_H */

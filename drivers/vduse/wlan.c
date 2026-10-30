@@ -3,6 +3,7 @@
 #define pr_fmt(fmt) "vduse-guest-wlan: " fmt
 
 #include <linux/completion.h>
+#include <linux/ctype.h>
 #include <linux/device/driver.h>
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
@@ -143,6 +144,7 @@ struct vduse_guest_wlan {
 	struct work_struct cmd_work;
 	struct work_struct note_work;
 	struct work_struct event_work;
+	struct work_struct country_work;
 
 	/* Protects running, the request state, the notes and the backlog. */
 	spinlock_t lock;
@@ -210,11 +212,23 @@ static void *vduse_guest_wlan_event_payload(struct vduse_guest_wlan_event *ev)
 	return ev->data + sizeof(struct virtio_wlan_event_hdr);
 }
 
-/* BSS events are dropped once the backlog is full, and others are kept. */
+static u16 vduse_guest_wlan_event_type(struct vduse_guest_wlan_event *ev)
+{
+	return le16_to_cpu(((struct virtio_wlan_event_hdr *)ev->data)->type);
+}
+
+/*
+ * BSS events are dropped once the backlog is full, and others are kept. A
+ * COUNTRY event replaces one that is still in the backlog. Only the country
+ * work queues them, on the same ordered workqueue as the event work, so the
+ * event work never holds the one that is replaced.
+ */
 static void vduse_guest_wlan_queue_event(struct vduse_guest_wlan *wlan,
 					 struct vduse_guest_wlan_event *ev,
 					 bool droppable)
 {
+	struct vduse_guest_wlan_event *old = NULL, *pos;
+
 	spin_lock_irq(&wlan->lock);
 	if (!wlan->running ||
 	    (droppable && wlan->backlog_len >= VDUSE_GUEST_WLAN_BACKLOG)) {
@@ -224,9 +238,23 @@ static void vduse_guest_wlan_queue_event(struct vduse_guest_wlan *wlan,
 		kfree(ev);
 		return;
 	}
-	list_add_tail(&ev->list, &wlan->backlog);
-	wlan->backlog_len++;
+	if (vduse_guest_wlan_event_type(ev) == VIRTIO_WLAN_EVENT_COUNTRY) {
+		list_for_each_entry(pos, &wlan->backlog, list) {
+			if (vduse_guest_wlan_event_type(pos) ==
+			    VIRTIO_WLAN_EVENT_COUNTRY) {
+				old = pos;
+				break;
+			}
+		}
+	}
+	if (old) {
+		list_replace(&old->list, &ev->list);
+	} else {
+		list_add_tail(&ev->list, &wlan->backlog);
+		wlan->backlog_len++;
+	}
 	spin_unlock_irq(&wlan->lock);
+	kfree(old);
 }
 
 static void vduse_guest_wlan_free_note(struct vduse_guest_wlan *wlan,
@@ -550,11 +578,15 @@ static void vduse_guest_wlan_note_work(struct work_struct *work)
 		}
 
 		/*
-		 * Events read the BSS entries' channels, which the driver
-		 * frees once the interface is gone.
+		 * Scan and connection events read the BSS entries' channels,
+		 * which the driver frees once the interface is gone. A
+		 * disconnection still reaches the host, since mac80211 reports
+		 * it as it stops the interface, before the gone notification.
 		 */
 		rtnl_lock();
-		if (wlan->gone) {
+		if (wlan->gone &&
+		    (note->type == VDUSE_GUEST_WLAN_NOTE_SCAN_DONE ||
+		     note->type == VDUSE_GUEST_WLAN_NOTE_CONNECT)) {
 			rtnl_unlock();
 			vduse_guest_wlan_free_note(wlan, note);
 			continue;
@@ -1228,10 +1260,45 @@ static void vduse_guest_wlan_stop_data(struct vduse_guest_wlan *wlan,
 		queue_work(system_percpu_wq, &wlan->tx_work);
 }
 
-/* The interface is being unregistered, with the RTNL and the wiphy lock. */
+/* This can be called in atomic context, so the report is built by a work. */
+static void vduse_guest_wlan_reg_change(void *priv)
+{
+	struct vduse_guest_wlan *wlan = priv;
+
+	queue_work(wlan->wq, &wlan->country_work);
+}
+
+/*
+ * The interface is being unregistered, with the RTNL and the wiphy lock.
+ * cfg80211 forgets the client before it ends the connection, so the host
+ * is told of the disconnection here.
+ */
 static void vduse_guest_wlan_gone(void *priv)
 {
 	struct vduse_guest_wlan *wlan = priv;
+	struct virtio_wlan_event_disconnected *e;
+	struct vduse_guest_wlan_event *ev;
+	bool connected;
+	u32 id;
+
+	ev = vduse_guest_wlan_event_alloc(VIRTIO_WLAN_EVENT_DISCONNECTED,
+					  sizeof(*e), GFP_KERNEL);
+	spin_lock_irq(&wlan->lock);
+	connected = ev && wlan->running && wlan->conn_active;
+	id = wlan->conn_id;
+	if (connected)
+		wlan->conn_active = false;
+	spin_unlock_irq(&wlan->lock);
+	if (connected) {
+		e = vduse_guest_wlan_event_payload(ev);
+		e->id = cpu_to_le32(id);
+		e->reason = cpu_to_le16(WLAN_REASON_UNSPECIFIED);
+		e->locally_generated = 1;
+		vduse_guest_wlan_queue_event(wlan, ev, false);
+		queue_work(wlan->wq, &wlan->event_work);
+	} else {
+		kfree(ev);
+	}
 
 	wlan->gone = true;
 	if (wlan->rx_registered) {
@@ -1248,6 +1315,7 @@ static const struct cfg80211_client_ops vduse_guest_wlan_client_ops = {
 	.connect_result = vduse_guest_wlan_note_connect,
 	.disconnected = vduse_guest_wlan_note_disconnected,
 	.mic_failure = vduse_guest_wlan_note_mic_failure,
+	.reg_change = vduse_guest_wlan_reg_change,
 	.gone = vduse_guest_wlan_gone,
 };
 
@@ -1765,9 +1833,57 @@ static int vduse_guest_wlan_cmd_get_station(struct vduse_guest_wlan *wlan,
 	return 0;
 }
 
+static int vduse_guest_wlan_cmd_power_mgmt(struct vduse_guest_wlan *wlan,
+					   const u8 *p, size_t len)
+{
+	const struct virtio_wlan_set_power_mgmt *pm = (const void *)p;
+	u32 timeout;
+
+	if (len != sizeof(*pm) || pm->enabled > 1)
+		return -EINVAL;
+	timeout = le32_to_cpu(pm->timeout);
+	if (timeout == VIRTIO_WLAN_PS_TIMEOUT_DEFAULT)
+		return cfg80211_client_set_power_mgmt(wlan->client, pm->enabled,
+						      -1);
+	if (timeout > INT_MAX)
+		return -EINVAL;
+	return cfg80211_client_set_power_mgmt(wlan->client, pm->enabled,
+					      timeout);
+}
+
+/* The interface must be down, as mac80211 requires for a new address. */
+static int vduse_guest_wlan_cmd_set_mac(struct vduse_guest_wlan *wlan,
+					const u8 *p, size_t len)
+{
+	const struct virtio_wlan_set_mac *m = (const void *)p;
+
+	if (!(vduse_guest_driver_features(wlan->dev) &
+	      BIT_ULL(VIRTIO_WLAN_F_SET_MAC)))
+		return -EOPNOTSUPP;
+	if (len != sizeof(*m))
+		return -EINVAL;
+	return cfg80211_client_set_mac(wlan->client, m->addr);
+}
+
+/* A country is two letters, or "00" for the world regulatory domain. */
+static int vduse_guest_wlan_cmd_set_country(struct vduse_guest_wlan *wlan,
+					    const u8 *p, size_t len)
+{
+	const struct virtio_wlan_set_country *c = (const void *)p;
+	char alpha2[3] = {};
+
+	if (len != sizeof(*c))
+		return -EINVAL;
+	memcpy(alpha2, c->alpha2, sizeof(c->alpha2));
+	if (!(isupper(alpha2[0]) && isupper(alpha2[1])) &&
+	    strcmp(alpha2, "00"))
+		return -EINVAL;
+	return cfg80211_client_set_country(wlan->client, alpha2);
+}
+
 /*
- * Run one command. The response's payload is out, and the P1 and P2
- * commands are not supported.
+ * Run one command. The response's payload is out, and the commands of WPA3
+ * and the other P1 and P2 features are not supported.
  */
 static int vduse_guest_wlan_dispatch(struct vduse_guest_wlan *wlan, u16 type,
 				     const u8 *p, size_t len,
@@ -1784,7 +1900,13 @@ static int vduse_guest_wlan_dispatch(struct vduse_guest_wlan *wlan, u16 type,
 		*out_len = wlan->wiphy_resp_len;
 		return 0;
 	case VIRTIO_WLAN_CMD_OPEN:
-		return len ? -EINVAL : cfg80211_client_open(wlan->client);
+		if (len)
+			return -EINVAL;
+		err = cfg80211_client_open(wlan->client);
+		/* The host takes its view of the channels from here on. */
+		if (!err)
+			queue_work(wlan->wq, &wlan->country_work);
+		return err;
 	case VIRTIO_WLAN_CMD_CLOSE:
 		if (len)
 			return -EINVAL;
@@ -1815,6 +1937,12 @@ static int vduse_guest_wlan_dispatch(struct vduse_guest_wlan *wlan, u16 type,
 			*out_len = sizeof(*sta);
 		}
 		return err;
+	case VIRTIO_WLAN_CMD_SET_POWER_MGMT:
+		return vduse_guest_wlan_cmd_power_mgmt(wlan, p, len);
+	case VIRTIO_WLAN_CMD_SET_MAC:
+		return vduse_guest_wlan_cmd_set_mac(wlan, p, len);
+	case VIRTIO_WLAN_CMD_SET_COUNTRY:
+		return vduse_guest_wlan_cmd_set_country(wlan, p, len);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -2055,18 +2183,20 @@ static const struct {
 	{ IEEE80211_CHAN_NO_HE, VIRTIO_WLAN_CHAN_NO_HE },
 };
 
+/* Describe a channel with the given flags and maximum power. */
 static void vduse_guest_wlan_channel(const struct ieee80211_channel *chan,
+				     u32 kflags, int power,
 				     struct virtio_wlan_channel *out)
 {
 	u32 flags = 0;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(vduse_guest_wlan_chan_flags); i++)
-		if (chan->orig_flags & vduse_guest_wlan_chan_flags[i].kernel)
+		if (kflags & vduse_guest_wlan_chan_flags[i].kernel)
 			flags |= vduse_guest_wlan_chan_flags[i].wire;
 
 	out->freq = cpu_to_le16(chan->center_freq);
-	out->max_power = cpu_to_le16(clamp_t(int, chan->orig_mpwr, 0, U16_MAX));
+	out->max_power = cpu_to_le16(clamp_t(int, power, 0, U16_MAX));
 	out->flags = cpu_to_le32(flags);
 }
 
@@ -2124,7 +2254,66 @@ static void vduse_guest_wlan_band(const struct ieee80211_supported_band *sband,
 	}
 
 	for (i = 0; i < sband->n_channels; i++)
-		vduse_guest_wlan_channel(&sband->channels[i], &chans[i]);
+		vduse_guest_wlan_channel(&sband->channels[i],
+					 sband->channels[i].orig_flags,
+					 sband->channels[i].orig_mpwr, &chans[i]);
+}
+
+/*
+ * Report the country that applies to the interface and the channels as it
+ * leaves them. The driver can free its channels once the interface is gone,
+ * so they are read under the RTNL.
+ */
+static void vduse_guest_wlan_country_work(struct work_struct *work)
+{
+	struct vduse_guest_wlan *wlan =
+		container_of(work, struct vduse_guest_wlan, country_work);
+	static const enum nl80211_band bands[] = {
+		NL80211_BAND_2GHZ, NL80211_BAND_5GHZ, NL80211_BAND_6GHZ,
+	};
+	struct virtio_wlan_event_country *e;
+	struct ieee80211_supported_band *sband;
+	struct vduse_guest_wlan_event *ev = NULL;
+	struct virtio_wlan_channel *chans;
+	unsigned int n = 0;
+	char alpha2[2];
+	int b, i;
+
+	rtnl_lock();
+	if (wlan->gone ||
+	    cfg80211_client_get_country(wlan->client, alpha2))
+		goto out;
+
+	for (b = 0; b < ARRAY_SIZE(bands); b++)
+		if (wlan->wiphy->bands[bands[b]])
+			n += wlan->wiphy->bands[bands[b]]->n_channels;
+	if (sizeof(struct virtio_wlan_event_hdr) + sizeof(*e) +
+	    n * sizeof(*chans) > VDUSE_GUEST_WLAN_EVENT_SIZE)
+		goto out;
+	ev = vduse_guest_wlan_event_alloc(VIRTIO_WLAN_EVENT_COUNTRY,
+					  sizeof(*e) + n * sizeof(*chans),
+					  GFP_KERNEL);
+	if (!ev)
+		goto out;
+
+	e = vduse_guest_wlan_event_payload(ev);
+	memcpy(e->alpha2, alpha2, sizeof(e->alpha2));
+	e->n_channels = cpu_to_le16(n);
+	chans = (void *)(e + 1);
+	for (b = 0; b < ARRAY_SIZE(bands); b++) {
+		sband = wlan->wiphy->bands[bands[b]];
+		for (i = 0; sband && i < sband->n_channels; i++)
+			vduse_guest_wlan_channel(&sband->channels[i],
+						 sband->channels[i].flags,
+						 sband->channels[i].max_power,
+						 chans++);
+	}
+out:
+	rtnl_unlock();
+	if (!ev)
+		return;
+	vduse_guest_wlan_queue_event(wlan, ev, false);
+	queue_work(wlan->wq, &wlan->event_work);
 }
 
 /* Describe the wiphy as GET_WIPHY reports it, for the 2.4, 5 and 6 GHz bands. */
@@ -2331,6 +2520,7 @@ static void *__init vduse_guest_wlan_setup(struct vduse_guest_dev *dev,
 	INIT_WORK(&wlan->cmd_work, vduse_guest_wlan_cmd_work);
 	INIT_WORK(&wlan->note_work, vduse_guest_wlan_note_work);
 	INIT_WORK(&wlan->event_work, vduse_guest_wlan_event_work);
+	INIT_WORK(&wlan->country_work, vduse_guest_wlan_country_work);
 	INIT_DELAYED_WORK(&wlan->rx_work, vduse_guest_wlan_rx_work);
 	INIT_WORK(&wlan->tx_work, vduse_guest_wlan_tx_work);
 	spin_lock_init(&wlan->data_lock);
@@ -2364,6 +2554,7 @@ static void *__init vduse_guest_wlan_setup(struct vduse_guest_dev *dev,
 	wlan->config.max_wiphy_size = cpu_to_le32(VDUSE_GUEST_WLAN_WIPHY_SIZE);
 
 	cfg->device_id = VIRTIO_ID_MAC80211_WLAN;
+	cfg->features = BIT_ULL(VIRTIO_WLAN_F_SET_MAC);
 	cfg->num_queues = VIRTIO_WLAN_VQ_MAX;
 	cfg->queue_sizes = vduse_guest_wlan_queue_sizes;
 	/*
@@ -2379,6 +2570,7 @@ static void *__init vduse_guest_wlan_setup(struct vduse_guest_dev *dev,
 	return wlan;
 
 unlock:
+	wlan->gone = true;
 	rtnl_unlock();
 	kfree(wlan->wiphy_resp);
 	cfg80211_client_unregister(wlan->client);
@@ -2392,6 +2584,10 @@ static void vduse_guest_wlan_release(void *priv)
 {
 	struct vduse_guest_wlan *wlan = priv;
 
+	/* A country work that runs after this does not use the client. */
+	rtnl_lock();
+	wlan->gone = true;
+	rtnl_unlock();
 	cfg80211_client_unregister(wlan->client);
 	destroy_workqueue(wlan->wq);
 	kfree(wlan->wiphy_resp);

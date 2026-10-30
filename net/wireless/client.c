@@ -188,6 +188,24 @@ int cfg80211_client_set_country(struct cfg80211_client *client,
 }
 EXPORT_SYMBOL_GPL(cfg80211_client_set_country);
 
+int cfg80211_client_get_country(struct cfg80211_client *client, char *alpha2)
+{
+	const struct ieee80211_regdomain *regd;
+	int err = 0;
+
+	rcu_read_lock();
+	regd = get_wiphy_regdom(&client->rdev->wiphy);
+	if (!regd)
+		regd = rcu_dereference(cfg80211_regdomain);
+	if (regd)
+		memcpy(alpha2, regd->alpha2, 2);
+	else
+		err = -ENOENT;
+	rcu_read_unlock();
+	return err;
+}
+EXPORT_SYMBOL_GPL(cfg80211_client_get_country);
+
 static int client_check_scan(struct wiphy *wiphy,
 			     const struct cfg80211_client_scan_params *params)
 {
