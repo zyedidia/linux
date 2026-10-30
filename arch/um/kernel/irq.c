@@ -167,8 +167,8 @@ static void irq_do_pending_events(bool timetravel_handlers_only)
 }
 #endif
 
-static void sigio_reg_handler(int idx, struct irq_entry *entry, enum um_irq_type t,
-			      struct uml_pt_regs *regs,
+static void sigio_reg_handler(int events, struct irq_entry *entry,
+			      enum um_irq_type t, struct uml_pt_regs *regs,
 			      bool timetravel_handlers_only)
 {
 	struct irq_reg *reg = &entry->reg[t];
@@ -176,7 +176,7 @@ static void sigio_reg_handler(int idx, struct irq_entry *entry, enum um_irq_type
 	if (!reg->events)
 		return;
 
-	if (os_epoll_triggered(idx, reg->events) <= 0)
+	if (!(events & reg->events))
 		return;
 
 	if (irq_do_timetravel_handler(entry, t))
@@ -200,10 +200,19 @@ static void sigio_reg_handler(int idx, struct irq_entry *entry, enum um_irq_type
 	irq_io_loop(reg, regs);
 }
 
+/*
+ * An IRQ handler can enable interrupts, as irq_exit() does to run softirqs,
+ * and so run this handler again for a pending SIGIO. The epoll buffer of the
+ * host thread is then refilled, and the fds are edge-triggered, so each
+ * batch is copied out of it before its events are handled.
+ */
 static void _sigio_handler(struct uml_pt_regs *regs,
 			   bool timetravel_handlers_only)
 {
-	struct irq_entry *irq_entry;
+	struct {
+		struct irq_entry *entry;
+		int events;
+	} batch[UM_EPOLL_BATCH];
 	int n, i;
 
 	if (timetravel_handlers_only && !um_irq_timetravel_handler_used())
@@ -229,13 +238,17 @@ static void _sigio_handler(struct uml_pt_regs *regs,
 				break;
 		}
 
-		for (i = 0; i < n ; i++) {
+		for (i = 0; i < n; i++) {
+			batch[i].entry = os_epoll_get_data_pointer(i);
+			batch[i].events = os_epoll_get_events(i);
+		}
+
+		for (i = 0; i < n; i++) {
 			enum um_irq_type t;
 
-			irq_entry = os_epoll_get_data_pointer(i);
-
 			for (t = 0; t < NUM_IRQ_TYPES; t++)
-				sigio_reg_handler(i, irq_entry, t, regs,
+				sigio_reg_handler(batch[i].events,
+						  batch[i].entry, t, regs,
 						  timetravel_handlers_only);
 		}
 	}

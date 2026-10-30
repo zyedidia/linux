@@ -305,9 +305,11 @@ extern void halt_skas(void);
 extern void reboot_skas(void);
 
 /* irq.c */
+/* The most events that one os_waiting_for_events_epoll() returns. */
+#define UM_EPOLL_BATCH 16
 extern int os_waiting_for_events_epoll(void);
 extern void *os_epoll_get_data_pointer(int index);
-extern int os_epoll_triggered(int index, int events);
+extern int os_epoll_get_events(int index);
 extern int os_event_mask(enum um_irq_type irq_type);
 extern int os_setup_epoll(void);
 extern int os_add_epoll_fd(int cpu, int events, int fd, void *data);

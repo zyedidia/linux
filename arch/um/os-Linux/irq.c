@@ -25,9 +25,7 @@
  */
 static int epollfds[CONFIG_NR_CPUS] = { [0 ... CONFIG_NR_CPUS - 1] = -1 };
 
-#define MAX_EPOLL_EVENTS 64
-
-static __thread struct epoll_event epoll_events[MAX_EPOLL_EVENTS];
+static __thread struct epoll_event epoll_events[UM_EPOLL_BATCH];
 
 /* The CPU that handles each fd's IRQs, which the SIGIO helper signals. */
 #define MAX_IRQ_FDS 4096
@@ -63,14 +61,13 @@ void *os_epoll_get_data_pointer(int index)
 	return epoll_events[index].data.ptr;
 }
 
-/* Helper to compare events versus the events in the epoll structure.
- * Same as above - needs to be on the userspace side
+/*
+ * Helper to return the events of an epoll event structure, which the
+ * kernel side compares with masks from os_event_mask().
  */
-
-
-int os_epoll_triggered(int index, int events)
+int os_epoll_get_events(int index)
 {
-	return epoll_events[index].events & events;
+	return epoll_events[index].events;
 }
 /* Helper to set the event mask.
  * The event mask is opaque to the kernel side, because it does not have
@@ -94,7 +91,7 @@ int os_setup_epoll(void)
 	int cpu;
 
 	for (cpu = 0; cpu < uml_ncpus; cpu++) {
-		epollfds[cpu] = epoll_create(MAX_EPOLL_EVENTS);
+		epollfds[cpu] = epoll_create(UM_EPOLL_BATCH);
 		if (epollfds[cpu] < 0)
 			return -errno;
 	}
@@ -115,7 +112,7 @@ int os_waiting_for_events_epoll(void)
 	int n, err;
 
 	n = epoll_wait(os_epoll_fd(),
-		(struct epoll_event *) &epoll_events, MAX_EPOLL_EVENTS, 0);
+		(struct epoll_event *) &epoll_events, UM_EPOLL_BATCH, 0);
 	if (n < 0) {
 		err = -errno;
 		if (errno != EINTR)
