@@ -2101,6 +2101,26 @@ static int mac80211_hwsim_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	return 0;
 }
 
+/*
+ * The fast transmit path reserves no room for the security header and MIC of
+ * a key that is uploaded to the driver, so make room before encrypting.
+ */
+static int mac80211_hwsim_encrypt(struct sk_buff *skb)
+{
+	struct ieee80211_tx_info *txi = IEEE80211_SKB_CB(skb);
+	int head, tail;
+
+	if (!txi->control.hw_key)
+		return 0;
+
+	head = max_t(int, IEEE80211_CCMP_HDR_LEN - skb_headroom(skb), 0);
+	tail = max_t(int, IEEE80211_GCMP_MIC_LEN - skb_tailroom(skb), 0);
+	if ((head || tail) && pskb_expand_head(skb, head, tail, GFP_ATOMIC))
+		return -ENOMEM;
+
+	return ieee80211_encrypt_tx_skb(skb);
+}
+
 static void mac80211_hwsim_tx(struct ieee80211_hw *hw,
 			      struct ieee80211_tx_control *control,
 			      struct sk_buff *skb)
@@ -2124,7 +2144,7 @@ static void mac80211_hwsim_tx(struct ieee80211_hw *hw,
 	unicast_data = is_unicast_ether_addr(hdr->addr1) &&
 		       ieee80211_is_data(hdr->frame_control);
 
-	if (unicast_data && ieee80211_encrypt_tx_skb(skb) < 0) {
+	if (unicast_data && mac80211_hwsim_encrypt(skb) < 0) {
 		ieee80211_free_txskb(hw, skb);
 		return;
 	}
@@ -2213,7 +2233,7 @@ static void mac80211_hwsim_tx(struct ieee80211_hw *hw,
 		}
 	}
 
-	if (!unicast_data && ieee80211_encrypt_tx_skb(skb) < 0) {
+	if (!unicast_data && mac80211_hwsim_encrypt(skb) < 0) {
 		ieee80211_free_txskb(hw, skb);
 		return;
 	}
