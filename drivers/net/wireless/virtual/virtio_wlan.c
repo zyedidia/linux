@@ -2265,6 +2265,8 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	set_wiphy_dev(wiphy, &vdev->dev);
 	memcpy(wiphy->perm_addr, mac, ETH_ALEN);
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	/* The driver keeps no state of the network namespace. */
+	wiphy->flags |= WIPHY_FLAG_NETNS_OK;
 	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	wiphy_ext_feature_set(wiphy,
 			      NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211);
