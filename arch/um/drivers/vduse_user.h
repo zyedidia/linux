@@ -43,6 +43,14 @@ int uml_vduse_user_create(int control, const char *name, uint32_t device_id,
 			  const void *config, uint32_t config_size);
 int uml_vduse_user_destroy(int control, const char *name);
 int uml_vduse_user_open(const char *name);
+int uml_vduse_user_broker_create(int broker, const char *name,
+				 uint32_t device_id, uint64_t features,
+				 uint32_t vq_num, uint32_t vq_align,
+				 const void *config, uint32_t config_size);
+int uml_vduse_user_broker_destroy(int broker, const char *name);
+int uml_vduse_user_broker_open(int broker, const char *name);
+int uml_vduse_user_broker_resize_log(int broker, const char *name,
+				     uint64_t size);
 
 int uml_vduse_user_read_msg(int fd, struct uml_vduse_user_msg *msg);
 int uml_vduse_user_reply(int fd, const struct uml_vduse_user_msg *msg,
@@ -74,6 +82,7 @@ int uml_vduse_user_reg_umem(int fd, void *addr, uint64_t size);
 int uml_vduse_user_dereg_umem(int fd, uint64_t size);
 
 int uml_vduse_user_open_log(const char *path);
+int uml_vduse_user_log_size(int fd, uint64_t *size);
 int uml_vduse_user_map_log(int fd, size_t size, int resize, void **addr);
 void uml_vduse_user_unmap_log(void *addr, size_t size);
 int uml_vduse_user_remove_log(const char *path);

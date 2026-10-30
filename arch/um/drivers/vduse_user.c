@@ -9,6 +9,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <linux/vduse.h>
 #include <um_malloc.h>
@@ -62,6 +63,153 @@ int uml_vduse_user_create(int control, const char *name, uint32_t device_id,
 
 	kfree(cfg);
 	return err;
+}
+
+/*
+ * A request to a launcher that creates, destroys and opens VDUSE devices on
+ * UML's behalf, and resizes their in-flight logs. The launcher defines the
+ * same layout. A create request is followed by the configuration space, and
+ * the launcher answers each request with an errno value, zero or negative,
+ * and passes the device fd with SCM_RIGHTS in its answer to an open request.
+ */
+enum {
+	UML_VDUSE_BROKER_CREATE = 1,
+	UML_VDUSE_BROKER_DESTROY,
+	UML_VDUSE_BROKER_OPEN,
+	UML_VDUSE_BROKER_RESIZE_LOG,
+};
+
+struct uml_vduse_broker_request {
+	uint32_t op;
+	uint32_t device_id;
+	uint32_t vq_num;
+	uint32_t vq_align;
+	uint64_t features;
+	uint64_t log_size;
+	uint32_t config_size;
+	uint32_t reserved;
+	char name[VDUSE_NAME_MAX];
+};
+
+static int broker_call(int broker, struct uml_vduse_broker_request *req,
+		       const void *config, uint32_t config_size, int *fd)
+{
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} control;
+	struct iovec iov[2] = {
+		{ .iov_base = req, .iov_len = sizeof(*req) },
+		{ .iov_base = (void *)config, .iov_len = config_size },
+	};
+	struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 2 };
+	struct cmsghdr *cmsg;
+	int32_t err;
+	int passed = -1;
+	ssize_t n;
+
+	do {
+		n = sendmsg(broker, &msg, MSG_NOSIGNAL);
+	} while (n < 0 && errno == EINTR);
+	if (n < 0)
+		return -errno;
+
+	iov[0] = (struct iovec){ .iov_base = &err, .iov_len = sizeof(err) };
+	msg = (struct msghdr){
+		.msg_iov = iov,
+		.msg_iovlen = 1,
+		.msg_control = control.buf,
+		.msg_controllen = sizeof(control.buf),
+	};
+	do {
+		n = recvmsg(broker, &msg, MSG_CMSG_CLOEXEC);
+	} while (n < 0 && errno == EINTR);
+	if (n < 0)
+		return -errno;
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+	    cmsg->cmsg_type == SCM_RIGHTS &&
+	    cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
+		memcpy(&passed, CMSG_DATA(cmsg), sizeof(int));
+
+	if (n != sizeof(err))
+		err = -EIO;
+	else if (!err && fd && passed < 0)
+		err = -EIO;
+	if (!err && fd) {
+		*fd = passed;
+		return 0;
+	}
+	if (passed >= 0)
+		close(passed);
+	return err > 0 ? -EIO : err;
+}
+
+static int broker_name(struct uml_vduse_broker_request *req, uint32_t op,
+		       const char *name)
+{
+	if (strlen(name) >= VDUSE_NAME_MAX)
+		return -ENAMETOOLONG;
+	memset(req, 0, sizeof(*req));
+	req->op = op;
+	strcpy(req->name, name);
+	return 0;
+}
+
+int uml_vduse_user_broker_create(int broker, const char *name,
+				 uint32_t device_id, uint64_t features,
+				 uint32_t vq_num, uint32_t vq_align,
+				 const void *config, uint32_t config_size)
+{
+	struct uml_vduse_broker_request req;
+	int err;
+
+	err = broker_name(&req, UML_VDUSE_BROKER_CREATE, name);
+	if (err)
+		return err;
+	req.device_id = device_id;
+	req.features = features;
+	req.vq_num = vq_num;
+	req.vq_align = vq_align;
+	req.config_size = config_size;
+	return broker_call(broker, &req, config, config_size, NULL);
+}
+
+int uml_vduse_user_broker_destroy(int broker, const char *name)
+{
+	struct uml_vduse_broker_request req;
+	int err;
+
+	err = broker_name(&req, UML_VDUSE_BROKER_DESTROY, name);
+	if (err)
+		return err;
+	return broker_call(broker, &req, NULL, 0, NULL);
+}
+
+int uml_vduse_user_broker_open(int broker, const char *name)
+{
+	struct uml_vduse_broker_request req;
+	int err, fd;
+
+	err = broker_name(&req, UML_VDUSE_BROKER_OPEN, name);
+	if (err)
+		return err;
+	err = broker_call(broker, &req, NULL, 0, &fd);
+	return err ? err : fd;
+}
+
+int uml_vduse_user_broker_resize_log(int broker, const char *name,
+				     uint64_t size)
+{
+	struct uml_vduse_broker_request req;
+	int err;
+
+	err = broker_name(&req, UML_VDUSE_BROKER_RESIZE_LOG, name);
+	if (err)
+		return err;
+	req.log_size = size;
+	return broker_call(broker, &req, NULL, 0, NULL);
 }
 
 int uml_vduse_user_destroy(int control, const char *name)
@@ -317,6 +465,16 @@ int uml_vduse_user_open_log(const char *path)
 	if (fd < 0)
 		return -errno;
 	return fd;
+}
+
+int uml_vduse_user_log_size(int fd, uint64_t *size)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) < 0)
+		return -errno;
+	*size = st.st_size;
+	return 0;
 }
 
 /*

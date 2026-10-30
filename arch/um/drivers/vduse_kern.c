@@ -5,6 +5,8 @@
 #include <linux/interrupt.h>
 #include <linux/kstrtox.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/vduse_guest.h>
@@ -39,6 +41,16 @@ struct uml_vduse {
 };
 
 static int uml_vduse_control = -1;
+
+/*
+ * The launcher's socket, through which UML creates, destroys and opens
+ * devices.
+ */
+static int uml_vduse_broker_fd = -1;
+module_param_named(broker_fd, uml_vduse_broker_fd, int, 0400);
+
+/* Each broker request waits for its answer before the next is sent. */
+static DEFINE_MUTEX(uml_vduse_broker_lock);
 
 static struct uml_vduse *uml_vduse_of(struct vduse_guest_dev *dev)
 {
@@ -103,6 +115,16 @@ static int uml_vduse_create(struct vduse_guest_dev *dev,
 			    const struct vduse_guest_config *cfg, u64 features,
 			    u32 vq_align)
 {
+	if (uml_vduse_broker_fd >= 0) {
+		guard(mutex)(&uml_vduse_broker_lock);
+		return uml_vduse_user_broker_create(uml_vduse_broker_fd,
+						    vduse_guest_name(dev),
+						    cfg->device_id, features,
+						    cfg->num_queues, vq_align,
+						    cfg->config,
+						    cfg->config_size);
+	}
+
 	if (uml_vduse_control < 0) {
 		uml_vduse_control = uml_vduse_user_open_control();
 		if (uml_vduse_control < 0)
@@ -116,6 +138,12 @@ static int uml_vduse_create(struct vduse_guest_dev *dev,
 
 static int uml_vduse_destroy(struct vduse_guest_dev *dev)
 {
+	if (uml_vduse_broker_fd >= 0) {
+		guard(mutex)(&uml_vduse_broker_lock);
+		return uml_vduse_user_broker_destroy(uml_vduse_broker_fd,
+						     vduse_guest_name(dev));
+	}
+
 	return uml_vduse_user_destroy(uml_vduse_control, vduse_guest_name(dev));
 }
 
@@ -134,7 +162,13 @@ static int uml_vduse_open(struct vduse_guest_dev *dev)
 		u->vqs[i].kickfd = -1;
 	}
 
-	u->fd = uml_vduse_user_open(vduse_guest_name(dev));
+	if (uml_vduse_broker_fd >= 0) {
+		guard(mutex)(&uml_vduse_broker_lock);
+		u->fd = uml_vduse_user_broker_open(uml_vduse_broker_fd,
+						   vduse_guest_name(dev));
+	} else {
+		u->fd = uml_vduse_user_open(vduse_guest_name(dev));
+	}
 	if (u->fd < 0)
 		return u->fd;
 
@@ -440,17 +474,37 @@ static int uml_vduse_dereg_umem(struct vduse_guest_dev *dev, u64 size)
 	return uml_vduse_user_dereg_umem(uml_vduse_of(dev)->fd, size);
 }
 
+/* The sandbox does not allow ftruncate, so the launcher resizes the log. */
+static int uml_vduse_broker_resize_log(struct vduse_guest_dev *dev, u64 size)
+{
+	guard(mutex)(&uml_vduse_broker_lock);
+	return uml_vduse_user_broker_resize_log(uml_vduse_broker_fd,
+						vduse_guest_name(dev), size);
+}
+
 /* A log given by path is opened here and closed with its mapping. */
 static int uml_vduse_map_log(struct vduse_guest_dev *dev, size_t size,
 			     bool resize, void **addr)
 {
 	struct uml_vduse *u = uml_vduse_of(dev);
+	u64 cur;
 	int err;
 
 	if (u->log_path) {
 		u->log_fd = uml_vduse_user_open_log(u->log_path);
 		if (u->log_fd < 0)
 			return u->log_fd;
+	} else if (uml_vduse_broker_fd >= 0) {
+		err = uml_vduse_user_log_size(u->log_fd, &cur);
+		if (err)
+			return err;
+		if (cur != size && !resize)
+			return -EINVAL;
+		if (cur != size) {
+			err = uml_vduse_broker_resize_log(dev, size);
+			if (err)
+				return err;
+		}
 	}
 
 	err = uml_vduse_user_map_log(u->log_fd, size, resize, addr);
@@ -477,10 +531,15 @@ static void uml_vduse_drop_log(struct vduse_guest_dev *dev)
 {
 	struct uml_vduse *u = uml_vduse_of(dev);
 
-	if (u->log_path)
+	if (u->log_path) {
 		uml_vduse_user_remove_log(u->log_path);
-	else
+	} else if (uml_vduse_broker_fd >= 0) {
+		if (uml_vduse_broker_resize_log(dev, 0))
+			pr_warn("%s: the launcher did not empty the in-flight log\n",
+				vduse_guest_name(dev));
+	} else {
 		uml_vduse_user_truncate_log(u->log_fd);
+	}
 }
 
 static const struct vduse_guest_host_ops uml_vduse_host_ops = {
@@ -555,4 +614,8 @@ __uml_help(uml_vduse_host,
 "    more for up to that long before it asks the host for a kick, which\n"
 "    saves kicks under load at the cost of guest CPU time. The default is\n"
 "    0.\n\n"
+"vduse_uml.broker_fd=<n>\n"
+"    Create, destroy and open VDUSE devices through a launcher that serves\n"
+"    the socket <n>, instead of through /dev/vduse. The launcher keeps the\n"
+"    control device to itself and decides which devices UML may create.\n\n"
 );
