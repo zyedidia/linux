@@ -7,6 +7,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/virtio.h>
@@ -19,15 +20,22 @@
 #define VIRTIO_WLAN_SCAN_TIMEOUT	(15 * HZ)
 #define VIRTIO_WLAN_CONNECT_TIMEOUT	(30 * HZ)
 #define VIRTIO_WLAN_EVENT_BUFS		128
+#define VIRTIO_WLAN_RX_BUFS		1024
 #define VIRTIO_WLAN_EVENT_BUDGET	64
 #define VIRTIO_WLAN_MAX_CONFIG_SIZE	16384
 #define VIRTIO_WLAN_MAX_POWER		30
 #define VIRTIO_WLAN_MAX_SCAN_SSIDS	16
 #define VIRTIO_WLAN_MAX_SCAN_IE_LEN	2048
+#define VIRTIO_WLAN_TX_TIMEOUT		(5 * HZ)
 
-/* A received frame fits in one page together with both of its headers. */
+/*
+ * An rx buffer holds the virtio header and the largest frame, which can have
+ * a VLAN tag. The MTU keeps it within one page.
+ */
+#define VIRTIO_WLAN_RX_BUF_SIZE(mtu) \
+	(sizeof(struct virtio_net_hdr_v1) + VLAN_ETH_HLEN + (mtu))
 #define VIRTIO_WLAN_MAX_MTU \
-	(PAGE_SIZE - sizeof(struct virtio_net_hdr_v1) - ETH_HLEN)
+	(PAGE_SIZE - VIRTIO_WLAN_RX_BUF_SIZE(0))
 
 static_assert(VIRTIO_WLAN_MAX_AKM_SUITES <= CFG80211_MAX_NUM_AKM_SUITES);
 static_assert(NL80211_MAX_NR_CIPHER_SUITES <= VIRTIO_WLAN_MAX_PAIRWISE);
@@ -115,6 +123,9 @@ struct virtio_wlan_stats {
 	u32 bad_rates;
 	u32 scan_timeouts;
 	u32 connect_timeouts;
+	u32 bad_rx_frames;
+	u32 tx_timeouts;
+	u32 rx_post_errors;
 };
 
 static const struct {
@@ -132,6 +143,9 @@ static const struct {
 	{ "scan_timeouts", offsetof(struct virtio_wlan_stats, scan_timeouts) },
 	{ "connect_timeouts",
 	  offsetof(struct virtio_wlan_stats, connect_timeouts) },
+	{ "bad_rx_frames", offsetof(struct virtio_wlan_stats, bad_rx_frames) },
+	{ "tx_timeouts", offsetof(struct virtio_wlan_stats, tx_timeouts) },
+	{ "rx_post_errors", offsetof(struct virtio_wlan_stats, rx_post_errors) },
 };
 
 enum virtio_wlan_conn_state {
@@ -145,8 +159,17 @@ struct virtio_wlan {
 	struct virtio_device *vdev;
 	struct net_device *netdev;
 	struct wireless_dev wdev;
+	struct virtqueue *rx_vq;
+	struct virtqueue *tx_vq;
 	struct virtqueue *cmd_vq;
 	struct virtqueue *event_vq;
+	struct napi_struct rx_napi;
+	struct napi_struct tx_napi;
+	void **rx_bufs;
+	unsigned int n_rx_bufs;
+	/* The rx buffers that could not be posted again, for the rx poll. */
+	void **rx_spare;
+	unsigned int n_rx_spare;
 	struct completion cmd_done;
 	void *cmd_buf;
 	size_t cmd_size;
@@ -159,7 +182,10 @@ struct virtio_wlan {
 	u32 max_event_size;
 	struct virtio_wlan_band_data bands[ARRAY_SIZE(virtio_wlan_bands)];
 	u32 ciphers[VIRTIO_WLAN_MAX_CIPHER_SUITES];
-	/* The callbacks of the event queue do nothing until this is set. */
+	/*
+	 * The callbacks of the data and event queues do nothing until this is
+	 * set.
+	 */
 	bool ready;
 	unsigned long event_scheduled;
 	struct wiphy_delayed_work event_work;
@@ -196,13 +222,18 @@ static void virtio_wlan_finish_scan(struct virtio_wlan *vw, bool aborted)
 	vw->scan_req = NULL;
 }
 
-/* Stop tracking the connection or attempt, without reporting anything. */
+/*
+ * Stop tracking the connection or attempt, without reporting anything. The
+ * carrier is on only while connected.
+ */
 static enum virtio_wlan_conn_state virtio_wlan_end_conn(struct virtio_wlan *vw)
 {
 	enum virtio_wlan_conn_state state = vw->conn_state;
 
 	vw->conn_state = VIRTIO_WLAN_IDLE;
 	wiphy_delayed_work_cancel(vw->wiphy, &vw->conn_timeout);
+	if (state == VIRTIO_WLAN_CONNECTED)
+		netif_carrier_off(vw->netdev);
 	return state;
 }
 
@@ -1319,6 +1350,7 @@ static void virtio_wlan_event_connect_result(struct virtio_wlan *vw,
 		cr.links[0].bssid = cr.links[0].bss->bssid;
 		vw->conn_state = VIRTIO_WLAN_CONNECTED;
 		wiphy_delayed_work_cancel(vw->wiphy, &vw->conn_timeout);
+		netif_carrier_on(vw->netdev);
 	} else {
 		virtio_wlan_end_conn(vw);
 		if (is_valid_ether_addr(e->bss.bssid))
@@ -1516,12 +1548,250 @@ static void virtio_wlan_event_work(struct wiphy *wiphy, struct wiphy_work *work)
 	}
 }
 
-static int virtio_wlan_open(struct net_device *dev)
+static void virtio_wlan_napi_schedule(struct napi_struct *napi,
+				      struct virtqueue *vq)
+{
+	if (napi_schedule_prep(napi)) {
+		virtqueue_disable_cb(vq);
+		__napi_schedule(napi);
+	}
+}
+
+/* A buffer used after the callback is enabled schedules the poll again. */
+static void virtio_wlan_napi_complete(struct napi_struct *napi,
+				      struct virtqueue *vq, int done)
+{
+	unsigned int opaque = virtqueue_enable_cb_prepare(vq);
+
+	if (napi_complete_done(napi, done)) {
+		if (unlikely(virtqueue_poll(vq, opaque)))
+			virtio_wlan_napi_schedule(napi, vq);
+	} else {
+		virtqueue_disable_cb(vq);
+	}
+}
+
+static void virtio_wlan_rx_done(struct virtqueue *vq)
+{
+	struct virtio_wlan *vw = vq->vdev->priv;
+
+	/* This pairs with the release in probe once the driver is complete. */
+	if (smp_load_acquire(&vw->ready))
+		virtio_wlan_napi_schedule(&vw->rx_napi, vq);
+}
+
+static void virtio_wlan_tx_done(struct virtqueue *vq)
+{
+	struct virtio_wlan *vw = vq->vdev->priv;
+
+	/* This pairs with the release in probe once the driver is complete. */
+	if (smp_load_acquire(&vw->ready))
+		virtio_wlan_napi_schedule(&vw->tx_napi, vq);
+}
+
+static int virtio_wlan_post_rx(struct virtio_wlan *vw, void *buf, gfp_t gfp)
+{
+	struct scatterlist sg;
+
+	sg_init_one(&sg, buf, VIRTIO_WLAN_RX_BUF_SIZE(vw->mtu));
+	return virtqueue_add_inbuf(vw->rx_vq, &sg, 1, buf, gfp);
+}
+
+/*
+ * No offload is negotiated, so the header is zero apart from num_buffers,
+ * which is ignored.
+ */
+static void virtio_wlan_receive(struct virtio_wlan *vw, void *buf,
+				unsigned int len)
+{
+	const struct virtio_net_hdr_v1 *hdr = buf;
+	struct net_device *dev = vw->netdev;
+	unsigned int frame_len;
+	struct sk_buff *skb;
+
+	if (len < sizeof(*hdr) + ETH_HLEN ||
+	    len > VIRTIO_WLAN_RX_BUF_SIZE(vw->mtu) || hdr->flags ||
+	    hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
+		vw->stats.bad_rx_frames++;
+		return;
+	}
+	frame_len = len - sizeof(*hdr);
+
+	skb = napi_alloc_skb(&vw->rx_napi, frame_len);
+	if (!skb) {
+		dev_core_stats_rx_dropped_inc(dev);
+		return;
+	}
+	skb_put_data(skb, hdr + 1, frame_len);
+	skb->protocol = eth_type_trans(skb, dev);
+	dev_sw_netstats_rx_add(dev, frame_len);
+	napi_gro_receive(&vw->rx_napi, skb);
+}
+
+/*
+ * Each frame is copied out of its buffer, which is posted again at once, so
+ * the ring needs no refill. A buffer that cannot be posted, since mapping it
+ * can fail, is kept as a spare, and the poll returns its full budget so that
+ * it runs again and retries, as virtio_net does.
+ */
+static int virtio_wlan_rx_poll(struct napi_struct *napi, int budget)
+{
+	struct virtio_wlan *vw = container_of(napi, struct virtio_wlan, rx_napi);
+	bool posted = false;
+	unsigned int len;
+	int done = 0;
+	void *buf;
+
+	while (vw->n_rx_spare &&
+	       !virtio_wlan_post_rx(vw, vw->rx_spare[vw->n_rx_spare - 1],
+				    GFP_ATOMIC)) {
+		vw->n_rx_spare--;
+		posted = true;
+	}
+	while (done < budget && (buf = virtqueue_get_buf(vw->rx_vq, &len))) {
+		virtio_wlan_receive(vw, buf, len);
+		if (virtio_wlan_post_rx(vw, buf, GFP_ATOMIC)) {
+			vw->stats.rx_post_errors++;
+			vw->rx_spare[vw->n_rx_spare++] = buf;
+		} else {
+			posted = true;
+		}
+		done++;
+	}
+	if (posted)
+		virtqueue_kick(vw->rx_vq);
+	if (vw->n_rx_spare)
+		return budget;
+	if (done < budget)
+		virtio_wlan_napi_complete(napi, vw->rx_vq, done);
+	return done;
+}
+
+/* Free the frames that the device has sent, with the queue's lock held. */
+static void virtio_wlan_free_tx(struct virtio_wlan *vw, int budget)
+{
+	unsigned int len, packets = 0, bytes = 0;
+	struct sk_buff *skb;
+
+	while ((skb = virtqueue_get_buf(vw->tx_vq, &len))) {
+		packets++;
+		bytes += skb->len - sizeof(struct virtio_net_hdr_v1);
+		napi_consume_skb(skb, budget);
+	}
+	if (packets)
+		dev_sw_netstats_tx_add(vw->netdev, packets, bytes);
+}
+
+static int virtio_wlan_tx_poll(struct napi_struct *napi, int budget)
+{
+	struct virtio_wlan *vw = container_of(napi, struct virtio_wlan, tx_napi);
+	struct netdev_queue *txq = netdev_get_tx_queue(vw->netdev, 0);
+	unsigned int opaque;
+	bool done;
+
+	__netif_tx_lock(txq, raw_smp_processor_id());
+	virtqueue_disable_cb(vw->tx_vq);
+	virtio_wlan_free_tx(vw, budget);
+	if (netif_tx_queue_stopped(txq) && vw->tx_vq->num_free)
+		netif_tx_wake_queue(txq);
+
+	opaque = virtqueue_enable_cb_prepare(vw->tx_vq);
+	done = napi_complete_done(napi, 0);
+	if (!done)
+		virtqueue_disable_cb(vw->tx_vq);
+	__netif_tx_unlock(txq);
+
+	/*
+	 * The callback is disabled under the queue's lock, which start_xmit
+	 * holds while it uses the queue.
+	 */
+	if (done && unlikely(virtqueue_poll(vw->tx_vq, opaque)) &&
+	    napi_schedule_prep(napi)) {
+		__netif_tx_lock(txq, raw_smp_processor_id());
+		virtqueue_disable_cb(vw->tx_vq);
+		__netif_tx_unlock(txq);
+		__napi_schedule(napi);
+	}
+	return 0;
+}
+
+/*
+ * Each frame takes one descriptor, and the queue stops when the ring is full.
+ * A frame that the device sends after that schedules the tx poll, which wakes
+ * the queue. The ring can also still be full when the interface comes up, so
+ * a frame that finds no descriptor stops the queue and waits.
+ */
+static netdev_tx_t virtio_wlan_start_xmit(struct sk_buff *skb,
+					  struct net_device *dev)
+{
+	struct virtio_wlan *vw = wiphy_priv(dev->ieee80211_ptr->wiphy);
+	bool kick = !netdev_xmit_more();
+	struct virtio_net_hdr_v1 *hdr;
+	struct scatterlist sg;
+
+	virtio_wlan_free_tx(vw, 0);
+	if (unlikely(!vw->tx_vq->num_free)) {
+		netif_stop_queue(dev);
+		return NETDEV_TX_BUSY;
+	}
+
+	/*
+	 * The timestamp can clone the skb, and skb_cow_head() then copies the
+	 * header that the push writes into.
+	 */
+	skb_tx_timestamp(skb);
+	if (skb_cow_head(skb, sizeof(*hdr)) || skb_linearize(skb))
+		goto drop;
+	hdr = skb_push(skb, sizeof(*hdr));
+	memset(hdr, 0, sizeof(*hdr));
+	sg_init_one(&sg, skb->data, skb->len);
+	if (virtqueue_add_outbuf(vw->tx_vq, &sg, 1, skb, GFP_ATOMIC))
+		goto drop;
+
+	if (!vw->tx_vq->num_free)
+		netif_stop_queue(dev);
+	if (kick || netif_queue_stopped(dev))
+		virtqueue_kick(vw->tx_vq);
+	return NETDEV_TX_OK;
+
+drop:
+	/* Frames added before this one may be waiting for the kick. */
+	if (kick)
+		virtqueue_kick(vw->tx_vq);
+	dev_core_stats_tx_dropped_inc(dev);
+	dev_kfree_skb_any(skb);
+	return NETDEV_TX_OK;
+}
+
+/* A missed wakeup leaves sent frames unreclaimed, so the tx poll runs. */
+static void virtio_wlan_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	struct virtio_wlan *vw = wiphy_priv(dev->ieee80211_ptr->wiphy);
 
-	guard(wiphy)(vw->wiphy);
-	return virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_OPEN, NULL, 0, NULL, 0, NULL);
+	vw->stats.tx_timeouts++;
+	virtio_wlan_napi_schedule(&vw->tx_napi, vw->tx_vq);
+}
+
+/* Buffers that the device used while the interface was down are polled now. */
+static int virtio_wlan_open(struct net_device *dev)
+{
+	struct virtio_wlan *vw = wiphy_priv(dev->ieee80211_ptr->wiphy);
+	int err;
+
+	wiphy_lock(vw->wiphy);
+	err = virtio_wlan_cmd(vw, VIRTIO_WLAN_CMD_OPEN, NULL, 0, NULL, 0, NULL);
+	wiphy_unlock(vw->wiphy);
+	if (err)
+		return err;
+
+	napi_enable(&vw->rx_napi);
+	napi_enable(&vw->tx_napi);
+	local_bh_disable();
+	virtio_wlan_napi_schedule(&vw->rx_napi, vw->rx_vq);
+	virtio_wlan_napi_schedule(&vw->tx_napi, vw->tx_vq);
+	local_bh_enable();
+	netif_start_queue(dev);
+	return 0;
 }
 
 /*
@@ -1533,6 +1803,10 @@ static int virtio_wlan_stop(struct net_device *dev)
 {
 	struct virtio_wlan *vw = wiphy_priv(dev->ieee80211_ptr->wiphy);
 
+	netif_tx_disable(dev);
+	napi_disable(&vw->rx_napi);
+	napi_disable(&vw->tx_napi);
+
 	guard(wiphy)(vw->wiphy);
 	virtio_wlan_drop_conn(vw);
 	if (vw->scan_req) {
@@ -1543,18 +1817,11 @@ static int virtio_wlan_stop(struct net_device *dev)
 	return 0;
 }
 
-static netdev_tx_t virtio_wlan_start_xmit(struct sk_buff *skb,
-					  struct net_device *dev)
-{
-	dev_core_stats_tx_dropped_inc(dev);
-	dev_kfree_skb_any(skb);
-	return NETDEV_TX_OK;
-}
-
 static const struct net_device_ops virtio_wlan_netdev_ops = {
 	.ndo_open = virtio_wlan_open,
 	.ndo_stop = virtio_wlan_stop,
 	.ndo_start_xmit = virtio_wlan_start_xmit,
+	.ndo_tx_timeout = virtio_wlan_tx_timeout,
 	.ndo_validate_addr = eth_validate_addr,
 };
 
@@ -1576,6 +1843,11 @@ static void virtio_wlan_netdev_setup(struct net_device *dev)
 {
 	ether_setup(dev);
 	dev->netdev_ops = &virtio_wlan_netdev_ops;
+	dev->needed_headroom = sizeof(struct virtio_net_hdr_v1);
+	/* Start_xmit pushes the virtio header onto the skb. */
+	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+	dev->watchdog_timeo = VIRTIO_WLAN_TX_TIMEOUT;
+	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 }
 
 static int virtio_wlan_read_config(struct virtio_device *vdev, u8 *mac,
@@ -1606,15 +1878,15 @@ static int virtio_wlan_read_config(struct virtio_device *vdev, u8 *mac,
 
 static int virtio_wlan_add_event_bufs(struct virtio_wlan *vw)
 {
-	unsigned int i;
+	unsigned int i, n;
 	int err;
 
-	vw->n_event_bufs = min_t(unsigned int, VIRTIO_WLAN_EVENT_BUFS,
-				 virtqueue_get_vring_size(vw->event_vq));
-	vw->event_bufs = kcalloc(vw->n_event_bufs, sizeof(*vw->event_bufs),
-				 GFP_KERNEL);
+	n = min_t(unsigned int, VIRTIO_WLAN_EVENT_BUFS,
+		  virtqueue_get_vring_size(vw->event_vq));
+	vw->event_bufs = kcalloc(n, sizeof(*vw->event_bufs), GFP_KERNEL);
 	if (!vw->event_bufs)
 		return -ENOMEM;
+	vw->n_event_bufs = n;
 	for (i = 0; i < vw->n_event_bufs; i++) {
 		vw->event_bufs[i] = kmalloc(vw->max_event_size, GFP_KERNEL);
 		if (!vw->event_bufs[i])
@@ -1627,13 +1899,45 @@ static int virtio_wlan_add_event_bufs(struct virtio_wlan *vw)
 	return 0;
 }
 
+/* The device sets the ring's size, so the number of buffers is capped. */
+static int virtio_wlan_add_rx_bufs(struct virtio_wlan *vw)
+{
+	unsigned int i, n;
+	int err;
+
+	n = min_t(unsigned int, VIRTIO_WLAN_RX_BUFS,
+		  virtqueue_get_vring_size(vw->rx_vq));
+	vw->rx_bufs = kcalloc(n, sizeof(*vw->rx_bufs), GFP_KERNEL);
+	vw->rx_spare = kcalloc(n, sizeof(*vw->rx_spare), GFP_KERNEL);
+	if (!vw->rx_bufs || !vw->rx_spare)
+		return -ENOMEM;
+	vw->n_rx_bufs = n;
+	for (i = 0; i < vw->n_rx_bufs; i++) {
+		vw->rx_bufs[i] = kmalloc(VIRTIO_WLAN_RX_BUF_SIZE(vw->mtu),
+					 GFP_KERNEL);
+		if (!vw->rx_bufs[i])
+			return -ENOMEM;
+		err = virtio_wlan_post_rx(vw, vw->rx_bufs[i], GFP_KERNEL);
+		if (err)
+			return err;
+	}
+	virtqueue_kick(vw->rx_vq);
+	return 0;
+}
+
 /*
- * The device holds the posted event buffers, and the buffer of a command
- * that timed out, until reset.
+ * The device holds the posted rx and event buffers, the frames that were not
+ * reclaimed, and the buffer of a command that timed out, until reset.
  */
 static void virtio_wlan_del_vqs(struct virtio_wlan *vw)
 {
+	struct sk_buff *skb;
+
 	virtio_reset_device(vw->vdev);
+	while (virtqueue_detach_unused_buf(vw->rx_vq))
+		;
+	while ((skb = virtqueue_detach_unused_buf(vw->tx_vq)))
+		dev_kfree_skb(skb);
 	while (virtqueue_detach_unused_buf(vw->cmd_vq))
 		;
 	while (virtqueue_detach_unused_buf(vw->event_vq))
@@ -1650,6 +1954,10 @@ static void virtio_wlan_free(struct virtio_wlan *vw)
 	for (i = 0; i < vw->n_event_bufs; i++)
 		kfree(vw->event_bufs[i]);
 	kfree(vw->event_bufs);
+	for (i = 0; i < vw->n_rx_bufs; i++)
+		kfree(vw->rx_bufs[i]);
+	kfree(vw->rx_bufs);
+	kfree(vw->rx_spare);
 	kfree(vw->resp_buf);
 	kfree_sensitive(vw->cmd_buf);
 }
@@ -1657,8 +1965,8 @@ static void virtio_wlan_free(struct virtio_wlan *vw)
 static int virtio_wlan_probe(struct virtio_device *vdev)
 {
 	struct virtqueue_info vqs_info[VIRTIO_WLAN_VQ_MAX] = {
-		[VIRTIO_WLAN_VQ_RX] = { "rx" },
-		[VIRTIO_WLAN_VQ_TX] = { "tx" },
+		[VIRTIO_WLAN_VQ_RX] = { "rx", virtio_wlan_rx_done },
+		[VIRTIO_WLAN_VQ_TX] = { "tx", virtio_wlan_tx_done },
 		[VIRTIO_WLAN_VQ_CMD] = { "cmd", virtio_wlan_cmd_done },
 		[VIRTIO_WLAN_VQ_EVENT] = { "event", virtio_wlan_event_done },
 	};
@@ -1706,6 +2014,8 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	err = virtio_find_vqs(vdev, VIRTIO_WLAN_VQ_MAX, vqs, vqs_info, NULL);
 	if (err)
 		goto err_free;
+	vw->rx_vq = vqs[VIRTIO_WLAN_VQ_RX];
+	vw->tx_vq = vqs[VIRTIO_WLAN_VQ_TX];
 	vw->cmd_vq = vqs[VIRTIO_WLAN_VQ_CMD];
 	vw->event_vq = vqs[VIRTIO_WLAN_VQ_EVENT];
 
@@ -1725,6 +2035,8 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	wiphy_unlock(wiphy);
 	if (!err)
 		err = virtio_wlan_add_event_bufs(vw);
+	if (!err)
+		err = virtio_wlan_add_rx_bufs(vw);
 	if (err)
 		goto err_reset;
 
@@ -1758,17 +2070,24 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	eth_hw_addr_set(netdev, mac);
 	netdev->mtu = mtu;
 	netdev->max_mtu = mtu;
+	netif_napi_add(netdev, &vw->rx_napi, virtio_wlan_rx_poll);
+	netif_napi_add_tx(netdev, &vw->tx_napi, virtio_wlan_tx_poll);
 	netif_carrier_off(netdev);
 	err = register_netdev(netdev);
 	if (err)
 		goto err_free_netdev;
 
 	/*
-	 * An event that arrived before this point found the flag clear, and
-	 * its callback is not repeated, so the work runs once now.
+	 * A buffer used before this point found the flag clear, and its
+	 * callback is not repeated, so the event work runs once now, and so do
+	 * the data polls if the interface is already open.
 	 */
 	smp_store_release(&vw->ready, true);
 	virtio_wlan_schedule_events(vw, 0);
+	local_bh_disable();
+	virtio_wlan_napi_schedule(&vw->rx_napi, vw->rx_vq);
+	virtio_wlan_napi_schedule(&vw->tx_napi, vw->tx_vq);
+	local_bh_enable();
 	return 0;
 
 err_free_netdev:
