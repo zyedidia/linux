@@ -234,9 +234,11 @@ int uml_vduse_user_vq_inject_irq(int fd, uint32_t index)
 int uml_vduse_user_kick_pending(int kickfd)
 {
 	struct pollfd p = { .fd = kickfd, .events = POLLIN };
+	struct timespec zero = { 0 };
 	int r;
 
-	r = poll(&p, 1, 0);
+	/* The sandbox allows ppoll but not poll. */
+	r = ppoll(&p, 1, &zero, NULL);
 	if (r < 0)
 		return -errno;
 	return r > 0 && (p.revents & POLLIN);
