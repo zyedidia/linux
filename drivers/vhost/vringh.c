@@ -1070,6 +1070,24 @@ int vringh_complete_kern(struct vringh *vrh, u16 head, u32 len)
 EXPORT_SYMBOL(vringh_complete_kern);
 
 /**
+ * vringh_complete_multi_kern - we've finished with many descriptors.
+ * @vrh: the vring.
+ * @used: the head, length pairs.
+ * @num_used: the number of used elements.
+ *
+ * The elements are published with one update of the used index. You should
+ * check vringh_need_notify_kern() after one or more calls to this function.
+ */
+int vringh_complete_multi_kern(struct vringh *vrh,
+			       const struct vring_used_elem used[],
+			       unsigned num_used)
+{
+	return __vringh_complete(vrh, used, num_used,
+				 putu16_kern, putused_kern);
+}
+EXPORT_SYMBOL(vringh_complete_multi_kern);
+
+/**
  * vringh_notify_enable_kern - we want to know if something changes.
  * @vrh: the vring.
  *

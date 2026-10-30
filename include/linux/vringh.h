@@ -246,6 +246,9 @@ int vringh_chain_kern_range(struct vringh *vrh, u16 head,
 			    gfp_t gfp);
 
 int vringh_complete_kern(struct vringh *vrh, u16 head, u32 len);
+int vringh_complete_multi_kern(struct vringh *vrh,
+			       const struct vring_used_elem used[],
+			       unsigned num_used);
 
 bool vringh_notify_enable_kern(struct vringh *vrh);
 void vringh_notify_disable_kern(struct vringh *vrh);
