@@ -27,6 +27,16 @@ config VDUSE_GUEST_WLAN
 	  mac80211 driver, which reports the BSS with a connection result
 	  and reports a requested disconnection before the request returns.
 
+config VDUSE_GUEST_NET
+	bool "VDUSE virtio-net backend"
+	depends on VDUSE_GUEST && NET
+	default y
+	help
+	  Export an Ethernet interface of the guest to the host as a
+	  virtio-net device. While the host's driver runs the device, every
+	  frame that the interface receives goes to the host, and the
+	  guest's own stack does not see it.
+
 config VDUSE_GUEST_PCI
 	bool "VDUSE devices through a VMM's VDUSE proxy"
 	depends on PCI_MSI && 64BIT && !UML
