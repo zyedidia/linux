@@ -23,6 +23,7 @@
 #include <linux/uaccess.h>
 #include <linux/uio.h>
 #include <linux/vduse_guest.h>
+#include <linux/vmalloc.h>
 #include <linux/xarray.h>
 #include <uapi/linux/virtio_gpu.h>
 #include <uapi/linux/virtio_ids.h>
@@ -31,6 +32,8 @@
 #define VDUSE_GUEST_GPU_CURSORQ 1
 #define VDUSE_GUEST_GPU_INLINE_IOVS 4
 #define VDUSE_GUEST_GPU_RENDER "/dev/dri/renderD128"
+#define VDUSE_GUEST_GPU_REGION_SIZE SZ_8G
+#define VDUSE_GUEST_GPU_SHMEM_MAX SZ_16M
 
 /*
  * The backend's memory holds the arguments of the ioctls that it runs in
@@ -104,6 +107,28 @@ struct vduse_guest_gpu_capset {
 };
 static_assert(sizeof(struct vduse_guest_gpu_capset) == 592);
 
+/* Libdrm's struct amdgpu_heap_info. */
+struct vduse_guest_gpu_heap_info {
+	u64 heap_size;
+	u64 heap_usage;
+	u64 max_allocation;
+};
+
+/*
+ * Virglrenderer's struct amdvgpu_shmem, at the start of a context's shared
+ * memory buffer, whose responses follow at rsp_mem_offset.
+ */
+struct vduse_guest_gpu_shmem {
+	u32 seqno;
+	u32 rsp_mem_offset;
+	u32 async_error;
+	u32 pad;
+	struct vduse_guest_gpu_heap_info gtt;
+	struct vduse_guest_gpu_heap_info vram;
+	struct vduse_guest_gpu_heap_info vis_vram;
+};
+static_assert(sizeof(struct vduse_guest_gpu_shmem) == 88);
+
 /* The entries of libdrm's amdgpu.ids that the backend knows. */
 static const struct {
 	u32 device_id;
@@ -125,15 +150,36 @@ struct vduse_guest_gpu_stats {
 	atomic64_t commands;
 	atomic64_t invalid_commands;
 	atomic_t contexts;
+	atomic_t resources;
 };
 
+/*
+ * A blob resource, which belongs to the device rather than to the context
+ * that created it. Its pages are mapped into the host-visible region at
+ * map_offset while mapped is set.
+ */
+struct vduse_guest_gpu_res {
+	u32 id;
+	u32 ctx_id;
+	u32 blob_flags;
+	u64 size;
+	struct page **pages;
+	unsigned int nr_pages;
+	void *vaddr;
+	bool mapped;
+	u64 map_offset;
+};
+
+/* A context, with the resource that holds its shared memory buffer. */
 struct vduse_guest_gpu_ctx {
 	u32 id;
+	struct vduse_guest_gpu_res *shmem;
 };
 
 struct vduse_guest_gpu {
 	struct vduse_guest_dev *dev;
 	struct virtio_gpu_config config;
+	struct vduse_guest_shm region;
 	char *render_path;
 
 	/*
@@ -148,8 +194,10 @@ struct vduse_guest_gpu {
 
 	/* The worker's own state, which the works use without a lock. */
 	struct xarray contexts;
+	struct xarray resources;
 	struct vduse_guest_gpu_capset capset;
 	bool capset_valid;
+	struct virtio_gpu_resp_map_info map_info;
 	struct mm_struct *mm;
 	void __user *umem;
 
@@ -164,6 +212,10 @@ union vduse_guest_gpu_req {
 	struct virtio_gpu_ctx_create ctx_create;
 	struct virtio_gpu_ctx_destroy ctx_destroy;
 	struct virtio_gpu_ctx_resource ctx_resource;
+	struct virtio_gpu_resource_create_blob create_blob;
+	struct virtio_gpu_resource_map_blob map_blob;
+	struct virtio_gpu_resource_unmap_blob unmap_blob;
+	struct virtio_gpu_resource_unref unref;
 };
 
 /*
@@ -517,15 +569,193 @@ static u32 vduse_guest_gpu_ctx_destroy(struct vduse_guest_gpu *gpu,
 }
 
 /*
- * The device has no resources, so attaching fails and detaching does
- * nothing, as it does for a resource that is not attached.
+ * Unmap a resource from the region. Once the unmap returns, the host maps
+ * none of its pages. If the unmap fails, the host may still map them, so the
+ * pages are kept for the device's lifetime.
  */
+static void vduse_guest_gpu_res_unmap(struct vduse_guest_gpu *gpu,
+				      struct vduse_guest_gpu_res *res)
+{
+	int err;
+
+	if (!res->mapped)
+		return;
+	err = vduse_guest_shm_unmap(gpu->dev, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+				    res->map_offset, res->size);
+	if (err) {
+		pr_warn("%s: cannot unmap resource %u: %d\n",
+			vduse_guest_name(gpu->dev), res->id, err);
+		res->nr_pages = 0;
+	}
+	res->mapped = false;
+}
+
+static void vduse_guest_gpu_res_free(struct vduse_guest_gpu *gpu,
+				     struct vduse_guest_gpu_res *res)
+{
+	struct vduse_guest_gpu_ctx *ctx = xa_load(&gpu->contexts, res->ctx_id);
+	unsigned int i;
+
+	if (ctx && ctx->shmem == res)
+		ctx->shmem = NULL;
+	vduse_guest_gpu_res_unmap(gpu, res);
+	if (res->vaddr)
+		vunmap(res->vaddr);
+	for (i = 0; i < res->nr_pages; i++)
+		__free_page(res->pages[i]);
+	kvfree(res->pages);
+	atomic_dec(&gpu->stats.resources);
+	kfree(res);
+}
+
+/*
+ * Create a blob resource. Blob 0 is the context's shared memory buffer, as
+ * in virglrenderer, and it is the only blob that the device creates.
+ */
+static u32 vduse_guest_gpu_create_blob(struct vduse_guest_gpu *gpu,
+				       const struct virtio_gpu_resource_create_blob *cmd)
+{
+	u32 ctx_id = le32_to_cpu(cmd->hdr.ctx_id);
+	u32 id = le32_to_cpu(cmd->resource_id);
+	u64 size = le64_to_cpu(cmd->size);
+	struct vduse_guest_gpu_shmem *shmem;
+	struct vduse_guest_gpu_res *res;
+	struct vduse_guest_gpu_ctx *ctx;
+	unsigned int i;
+	int err;
+
+	ctx = xa_load(&gpu->contexts, ctx_id);
+	if (!ctx)
+		return VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID;
+	if (!id)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+	if (le32_to_cpu(cmd->blob_mem) != VIRTIO_GPU_BLOB_MEM_HOST3D ||
+	    le32_to_cpu(cmd->nr_entries) || le64_to_cpu(cmd->blob_id) ||
+	    ctx->shmem || size < sizeof(*shmem) ||
+	    size > VDUSE_GUEST_GPU_SHMEM_MAX || !PAGE_ALIGNED(size))
+		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	res = kzalloc_obj(*res);
+	if (!res)
+		return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+	res->id = id;
+	res->ctx_id = ctx_id;
+	res->blob_flags = le32_to_cpu(cmd->blob_flags);
+	res->size = size;
+	atomic_inc(&gpu->stats.resources);
+
+	res->pages = kvcalloc(size >> PAGE_SHIFT, sizeof(*res->pages),
+			      GFP_KERNEL);
+	if (!res->pages)
+		goto nomem;
+	for (i = 0; i < size >> PAGE_SHIFT; i++) {
+		res->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!res->pages[i])
+			goto nomem;
+		res->nr_pages++;
+	}
+	res->vaddr = vmap(res->pages, res->nr_pages, VM_MAP, PAGE_KERNEL);
+	if (!res->vaddr)
+		goto nomem;
+
+	err = xa_insert(&gpu->resources, id, res, GFP_KERNEL);
+	if (err) {
+		vduse_guest_gpu_res_free(gpu, res);
+		return err == -EBUSY ? VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID :
+				       VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+	}
+
+	shmem = res->vaddr;
+	shmem->rsp_mem_offset = sizeof(*shmem);
+	ctx->shmem = res;
+	return VIRTIO_GPU_RESP_OK_NODATA;
+
+nomem:
+	vduse_guest_gpu_res_free(gpu, res);
+	return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+}
+
+/*
+ * Map a mappable blob at the offset that the host's driver chose, one range
+ * for each run of contiguous pages. The host maps guest memory write-back.
+ */
+static u32 vduse_guest_gpu_map_blob(struct vduse_guest_gpu *gpu,
+				    const struct virtio_gpu_resource_map_blob *cmd,
+				    struct virtio_gpu_resp_map_info *info)
+{
+	u64 offset = le64_to_cpu(cmd->offset);
+	struct vduse_guest_shm_range *ranges;
+	struct vduse_guest_gpu_res *res;
+	unsigned int i, nr = 0;
+	int err;
+
+	res = xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id));
+	if (!res)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+	if (!(res->blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE) ||
+	    res->mapped || !PAGE_ALIGNED(offset))
+		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	ranges = kvcalloc(res->nr_pages, sizeof(*ranges), GFP_KERNEL);
+	if (!ranges)
+		return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+	for (i = 0; i < res->nr_pages; i++) {
+		phys_addr_t phys = page_to_phys(res->pages[i]);
+
+		if (nr && ranges[nr - 1].phys + ranges[nr - 1].size == phys) {
+			ranges[nr - 1].size += PAGE_SIZE;
+			continue;
+		}
+		ranges[nr].offset = offset + ((u64)i << PAGE_SHIFT);
+		ranges[nr].size = PAGE_SIZE;
+		ranges[nr].phys = phys;
+		nr++;
+	}
+
+	err = vduse_guest_shm_map(gpu->dev, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+				  ranges, nr);
+	kvfree(ranges);
+	if (err)
+		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	res->mapped = true;
+	res->map_offset = offset;
+	info->map_info = cpu_to_le32(VIRTIO_GPU_MAP_CACHE_CACHED);
+	return VIRTIO_GPU_RESP_OK_MAP_INFO;
+}
+
+static u32 vduse_guest_gpu_unmap_blob(struct vduse_guest_gpu *gpu,
+				      const struct virtio_gpu_resource_unmap_blob *cmd)
+{
+	struct vduse_guest_gpu_res *res;
+
+	res = xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id));
+	if (!res)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+	vduse_guest_gpu_res_unmap(gpu, res);
+	return VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static u32 vduse_guest_gpu_unref(struct vduse_guest_gpu *gpu,
+				 const struct virtio_gpu_resource_unref *cmd)
+{
+	struct vduse_guest_gpu_res *res;
+
+	res = xa_erase(&gpu->resources, le32_to_cpu(cmd->resource_id));
+	if (!res)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+	vduse_guest_gpu_res_free(gpu, res);
+	return VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+/* Attaching a resource to a context and detaching it check that both exist. */
 static u32 vduse_guest_gpu_ctx_resource(struct vduse_guest_gpu *gpu,
 					const struct virtio_gpu_ctx_resource *cmd)
 {
 	if (!xa_load(&gpu->contexts, le32_to_cpu(cmd->hdr.ctx_id)))
 		return VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID;
-	if (le32_to_cpu(cmd->hdr.type) == VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE)
+	if (le32_to_cpu(cmd->hdr.type) == VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE &&
+	    !xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id)))
 		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
 	return VIRTIO_GPU_RESP_OK_NODATA;
 }
@@ -575,6 +805,26 @@ static u32 vduse_guest_gpu_dispatch(struct vduse_guest_gpu *gpu,
 		if (in_len < sizeof(req->ctx_resource))
 			break;
 		return vduse_guest_gpu_ctx_resource(gpu, &req->ctx_resource);
+	case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+		if (in_len < sizeof(req->create_blob))
+			break;
+		return vduse_guest_gpu_create_blob(gpu, &req->create_blob);
+	case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
+		if (in_len < sizeof(req->map_blob))
+			break;
+		memset(&gpu->map_info, 0, sizeof(gpu->map_info));
+		*out = (void *)&gpu->map_info + sizeof(gpu->map_info.hdr);
+		*out_len = sizeof(gpu->map_info) - sizeof(gpu->map_info.hdr);
+		return vduse_guest_gpu_map_blob(gpu, &req->map_blob,
+						&gpu->map_info);
+	case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
+		if (in_len < sizeof(req->unmap_blob))
+			break;
+		return vduse_guest_gpu_unmap_blob(gpu, &req->unmap_blob);
+	case VIRTIO_GPU_CMD_RESOURCE_UNREF:
+		if (in_len < sizeof(req->unref))
+			break;
+		return vduse_guest_gpu_unref(gpu, &req->unref);
 	}
 
 	return VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -725,10 +975,11 @@ static int vduse_guest_gpu_start(void *priv)
 	return 0;
 }
 
-/* A reset destroys every context. */
+/* A reset unmaps and frees every resource and destroys every context. */
 static void vduse_guest_gpu_stop(void *priv)
 {
 	struct vduse_guest_gpu *gpu = priv;
+	struct vduse_guest_gpu_res *res;
 	struct vduse_guest_gpu_ctx *ctx;
 	unsigned long id;
 
@@ -737,6 +988,10 @@ static void vduse_guest_gpu_stop(void *priv)
 	spin_unlock_irq(&gpu->lock);
 	kthread_flush_worker(gpu->worker);
 
+	xa_for_each(&gpu->resources, id, res) {
+		xa_erase(&gpu->resources, id);
+		vduse_guest_gpu_res_free(gpu, res);
+	}
 	xa_for_each(&gpu->contexts, id, ctx) {
 		xa_erase(&gpu->contexts, id);
 		vduse_guest_gpu_ctx_free(gpu, ctx);
@@ -749,15 +1004,21 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 {
 	const char *name = vduse_guest_name(dev);
 	const char *render = VDUSE_GUEST_GPU_RENDER;
+	u64 region = VDUSE_GUEST_GPU_REGION_SIZE;
 	struct vduse_guest_gpu *gpu;
-	char *opt;
+	char *opt, *end;
 	int err;
 
 	while ((opt = strsep(&opts, ","))) {
-		if (strstarts(opt, "render="))
+		if (strstarts(opt, "render=")) {
 			render = opt + strlen("render=");
-		else if (*opt)
+		} else if (strstarts(opt, "region=")) {
+			region = memparse(opt + strlen("region="), &end);
+			if (*end || !region || !PAGE_ALIGNED(region))
+				return ERR_PTR(-EINVAL);
+		} else if (*opt) {
 			return ERR_PTR(-EINVAL);
+		}
 	}
 
 	gpu = kzalloc_obj(*gpu);
@@ -766,6 +1027,7 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	gpu->dev = dev;
 	spin_lock_init(&gpu->lock);
 	xa_init(&gpu->contexts);
+	xa_init(&gpu->resources);
 	kthread_init_work(&gpu->ctrl_work, vduse_guest_gpu_ctrl_work);
 	kthread_init_work(&gpu->cursor_work, vduse_guest_gpu_cursor_work);
 
@@ -802,6 +1064,14 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	cfg->allow_reconnect = false;
 	cfg->config = &gpu->config;
 	cfg->config_size = sizeof(gpu->config);
+	/*
+	 * Blobs are mapped into the host-visible region, whose size bounds
+	 * the total size of the mapped blobs and costs nothing by itself.
+	 */
+	gpu->region.id = VIRTIO_GPU_SHM_ID_HOST_VISIBLE;
+	gpu->region.size = region;
+	cfg->shm = &gpu->region;
+	cfg->num_shm = 1;
 
 	pr_info("%s: serving %s\n", name, gpu->render_path);
 	return gpu;
@@ -832,6 +1102,7 @@ static void vduse_guest_gpu_show(void *priv, struct seq_file *m)
 	seq_printf(m, "  %-18s %lld\n", "invalid_commands",
 		   atomic64_read(&s->invalid_commands));
 	seq_printf(m, "  %-18s %d\n", "contexts", atomic_read(&s->contexts));
+	seq_printf(m, "  %-18s %d\n", "resources", atomic_read(&s->resources));
 }
 
 const struct vduse_guest_backend_ops vduse_guest_gpu_ops = {
