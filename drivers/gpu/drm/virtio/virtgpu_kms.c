@@ -144,6 +144,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	spin_lock_init(&vgdev->display_info_lock);
 	spin_lock_init(&vgdev->resource_export_lock);
 	spin_lock_init(&vgdev->host_visible_lock);
+	init_rwsem(&vgdev->host_visible_fault_sem);
 	ida_init(&vgdev->ctx_id_ida);
 	ida_init(&vgdev->resource_ida);
 	init_waitqueue_head(&vgdev->resp_wq);
@@ -178,9 +179,15 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_RESOURCE_BLOB))
 		vgdev->has_resource_blob = true;
 
-	if (virtio_get_shm_region(vgdev->vdev, &vgdev->host_visible_region,
-				  VIRTIO_GPU_SHM_ID_HOST_VISIBLE)) {
-		if (!devm_request_mem_region(&vgdev->vdev->dev,
+	if (virtio_get_any_shm_region(vgdev->vdev, &vgdev->host_visible_region,
+				      VIRTIO_GPU_SHM_ID_HOST_VISIBLE)) {
+		/*
+		 * The transport inserts the pages of a region without a
+		 * physical address on faults, so only its placements are
+		 * managed here, as offsets in the region.
+		 */
+		if (!vgdev->host_visible_region.no_phys &&
+		    !devm_request_mem_region(&vgdev->vdev->dev,
 					     vgdev->host_visible_region.addr,
 					     vgdev->host_visible_region.len,
 					     dev_name(&vgdev->vdev->dev))) {
@@ -256,6 +263,10 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 		goto err_scanouts;
 	}
 
+	if (vgdev->has_host_visible && vgdev->host_visible_region.no_phys)
+		virtio_set_shm_invalidate(vgdev->vdev,
+					  virtio_gpu_vram_invalidate);
+
 	virtio_device_ready(vgdev->vdev);
 
 	if (num_capsets)
@@ -292,6 +303,19 @@ static void virtio_gpu_cleanup_cap_cache(struct virtio_gpu_device *vgdev)
 void virtio_gpu_deinit(struct drm_device *dev)
 {
 	struct virtio_gpu_device *vgdev = dev->dev_private;
+
+	/*
+	 * Once the region is closed, no fault reaches the transport again,
+	 * and the mappings that remain are zapped before the transport may
+	 * release their pages.
+	 */
+	if (vgdev->has_host_visible && vgdev->host_visible_region.no_phys) {
+		down_write(&vgdev->host_visible_fault_sem);
+		vgdev->host_visible_closed = true;
+		up_write(&vgdev->host_visible_fault_sem);
+		unmap_mapping_range(dev->anon_inode->i_mapping, 0, 0, 1);
+		virtio_set_shm_invalidate(vgdev->vdev, NULL);
+	}
 
 	flush_work(&vgdev->obj_free_work);
 	flush_work(&vgdev->ctrlq.dequeue_work);

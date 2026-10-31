@@ -139,6 +139,12 @@ struct dma_buf *virtgpu_gem_prime_export(struct drm_gem_object *obj,
 
 	drm_dev_get(dev);
 	drm_gem_object_get(obj);
+	/*
+	 * Mappings through the dma-buf share the DRM device's address space,
+	 * as drm_gem_dmabuf_export() arranges, so that zapping a blob's fake
+	 * offset reaches them too.
+	 */
+	buf->file->f_mapping = dev->anon_inode->i_mapping;
 
 	return buf;
 }

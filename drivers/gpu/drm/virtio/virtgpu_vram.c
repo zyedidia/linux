@@ -31,6 +31,72 @@ static const struct vm_operations_struct virtio_gpu_vram_vm_ops = {
 	.close = drm_gem_vm_close,
 };
 
+/*
+ * A fault on a blob of a region without a physical address goes to the
+ * transport with the blob's offset in the region. The mapping keeps the
+ * blob's fake offset in vm_pgoff. Until deinit closes the region, the
+ * transport stays bound. It may release the fault's lock and ask for a
+ * retry, after which neither the VMA nor the blob is used here.
+ */
+static vm_fault_t virtio_gpu_vram_fault(struct vm_fault *vmf)
+{
+	struct drm_gem_object *obj = vmf->vma->vm_private_data;
+	struct virtio_gpu_device *vgdev = obj->dev->dev_private;
+	struct virtio_gpu_object_vram *vram =
+		to_virtio_gpu_vram(gem_to_virtio_gpu_obj(obj));
+	u64 offset;
+	vm_fault_t ret;
+
+	offset = (u64)(vmf->pgoff - drm_vma_node_start(&obj->vma_node)) <<
+		 PAGE_SHIFT;
+	if (offset >= vram->vram_node.size)
+		return VM_FAULT_SIGBUS;
+
+	down_read(&vgdev->host_visible_fault_sem);
+	if (vgdev->host_visible_closed)
+		ret = VM_FAULT_SIGBUS;
+	else
+		ret = virtio_shm_fault(vgdev->vdev,
+				       VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+				       vram->vram_node.start + offset, vmf);
+	up_read(&vgdev->host_visible_fault_sem);
+	return ret;
+}
+
+static const struct vm_operations_struct virtio_gpu_vram_fault_vm_ops = {
+	.open = drm_gem_vm_open,
+	.close = drm_gem_vm_close,
+	.fault = virtio_gpu_vram_fault,
+};
+
+/*
+ * Map a blob of a region without a physical address. The transport inserts
+ * its pages on faults with the caching type that it chooses, so map_info is
+ * ignored. The mapping is shared and VM_PFNMAP, so that no process can pin
+ * the pages past an invalidation.
+ */
+static int virtio_gpu_vram_mmap_fault(struct drm_gem_object *obj,
+				      struct vm_area_struct *vma)
+{
+	struct virtio_gpu_object_vram *vram =
+		to_virtio_gpu_vram(gem_to_virtio_gpu_obj(obj));
+	unsigned long vm_size = vma->vm_end - vma->vm_start;
+	unsigned long pgoff, vm_end;
+
+	if (is_cow_mapping(vma->vm_flags))
+		return -EINVAL;
+
+	pgoff = vma->vm_pgoff - drm_vma_node_start(&obj->vma_node);
+	if (check_add_overflow(pgoff << PAGE_SHIFT, vm_size, &vm_end) ||
+	    vm_end > vram->vram_node.size)
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	vma->vm_ops = &virtio_gpu_vram_fault_vm_ops;
+	return 0;
+}
+
 static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 				struct vm_area_struct *vma)
 {
@@ -52,6 +118,9 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 	wait_event(vgdev->resp_wq, vram->map_state != STATE_INITIALIZING);
 	if (vram->map_state != STATE_OK)
 		return -EINVAL;
+
+	if (vgdev->host_visible_region.no_phys)
+		return virtio_gpu_vram_mmap_fault(obj, vma);
 
 	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
 	vm_flags_set(vma, VM_MIXEDMAP | VM_DONTEXPAND);
@@ -98,6 +167,12 @@ struct sg_table *virtio_gpu_vram_map_dma_buf(struct virtio_gpu_object *bo,
 			goto out;
 		}
 		return sgt;
+	}
+
+	/* Another device cannot reach a region without a physical address. */
+	if (vgdev->host_visible_region.no_phys) {
+		ret = -EIO;
+		goto out;
 	}
 
 	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
@@ -237,6 +312,63 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 
 	*bo_ptr = &vram->base;
 	return 0;
+}
+
+/*
+ * Zap the mappings of the blobs whose placements overlap an invalidated
+ * range of the host-visible region. Each blob is found under the lock that
+ * protects the placements, and a blob whose last reference is gone has no
+ * mapping left. Dropping a reference can free the blob, which sends the
+ * device a command, so the references are dropped from a work item instead
+ * of from the transport's call.
+ */
+void virtio_gpu_vram_invalidate(struct virtio_device *vdev, u8 id,
+				u64 offset, u64 len)
+{
+	struct drm_device *dev = vdev->priv;
+	struct virtio_gpu_device *vgdev = dev->dev_private;
+	u64 pos = offset, end = offset + len;
+
+	if (id != VIRTIO_GPU_SHM_ID_HOST_VISIBLE)
+		return;
+
+	while (pos < end) {
+		struct virtio_gpu_object_array *objs;
+		struct drm_gem_object *obj = NULL;
+		struct drm_mm_node *node;
+
+		objs = virtio_gpu_array_alloc(1);
+		if (!objs) {
+			/* Without memory, every mapping of the device is zapped. */
+			unmap_mapping_range(dev->anon_inode->i_mapping, 0, 0, 1);
+			return;
+		}
+
+		spin_lock(&vgdev->host_visible_lock);
+		drm_mm_for_each_node_in_range(node, &vgdev->host_visible_mm,
+					      pos, end) {
+			struct virtio_gpu_object_vram *vram =
+				container_of(node, struct virtio_gpu_object_vram,
+					     vram_node);
+
+			pos = node->start + node->size;
+			if (kref_get_unless_zero(&vram->base.base.base.refcount)) {
+				obj = &vram->base.base.base;
+				break;
+			}
+		}
+		spin_unlock(&vgdev->host_visible_lock);
+
+		if (!obj) {
+			kfree(objs);
+			return;
+		}
+
+		drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
+		objs->objs[0] = obj;
+		objs->nents = 1;
+		virtio_gpu_array_put_free_delayed(vgdev, objs);
+	}
 }
 
 void virtio_gpu_vram_map_deferred(struct virtio_gpu_object_vram *vram)

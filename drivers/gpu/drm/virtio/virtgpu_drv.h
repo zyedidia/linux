@@ -278,6 +278,13 @@ struct virtio_gpu_device {
 	spinlock_t resource_export_lock;
 	/* protects map state and host_visible_mm */
 	spinlock_t host_visible_lock;
+	/*
+	 * Faults on a region without a physical address hold this for
+	 * reading while they reach the transport, and deinit sets
+	 * host_visible_closed under it for writing.
+	 */
+	struct rw_semaphore host_visible_fault_sem;
+	bool host_visible_closed;
 };
 
 struct virtio_gpu_fpriv {
@@ -512,6 +519,8 @@ void virtio_gpu_vram_unmap_dma_buf(struct device *dev,
 				   struct sg_table *sgt,
 				   enum dma_data_direction dir);
 void virtio_gpu_vram_map_deferred(struct virtio_gpu_object_vram *vram);
+void virtio_gpu_vram_invalidate(struct virtio_device *vdev, u8 id,
+				u64 offset, u64 len);
 
 /* virtgpu_submit.c */
 int virtio_gpu_execbuffer_ioctl(struct drm_device *dev, void *data,
