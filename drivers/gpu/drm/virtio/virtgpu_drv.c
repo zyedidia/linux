@@ -99,7 +99,13 @@ static int virtio_gpu_probe(struct virtio_device *vdev)
 			goto err_free;
 	}
 
-	dma_set_max_seg_size(dev->dev, dma_max_mapping_size(dev->dev) ?: UINT_MAX);
+	/*
+	 * A parent without DMA parameters, such as a vDPA device, keeps the
+	 * default maximum segment size.
+	 */
+	if (dev->dev->dma_parms)
+		dma_set_max_seg_size(dev->dev,
+				     dma_max_mapping_size(dev->dev) ?: UINT_MAX);
 	ret = virtio_gpu_init(vdev, dev);
 	if (ret)
 		goto err_free;
