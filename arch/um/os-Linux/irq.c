@@ -105,7 +105,9 @@ int os_epoll_fd(void)
 }
 
 /*
- * Helper to run the actual epoll_wait
+ * Helper to run the actual epoll_wait. It and the helpers that change the
+ * epoll sets run in interrupt context or under irq_lock, and strerror()
+ * allocates memory, so they print errors as numbers.
  */
 int os_waiting_for_events_epoll(void)
 {
@@ -116,11 +118,8 @@ int os_waiting_for_events_epoll(void)
 	if (n < 0) {
 		err = -errno;
 		if (errno != EINTR)
-			printk(
-				UM_KERN_ERR "os_waiting_for_events:"
-				" epoll returned %d, error = %s\n", n,
-				strerror(errno)
-			);
+			printk(UM_KERN_ERR "os_waiting_for_events: epoll returned %d, errno %d\n",
+			       n, errno);
 		return err;
 	}
 	return n;
@@ -144,7 +143,7 @@ int os_add_epoll_fd(int cpu, int events, int fd, void *data)
 	if ((result) && (errno == EEXIST))
 		result = os_mod_epoll_fd(cpu, events, fd, data);
 	if (result)
-		printk("epollctl add err fd %d, %s\n", fd, strerror(errno));
+		printk("epollctl add err fd %d, errno %d\n", fd, errno);
 	return result;
 }
 
@@ -160,8 +159,7 @@ int os_mod_epoll_fd(int cpu, int events, int fd, void *data)
 	event.events = events | EPOLLET;
 	result = epoll_ctl(epollfds[cpu], EPOLL_CTL_MOD, fd, &event);
 	if (result)
-		printk(UM_KERN_ERR
-			"epollctl mod err fd %d, %s\n", fd, strerror(errno));
+		printk(UM_KERN_ERR "epollctl mod err fd %d, errno %d\n", fd, errno);
 	return result;
 }
 

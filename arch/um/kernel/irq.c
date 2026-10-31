@@ -324,6 +324,13 @@ static int activate_fd(int irq, int fd, enum um_irq_type type, void *dev_id,
 	if (err < 0)
 		goto out;
 
+	/*
+	 * Starting the SIGIO helper creates a thread, which allocates memory,
+	 * so it happens before irq_lock is taken. It starts the helper only
+	 * once.
+	 */
+	maybe_sigio_broken(fd);
+
 	raw_spin_lock_irqsave(&irq_lock, flags);
 	irq_entry = get_irq_entry_by_fd(fd);
 	if (irq_entry) {
@@ -357,7 +364,6 @@ already:
 		irq_entry = new;
 		irq_entry->fd = fd;
 		list_add_tail(&irq_entry->list, &active_fds);
-		maybe_sigio_broken(fd);
 	}
 
 	irq_entry->reg[type].id = dev_id;
