@@ -26,6 +26,11 @@
 #include <linux/virtio.h>
 #include <linux/vmalloc.h>
 #include <linux/sched/mm.h>
+#include <linux/maple_tree.h>
+#include <linux/memfd.h>
+#include <linux/mm.h>
+#include <linux/shmem_fs.h>
+#include <linux/hugetlb.h>
 #include <uapi/linux/vduse.h>
 #include <uapi/linux/vdpa.h>
 #include <uapi/linux/virtio_config.h>
@@ -48,6 +53,11 @@
 /* 128 MB reserved for virtqueue creation */
 #define VDUSE_IOVA_SIZE (VDUSE_MAX_BOUNCE_SIZE + 128 * 1024 * 1024)
 #define VDUSE_MSG_DEFAULT_TIMEOUT 30
+#define VDUSE_MAX_SHM 8
+#define VDUSE_MAX_SHM_SIZE (1ULL << 40)
+#define VDUSE_MAX_SHM_FILES 16
+#define VDUSE_MAX_SHM_RANGES (1U << 16)
+#define VDUSE_MAX_SHM_RANGE_SIZE (1ULL << 32)
 
 #define IRQ_UNBOUND -1
 
@@ -102,6 +112,38 @@ struct vduse_as {
 	struct mutex mem_lock;
 };
 
+/*
+ * A mapped range of a shared memory region. The folios behind its file
+ * range stay pinned until it is unmapped, and pos holds the file position
+ * at which each folio starts.
+ */
+struct vduse_shm_entry {
+	u64 offset;
+	u64 size;
+	u64 file_offset;
+	u32 file;
+	unsigned int nr_folios;
+	struct folio **folios;
+	loff_t *pos;
+	struct list_head list;
+};
+
+/*
+ * A backing file, with the entries that map its ranges keyed by the page
+ * index in the file.
+ */
+struct vduse_shm_backing {
+	struct file *file;
+	struct maple_tree ranges;
+};
+
+/* A shared memory region, whose mapped ranges are keyed by page index. */
+struct vduse_shm {
+	u8 id;
+	u64 size;
+	struct maple_tree entries;
+};
+
 struct vduse_vq_group {
 	rwlock_t as_lock;
 	struct vduse_as *as; /* Protected by as_lock */
@@ -144,6 +186,25 @@ struct vduse_dev {
 	struct vduse_vq_group *groups;
 	unsigned int bounce_size;
 	struct mutex domain_lock;
+	/*
+	 * The shared memory regions are declared before the device is
+	 * attached. The shm_lock mutex protects their entries, the backing
+	 * files and shm_revoked, which is set when the device's file is
+	 * closed. The shm_map_lock mutex serializes mapping, unmapping,
+	 * revoking and publishing files, and protects the files' range
+	 * trees. The shm_cb_sem semaphore protects shm_cb, and msg_lock
+	 * shm_faults_failed.
+	 */
+	struct vduse_shm shm[VDUSE_MAX_SHM];
+	u32 shm_num;
+	struct mutex shm_map_lock;
+	struct mutex shm_lock;
+	struct vduse_shm_backing shm_files[VDUSE_MAX_SHM_FILES];
+	u32 shm_nr_files;
+	bool shm_revoked;
+	bool shm_faults_failed;
+	struct rw_semaphore shm_cb_sem;
+	struct vdpa_shm_callback shm_cb;
 };
 
 struct vduse_dev_msg {
@@ -246,8 +307,13 @@ static void vduse_dev_broken(struct vduse_dev *dev)
 	wake_up(&dev->waitq);
 }
 
-static int vduse_dev_msg_sync(struct vduse_dev *dev,
-			      struct vduse_dev_msg *msg)
+/*
+ * Send a message and wait for its response. A timeout marks the device
+ * broken only with break_on_timeout.
+ */
+static int __vduse_dev_msg_sync(struct vduse_dev *dev,
+				struct vduse_dev_msg *msg,
+				bool break_on_timeout)
 {
 	int ret;
 
@@ -256,7 +322,9 @@ static int vduse_dev_msg_sync(struct vduse_dev *dev,
 
 	init_waitqueue_head(&msg->waitq);
 	spin_lock(&dev->msg_lock);
-	if (unlikely(dev->broken)) {
+	if (unlikely(dev->broken ||
+		     (msg->req.type == VDUSE_SHM_FAULT &&
+		      dev->shm_faults_failed))) {
 		spin_unlock(&dev->msg_lock);
 		return -EIO;
 	}
@@ -275,13 +343,19 @@ static int vduse_dev_msg_sync(struct vduse_dev *dev,
 		list_del(&msg->list);
 		msg->resp.result = VDUSE_REQ_RESULT_FAILED;
 		/* Mark the device as malfunction when there is a timeout */
-		if (!ret)
+		if (!ret && break_on_timeout)
 			vduse_dev_broken(dev);
 	}
 	ret = (msg->resp.result == VDUSE_REQ_RESULT_OK) ? 0 : -EIO;
 	spin_unlock(&dev->msg_lock);
 
 	return ret;
+}
+
+static int vduse_dev_msg_sync(struct vduse_dev *dev,
+			      struct vduse_dev_msg *msg)
+{
+	return __vduse_dev_msg_sync(dev, msg, true);
 }
 
 static int vduse_dev_get_vq_state_packed(struct vduse_dev *dev,
@@ -893,6 +967,592 @@ static int vduse_vdpa_set_map(struct vdpa_device *vdpa,
 	return 0;
 }
 
+static struct vduse_shm *vduse_find_shm(struct vduse_dev *dev, u8 id)
+{
+	/* Pairs with the release that publishes a region in setup. */
+	u32 i, num = smp_load_acquire(&dev->shm_num);
+
+	for (i = 0; i < num; i++) {
+		if (dev->shm[i].id == id)
+			return &dev->shm[i];
+	}
+	return NULL;
+}
+
+/*
+ * Applications write to the folios through PFN mappings, which set no dirty
+ * bit, so each folio is marked dirty when it is unpinned.
+ */
+static void vduse_shm_entry_free(struct vduse_shm_entry *e)
+{
+	unsigned int i;
+
+	for (i = 0; i < e->nr_folios; i++)
+		folio_mark_dirty_lock(e->folios[i]);
+	unpin_folios(e->folios, e->nr_folios);
+	kvfree(e->folios);
+	kvfree(e->pos);
+	kfree(e);
+}
+
+/* Pin the folios behind an entry's file range, which allocates any hole. */
+static int vduse_shm_entry_pin(struct vduse_shm_entry *e, struct file *file)
+{
+	unsigned int i, max = e->size >> PAGE_SHIFT;
+	pgoff_t first;
+	loff_t pos;
+	long n;
+
+	if (e->file_offset + e->size > i_size_read(file_inode(file)))
+		return -EINVAL;
+
+	e->folios = kvmalloc_array(max, sizeof(*e->folios), GFP_KERNEL_ACCOUNT);
+	e->pos = kvmalloc_array(max, sizeof(*e->pos), GFP_KERNEL_ACCOUNT);
+	if (!e->folios || !e->pos)
+		return -ENOMEM;
+
+	n = memfd_pin_folios(file, e->file_offset,
+			     e->file_offset + e->size - 1, e->folios, max,
+			     &first);
+	if (n < 0)
+		return n;
+	e->nr_folios = n;
+
+	pos = e->file_offset - first;
+	for (i = 0; i < e->nr_folios; i++) {
+		e->pos[i] = pos;
+		pos += folio_size(e->folios[i]);
+	}
+	if (pos < e->file_offset + e->size)
+		return -EINVAL;
+	return 0;
+}
+
+/* Return the PFN behind an offset of the region that the entry maps. */
+static unsigned long vduse_shm_entry_pfn(const struct vduse_shm_entry *e,
+					 u64 offset)
+{
+	loff_t pos = e->file_offset + (offset - e->offset);
+	unsigned int lo = 0, hi = e->nr_folios;
+
+	while (hi - lo > 1) {
+		unsigned int mid = lo + (hi - lo) / 2;
+
+		if (e->pos[mid] <= pos)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	return folio_pfn(e->folios[lo]) + ((pos - e->pos[lo]) >> PAGE_SHIFT);
+}
+
+static void vduse_shm_invalidate(struct vduse_dev *dev, u8 id, u64 offset,
+				 u64 size)
+{
+	down_read(&dev->shm_cb_sem);
+	if (dev->shm_cb.invalidate)
+		dev->shm_cb.invalidate(dev->shm_cb.private, id, offset, size);
+	up_read(&dev->shm_cb_sem);
+}
+
+static bool vduse_shm_range_valid(struct vduse_shm *shm, u64 offset, u64 size)
+{
+	return size && PAGE_ALIGNED(offset) && PAGE_ALIGNED(size) &&
+	       offset <= shm->size && size <= shm->size - offset;
+}
+
+/* Return whether the file has no seal that forbids writes. */
+static bool vduse_shm_file_writable(struct file *file)
+{
+	int seals = memfd_get_seals(file);
+
+	return seals >= 0 && !(seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE));
+}
+
+static int vduse_shm_setup(struct vduse_dev *dev,
+			   const struct vduse_shm_config *config)
+{
+	struct vduse_shm *shm;
+	int ret;
+
+	if (!is_mem_zero((const char *)config->padding,
+			 sizeof(config->padding)) ||
+	    !is_mem_zero((const char *)config->reserved,
+			 sizeof(config->reserved)) ||
+	    !config->size || !PAGE_ALIGNED(config->size) ||
+	    config->size > VDUSE_MAX_SHM_SIZE)
+		return -EINVAL;
+
+	mutex_lock(&vduse_lock);
+	ret = -EBUSY;
+	if (dev->vdev)
+		goto unlock;
+	ret = -EEXIST;
+	if (vduse_find_shm(dev, config->id))
+		goto unlock;
+	ret = -ENOSPC;
+	if (dev->shm_num == VDUSE_MAX_SHM)
+		goto unlock;
+
+	shm = &dev->shm[dev->shm_num];
+	shm->id = config->id;
+	shm->size = config->size;
+	mt_init(&shm->entries);
+	/* Pairs with the acquire in vduse_find_shm(). */
+	smp_store_release(&dev->shm_num, dev->shm_num + 1);
+	ret = 0;
+unlock:
+	mutex_unlock(&vduse_lock);
+	return ret;
+}
+
+/*
+ * A file is registered once, so that its range tree covers every mapping of
+ * its pages.
+ */
+static bool vduse_shm_file_registered(struct vduse_dev *dev,
+				      struct file *file)
+{
+	u32 i;
+
+	for (i = 0; i < dev->shm_nr_files; i++) {
+		if (dev->shm_files[i].file->f_mapping == file->f_mapping)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Register a backing file. Applications map its pages writable, so it must
+ * be open for writing and have no seal that forbids writes, and it counts as
+ * a writable mapping until it is dropped, so that no such seal can be added.
+ * The index is written to the caller before the file is published, and the
+ * write is repeated if another registration took that index meanwhile.
+ */
+static int vduse_shm_reg_file(struct vduse_dev *dev, int fd,
+			      u32 __user *uindex)
+{
+	struct vduse_shm_backing *b;
+	struct file *file;
+	u32 index;
+	int ret;
+
+	file = fget(fd);
+	if (!file)
+		return -EBADF;
+
+	ret = -EINVAL;
+	if (!(file->f_mode & FMODE_WRITE) ||
+	    (!shmem_file(file) && !is_file_hugepages(file)) ||
+	    !vduse_shm_file_writable(file))
+		goto put;
+	ret = mapping_map_writable(file->f_mapping);
+	if (ret)
+		goto put;
+	if (!vduse_shm_file_writable(file)) {
+		ret = -EINVAL;
+		goto unmap;
+	}
+
+	for (;;) {
+		mutex_lock(&dev->shm_lock);
+		index = dev->shm_nr_files;
+		if (dev->shm_revoked)
+			ret = -ENODEV;
+		else if (index == VDUSE_MAX_SHM_FILES)
+			ret = -ENOSPC;
+		else if (vduse_shm_file_registered(dev, file))
+			ret = -EEXIST;
+		mutex_unlock(&dev->shm_lock);
+		if (ret)
+			goto unmap;
+
+		if (put_user(index, uindex)) {
+			ret = -EFAULT;
+			goto unmap;
+		}
+
+		mutex_lock(&dev->shm_map_lock);
+		mutex_lock(&dev->shm_lock);
+		if (!dev->shm_revoked && dev->shm_nr_files == index &&
+		    !vduse_shm_file_registered(dev, file)) {
+			b = &dev->shm_files[index];
+			b->file = file;
+			mt_init(&b->ranges);
+			dev->shm_nr_files++;
+			mutex_unlock(&dev->shm_lock);
+			mutex_unlock(&dev->shm_map_lock);
+			return 0;
+		}
+		mutex_unlock(&dev->shm_lock);
+		mutex_unlock(&dev->shm_map_lock);
+	}
+
+unmap:
+	mapping_unmap_writable(file->f_mapping);
+put:
+	fput(file);
+	return ret;
+}
+
+/*
+ * Reserve an entry's file range, unless a mapped or reserved range of the
+ * file overlaps it. A file range is mapped at most once, and is reserved
+ * before it is pinned, so that a folio is pinned a bounded number of times.
+ * Faults do not read the file's tree, and shm_map_lock serializes its
+ * writers.
+ */
+static int vduse_shm_reserve(struct vduse_shm_backing *b,
+			     struct vduse_shm_entry *e)
+{
+	unsigned long first = e->file_offset >> PAGE_SHIFT;
+	unsigned long last = first + (e->size >> PAGE_SHIFT) - 1;
+	unsigned long index = first;
+
+	if (mt_find(&b->ranges, &index, last))
+		return -EEXIST;
+	return mtree_store_range(&b->ranges, first, last, e,
+				 GFP_KERNEL_ACCOUNT);
+}
+
+static void vduse_shm_unreserve(struct vduse_dev *dev,
+				struct vduse_shm_entry *e)
+{
+	mtree_erase(&dev->shm_files[e->file].ranges,
+		    e->file_offset >> PAGE_SHIFT);
+}
+
+/* Insert an entry into its region, unless it overlaps a mapped range. */
+static int vduse_shm_insert(struct vduse_shm *shm, struct vduse_shm_entry *e)
+{
+	unsigned long first = e->offset >> PAGE_SHIFT;
+	unsigned long last = first + (e->size >> PAGE_SHIFT) - 1;
+	unsigned long index = first;
+
+	if (mt_find(&shm->entries, &index, last))
+		return -EEXIST;
+	return mtree_store_range(&shm->entries, first, last, e,
+				 GFP_KERNEL_ACCOUNT);
+}
+
+/*
+ * Reserve and pin every range of the request, then insert them all into
+ * the region or none, under shm_lock so that faults see all or none. The
+ * files stay registered while an ioctl runs, since only closing the
+ * device's file drops them.
+ */
+static int vduse_shm_map(struct vduse_dev *dev,
+			 const struct vduse_shm_map *map)
+{
+	struct vduse_shm_range __user *uranges = u64_to_user_ptr(map->ranges);
+	struct vduse_shm *shm = vduse_find_shm(dev, map->id);
+	struct vduse_shm_entry *e, *tmp;
+	unsigned int i, inserted = 0;
+	LIST_HEAD(entries);
+	int ret = 0;
+
+	if (!shm || !is_mem_zero((const char *)map->padding,
+				 sizeof(map->padding)) ||
+	    !is_mem_zero((const char *)map->reserved, sizeof(map->reserved)) ||
+	    !map->nr_ranges || map->nr_ranges > VDUSE_MAX_SHM_RANGES)
+		return -EINVAL;
+
+	mutex_lock(&dev->shm_map_lock);
+	for (i = 0; i < map->nr_ranges; i++) {
+		struct vduse_shm_backing *b = NULL;
+		struct vduse_shm_range r;
+
+		ret = -EFAULT;
+		if (copy_from_user(&r, &uranges[i], sizeof(r)))
+			goto free;
+		ret = -EINVAL;
+		if (!is_mem_zero((const char *)r.reserved, sizeof(r.reserved)) ||
+		    !vduse_shm_range_valid(shm, r.offset, r.size) ||
+		    r.size > VDUSE_MAX_SHM_RANGE_SIZE ||
+		    !PAGE_ALIGNED(r.file_offset) ||
+		    r.file_offset + r.size < r.file_offset)
+			goto free;
+
+		mutex_lock(&dev->shm_lock);
+		if (r.file < dev->shm_nr_files)
+			b = &dev->shm_files[r.file];
+		mutex_unlock(&dev->shm_lock);
+		if (!b || !vduse_shm_file_writable(b->file))
+			goto free;
+
+		ret = -ENOMEM;
+		e = kzalloc_obj(*e, GFP_KERNEL_ACCOUNT);
+		if (!e)
+			goto free;
+		e->offset = r.offset;
+		e->size = r.size;
+		e->file_offset = r.file_offset;
+		e->file = r.file;
+
+		ret = vduse_shm_reserve(b, e);
+		if (ret) {
+			kfree(e);
+			goto free;
+		}
+		list_add_tail(&e->list, &entries);
+
+		ret = vduse_shm_entry_pin(e, b->file);
+		if (ret)
+			goto free;
+		cond_resched();
+	}
+
+	mutex_lock(&dev->shm_lock);
+	ret = dev->shm_revoked ? -ENODEV : 0;
+	list_for_each_entry(e, &entries, list) {
+		if (ret)
+			break;
+		ret = vduse_shm_insert(shm, e);
+		if (!ret)
+			inserted++;
+	}
+	if (ret) {
+		list_for_each_entry(e, &entries, list) {
+			if (!inserted--)
+				break;
+			mtree_erase(&shm->entries, e->offset >> PAGE_SHIFT);
+		}
+	}
+	mutex_unlock(&dev->shm_lock);
+	if (!ret)
+		goto unlock;
+free:
+	list_for_each_entry_safe(e, tmp, &entries, list) {
+		vduse_shm_unreserve(dev, e);
+		vduse_shm_entry_free(e);
+		cond_resched();
+	}
+unlock:
+	mutex_unlock(&dev->shm_map_lock);
+	return ret;
+}
+
+/*
+ * Remove the entries, zap the driver's mappings of the range, and only then
+ * release the folios. A fault that found an entry inserted its page before
+ * the entry was removed, so the zap removes that page too. Holding
+ * shm_map_lock throughout keeps another unmap of the range from returning
+ * before the zap, and the file ranges from being mapped again before the
+ * folios are released.
+ */
+static int vduse_shm_unmap(struct vduse_dev *dev,
+			   const struct vduse_shm_unmap *unmap)
+{
+	struct vduse_shm *shm = vduse_find_shm(dev, unmap->id);
+	unsigned long first, last, index;
+	struct vduse_shm_entry *e, *tmp;
+	LIST_HEAD(entries);
+	int ret = 0;
+
+	if (!shm || !is_mem_zero((const char *)unmap->padding,
+				 sizeof(unmap->padding)) ||
+	    !is_mem_zero((const char *)unmap->reserved,
+			 sizeof(unmap->reserved)) ||
+	    !vduse_shm_range_valid(shm, unmap->offset, unmap->size))
+		return -EINVAL;
+
+	first = unmap->offset >> PAGE_SHIFT;
+	last = first + (unmap->size >> PAGE_SHIFT) - 1;
+
+	mutex_lock(&dev->shm_map_lock);
+	mutex_lock(&dev->shm_lock);
+	index = first;
+	mt_for_each(&shm->entries, e, index, last) {
+		if (e->offset < unmap->offset ||
+		    e->offset + e->size > unmap->offset + unmap->size) {
+			ret = -EINVAL;
+			break;
+		}
+		cond_resched();
+	}
+	if (!ret) {
+		index = first;
+		mt_for_each(&shm->entries, e, index, last) {
+			list_add_tail(&e->list, &entries);
+			cond_resched();
+		}
+		list_for_each_entry(e, &entries, list) {
+			mtree_erase(&shm->entries, e->offset >> PAGE_SHIFT);
+			cond_resched();
+		}
+	}
+	mutex_unlock(&dev->shm_lock);
+
+	if (!list_empty(&entries))
+		vduse_shm_invalidate(dev, unmap->id, unmap->offset,
+				     unmap->size);
+	list_for_each_entry_safe(e, tmp, &entries, list) {
+		vduse_shm_unreserve(dev, e);
+		vduse_shm_entry_free(e);
+		cond_resched();
+	}
+	mutex_unlock(&dev->shm_map_lock);
+	return ret;
+}
+
+/*
+ * Fail the fault requests that wait, which no device will answer, and make
+ * later ones fail before they are queued.
+ */
+static void vduse_shm_fail_faults(struct vduse_dev *dev)
+{
+	struct vduse_dev_msg *msg, *tmp;
+	struct list_head *lists[] = { &dev->send_list, &dev->recv_list };
+	int i;
+
+	spin_lock(&dev->msg_lock);
+	dev->shm_faults_failed = true;
+	for (i = 0; i < ARRAY_SIZE(lists); i++) {
+		list_for_each_entry_safe(msg, tmp, lists[i], list) {
+			if (msg->req.type != VDUSE_SHM_FAULT)
+				continue;
+			list_del(&msg->list);
+			msg->resp.result = VDUSE_REQ_RESULT_FAILED;
+			msg->completed = 1;
+			wake_up(&msg->waitq);
+		}
+	}
+	spin_unlock(&dev->msg_lock);
+}
+
+/*
+ * Unmap every region and drop the backing files when the device's file is
+ * closed. Later faults fail without a request.
+ */
+static void vduse_shm_revoke(struct vduse_dev *dev)
+{
+	struct file *files[VDUSE_MAX_SHM_FILES];
+	struct vduse_shm_entry *e, *tmp;
+	unsigned long index;
+	LIST_HEAD(entries);
+	u32 i, nr_files;
+
+	vduse_shm_fail_faults(dev);
+
+	mutex_lock(&dev->shm_map_lock);
+	mutex_lock(&dev->shm_lock);
+	dev->shm_revoked = true;
+	for (i = 0; i < dev->shm_num; i++) {
+		index = 0;
+		mt_for_each(&dev->shm[i].entries, e, index, ULONG_MAX) {
+			list_add_tail(&e->list, &entries);
+			cond_resched();
+		}
+		mtree_destroy(&dev->shm[i].entries);
+	}
+	nr_files = dev->shm_nr_files;
+	for (i = 0; i < nr_files; i++) {
+		files[i] = dev->shm_files[i].file;
+		mtree_destroy(&dev->shm_files[i].ranges);
+	}
+	dev->shm_nr_files = 0;
+	mutex_unlock(&dev->shm_lock);
+
+	for (i = 0; i < dev->shm_num; i++)
+		vduse_shm_invalidate(dev, dev->shm[i].id, 0, dev->shm[i].size);
+	list_for_each_entry_safe(e, tmp, &entries, list) {
+		vduse_shm_entry_free(e);
+		cond_resched();
+	}
+	mutex_unlock(&dev->shm_map_lock);
+
+	for (i = 0; i < nr_files; i++) {
+		mapping_unmap_writable(files[i]->f_mapping);
+		fput(files[i]);
+	}
+}
+
+static bool vduse_vdpa_get_shm_region(struct vdpa_device *vdpa, u8 id,
+				      struct virtio_shm_region *region)
+{
+	struct vduse_dev *dev = vdpa_to_vduse(vdpa);
+	struct vduse_shm *shm = vduse_find_shm(dev, id);
+
+	if (!shm)
+		return false;
+	region->addr = 0;
+	region->len = shm->size;
+	region->no_phys = true;
+	return true;
+}
+
+/*
+ * Insert the page behind a mapped offset. An unmapped offset sends the
+ * device one request, while the fault's lock is dropped, and the retry
+ * fails if the device did not map the offset. A fault that cannot be
+ * retried fails on an unmapped offset without a request. A fault under
+ * the VMA lock is retried under mmap_lock first, which then sends the
+ * request.
+ */
+static vm_fault_t vduse_vdpa_shm_fault(struct vdpa_device *vdpa, u8 id,
+				       u64 offset, struct vm_fault *vmf)
+{
+	struct vduse_dev *dev = vdpa_to_vduse(vdpa);
+	struct vduse_shm *shm = vduse_find_shm(dev, id);
+	struct vm_area_struct *vma = vmf->vma;
+	struct vduse_dev_msg msg = { 0 };
+	struct vduse_shm_entry *e;
+	vm_fault_t ret;
+	bool revoked;
+
+	/*
+	 * A private mapping could copy the pages, and a mapping that is not
+	 * only VM_PFNMAP could pin them past an unmap.
+	 */
+	if (!shm || !PAGE_ALIGNED(offset) || offset >= shm->size ||
+	    !(vma->vm_flags & VM_PFNMAP) || (vma->vm_flags & VM_MIXEDMAP) ||
+	    is_cow_mapping(vma->vm_flags))
+		return VM_FAULT_SIGBUS;
+
+	mutex_lock(&dev->shm_lock);
+	e = mtree_load(&shm->entries, offset >> PAGE_SHIFT);
+	if (e) {
+		ret = vmf_insert_pfn_prot(vma, vmf->address,
+					  vduse_shm_entry_pfn(e, offset),
+					  vm_get_page_prot(vma->vm_flags));
+		mutex_unlock(&dev->shm_lock);
+		return ret;
+	}
+	revoked = dev->shm_revoked;
+	mutex_unlock(&dev->shm_lock);
+
+	if (revoked || (vmf->flags & FAULT_FLAG_TRIED) ||
+	    !(vmf->flags & FAULT_FLAG_ALLOW_RETRY))
+		return VM_FAULT_SIGBUS;
+	if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
+		return VM_FAULT_RETRY;
+
+	if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+		release_fault_lock(vmf);
+		return VM_FAULT_RETRY;
+	}
+
+	msg.req.type = VDUSE_SHM_FAULT;
+	msg.req.shm_fault.id = id;
+	msg.req.shm_fault.offset = offset;
+	release_fault_lock(vmf);
+	__vduse_dev_msg_sync(dev, &msg, false);
+	return VM_FAULT_RETRY;
+}
+
+static void vduse_vdpa_set_shm_cb(struct vdpa_device *vdpa,
+				  const struct vdpa_shm_callback *cb)
+{
+	struct vduse_dev *dev = vdpa_to_vduse(vdpa);
+
+	down_write(&dev->shm_cb_sem);
+	if (cb)
+		dev->shm_cb = *cb;
+	else
+		memset(&dev->shm_cb, 0, sizeof(dev->shm_cb));
+	up_write(&dev->shm_cb_sem);
+}
+
 static void vduse_vdpa_free(struct vdpa_device *vdpa)
 {
 	struct vduse_dev *dev = vdpa_to_vduse(vdpa);
@@ -931,6 +1591,9 @@ static const struct vdpa_config_ops vduse_vdpa_config_ops = {
 	.set_map		= vduse_vdpa_set_map,
 	.set_group_asid		= vduse_set_group_asid,
 	.get_vq_map		= vduse_get_vq_map,
+	.get_shm_region		= vduse_vdpa_get_shm_region,
+	.shm_fault		= vduse_vdpa_shm_fault,
+	.set_shm_cb		= vduse_vdpa_set_shm_cb,
 	.free			= vduse_vdpa_free,
 };
 
@@ -1630,6 +2293,59 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 		ret = 0;
 		break;
 	}
+	case VDUSE_SHM_SETUP: {
+		struct vduse_shm_config config;
+
+		ret = -ENOIOCTLCMD;
+		if (dev->api_version < VDUSE_API_VERSION_2)
+			break;
+		ret = -EFAULT;
+		if (copy_from_user(&config, argp, sizeof(config)))
+			break;
+		ret = vduse_shm_setup(dev, &config);
+		break;
+	}
+	case VDUSE_SHM_REG_FILE: {
+		struct vduse_shm_file sf;
+
+		ret = -ENOIOCTLCMD;
+		if (dev->api_version < VDUSE_API_VERSION_2)
+			break;
+		ret = -EFAULT;
+		if (copy_from_user(&sf, argp, sizeof(sf)))
+			break;
+		ret = -EINVAL;
+		if (!is_mem_zero((const char *)sf.reserved,
+				 sizeof(sf.reserved)))
+			break;
+		ret = vduse_shm_reg_file(dev, sf.fd,
+					 &((struct vduse_shm_file __user *)argp)->index);
+		break;
+	}
+	case VDUSE_SHM_MAP: {
+		struct vduse_shm_map map;
+
+		ret = -ENOIOCTLCMD;
+		if (dev->api_version < VDUSE_API_VERSION_2)
+			break;
+		ret = -EFAULT;
+		if (copy_from_user(&map, argp, sizeof(map)))
+			break;
+		ret = vduse_shm_map(dev, &map);
+		break;
+	}
+	case VDUSE_SHM_UNMAP: {
+		struct vduse_shm_unmap unmap;
+
+		ret = -ENOIOCTLCMD;
+		if (dev->api_version < VDUSE_API_VERSION_2)
+			break;
+		ret = -EFAULT;
+		if (copy_from_user(&unmap, argp, sizeof(unmap)))
+			break;
+		ret = vduse_shm_unmap(dev, &unmap);
+		break;
+	}
 	default:
 		ret = -ENOIOCTLCMD;
 		break;
@@ -1762,6 +2478,8 @@ static long vduse_dev_compat_ioctl(struct file *file, unsigned int cmd,
 static int vduse_dev_release(struct inode *inode, struct file *file)
 {
 	struct vduse_dev *dev = file->private_data;
+
+	vduse_shm_revoke(dev);
 
 	mutex_lock(&dev->domain_lock);
 	for (int i = 0; i < dev->nas; i++)
@@ -1985,6 +2703,9 @@ static struct vduse_dev *vduse_dev_create(void)
 	INIT_LIST_HEAD(&dev->recv_list);
 	spin_lock_init(&dev->irq_lock);
 	init_rwsem(&dev->rwsem);
+	mutex_init(&dev->shm_map_lock);
+	mutex_init(&dev->shm_lock);
+	init_rwsem(&dev->shm_cb_sem);
 
 	INIT_WORK(&dev->inject, vduse_dev_irq_inject);
 	init_waitqueue_head(&dev->waitq);
@@ -2036,6 +2757,8 @@ static int vduse_destroy_dev(char *name)
 	kfree(dev->as);
 	kfree(dev->name);
 	kfree(dev->groups);
+	for (int i = 0; i < dev->shm_num; i++)
+		mtree_destroy(&dev->shm[i].entries);
 	vduse_dev_destroy(dev);
 	module_put(THIS_MODULE);
 
@@ -2288,7 +3011,7 @@ static long vduse_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case VDUSE_GET_API_VERSION:
 		if (control->api_version == VDUSE_API_VERSION_NOT_ASKED)
-			control->api_version = VDUSE_API_VERSION_1;
+			control->api_version = VDUSE_API_VERSION_2;
 		ret = put_user(control->api_version, (u64 __user *)argp);
 		break;
 	case VDUSE_SET_API_VERSION: {
@@ -2299,7 +3022,7 @@ static long vduse_ioctl(struct file *file, unsigned int cmd,
 			break;
 
 		ret = -EINVAL;
-		if (api_version > VDUSE_API_VERSION_1)
+		if (api_version > VDUSE_API_VERSION_2)
 			break;
 
 		ret = 0;
