@@ -107,6 +107,27 @@ void virtio_gpu_fence_emit(struct virtio_gpu_device *vgdev,
 	}
 }
 
+/* Signal every pending fence with an error, once the device is gone. */
+void virtio_gpu_fence_fail_all(struct virtio_gpu_device *vgdev)
+{
+	struct virtio_gpu_fence_driver *drv = &vgdev->fence_drv;
+	struct virtio_gpu_fence *curr, *tmp;
+	unsigned long irq_flags;
+
+	spin_lock_irqsave(&drv->lock, irq_flags);
+	list_for_each_entry_safe(curr, tmp, &drv->fences, node) {
+		dma_fence_set_error(&curr->f, -ENODEV);
+		dma_fence_signal_locked(&curr->f);
+		if (curr->e) {
+			drm_send_event(vgdev->ddev, &curr->e->base);
+			curr->e = NULL;
+		}
+		list_del(&curr->node);
+		dma_fence_put(&curr->f);
+	}
+	spin_unlock_irqrestore(&drv->lock, irq_flags);
+}
+
 void virtio_gpu_fence_event_process(struct virtio_gpu_device *vgdev,
 				    u64 fence_id)
 {

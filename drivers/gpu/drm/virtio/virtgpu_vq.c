@@ -222,6 +222,45 @@ static void reclaim_vbufs(struct virtqueue *vq, struct list_head *reclaim_list)
 		DRM_DEBUG("Huh? zero vbufs reclaimed");
 }
 
+/*
+ * Complete the commands that a reset device left unanswered as failed, so
+ * that their callbacks release what they hold, and fail their fences.
+ */
+void virtio_gpu_fail_pending(struct virtio_gpu_device *vgdev)
+{
+	struct virtio_gpu_queue *queues[] = { &vgdev->ctrlq, &vgdev->cursorq };
+	struct virtio_gpu_ctrl_hdr *resp;
+	struct virtio_gpu_vbuffer *vbuf;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(queues); i++) {
+		for (;;) {
+			spin_lock(&queues[i]->qlock);
+			vbuf = virtqueue_detach_unused_buf(queues[i]->vq);
+			spin_unlock(&queues[i]->qlock);
+			if (!vbuf)
+				break;
+
+			resp = (struct virtio_gpu_ctrl_hdr *)vbuf->resp_buf;
+			if (vbuf->resp_size >= sizeof(*resp)) {
+				memset(resp, 0, sizeof(*resp));
+				resp->type =
+					cpu_to_le32(VIRTIO_GPU_RESP_ERR_UNSPEC);
+			}
+			if (vbuf->resp_cb)
+				vbuf->resp_cb(vgdev, vbuf);
+			if (vbuf->objs)
+				virtio_gpu_array_put_free_delayed(vgdev,
+								  vbuf->objs);
+			free_vbuf(vgdev, vbuf);
+		}
+	}
+	virtio_gpu_fence_fail_all(vgdev);
+	wake_up_all(&vgdev->ctrlq.ack_queue);
+	wake_up_all(&vgdev->cursorq.ack_queue);
+	wake_up_all(&vgdev->resp_wq);
+}
+
 void virtio_gpu_dequeue_ctrl_func(struct work_struct *work)
 {
 	struct virtio_gpu_device *vgdev =
