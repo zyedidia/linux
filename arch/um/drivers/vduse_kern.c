@@ -9,7 +9,9 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/vduse.h>
 #include <linux/vduse_guest.h>
+#include <as-layout.h>
 #include <irq_kern.h>
 #include <init.h>
 #include <mem.h>
@@ -25,13 +27,15 @@ struct uml_vduse_vq {
 };
 
 /*
- * A device's host fds, its in-flight log file, and the host window in which
- * the chunks of its bounce region lie side by side.
+ * A device's host fds, its in-flight log file, the host window in which
+ * the chunks of its bounce region lie side by side, and the index of the
+ * guest memory file once it backs the device's shared memory regions.
  */
 struct uml_vduse {
 	int fd;
 	int irq;
 	struct uml_vduse_vq *vqs;
+	int mem_file;
 
 	char *log_path;
 	int log_fd;
@@ -68,6 +72,7 @@ static int uml_vduse_alloc(struct vduse_guest_dev *dev,
 
 	u->fd = -1;
 	u->log_fd = -1;
+	u->mem_file = -1;
 	vduse_guest_set_host_data(dev, u);
 	return 0;
 }
@@ -111,10 +116,13 @@ static int uml_vduse_check_opts(struct vduse_guest_dev *dev)
 	return 0;
 }
 
+/* Shared memory regions need VDUSE API version 2. */
 static int uml_vduse_create(struct vduse_guest_dev *dev,
 			    const struct vduse_guest_config *cfg, u64 features,
 			    u32 vq_align)
 {
+	u64 api_version = cfg->num_shm ? 2 : 0;
+
 	if (uml_vduse_broker_fd >= 0) {
 		guard(mutex)(&uml_vduse_broker_lock);
 		return uml_vduse_user_broker_create(uml_vduse_broker_fd,
@@ -122,7 +130,8 @@ static int uml_vduse_create(struct vduse_guest_dev *dev,
 						    cfg->device_id, features,
 						    cfg->num_queues, vq_align,
 						    cfg->config,
-						    cfg->config_size);
+						    cfg->config_size,
+						    api_version);
 	}
 
 	if (uml_vduse_control < 0) {
@@ -133,7 +142,8 @@ static int uml_vduse_create(struct vduse_guest_dev *dev,
 
 	return uml_vduse_user_create(uml_vduse_control, vduse_guest_name(dev),
 				     cfg->device_id, features, cfg->num_queues,
-				     vq_align, cfg->config, cfg->config_size);
+				     vq_align, cfg->config, cfg->config_size,
+				     api_version);
 }
 
 static int uml_vduse_destroy(struct vduse_guest_dev *dev)
@@ -177,9 +187,13 @@ static int uml_vduse_open(struct vduse_guest_dev *dev)
 	return 0;
 }
 
+/* Closing the device's file drops its registered files. */
 static void uml_vduse_close(struct vduse_guest_dev *dev)
 {
-	os_close_file(uml_vduse_of(dev)->fd);
+	struct uml_vduse *u = uml_vduse_of(dev);
+
+	os_close_file(u->fd);
+	u->mem_file = -1;
 }
 
 static int uml_vduse_node_id(struct vduse_guest_dev *dev, u64 *node_dev,
@@ -246,6 +260,7 @@ static int uml_vduse_read_msg(struct vduse_guest_dev *dev,
 	BUILD_BUG_ON((int)UML_VDUSE_MSG_SET_STATUS != VDUSE_GUEST_MSG_SET_STATUS);
 	BUILD_BUG_ON((int)UML_VDUSE_MSG_UPDATE_IOTLB !=
 		     VDUSE_GUEST_MSG_UPDATE_IOTLB);
+	BUILD_BUG_ON((int)UML_VDUSE_MSG_SHM_FAULT != VDUSE_GUEST_MSG_SHM_FAULT);
 	BUILD_BUG_ON((int)UML_VDUSE_MSG_UNKNOWN != VDUSE_GUEST_MSG_UNKNOWN);
 
 	err = uml_vduse_user_read_msg(uml_vduse_of(dev)->fd, &m);
@@ -542,6 +557,69 @@ static void uml_vduse_drop_log(struct vduse_guest_dev *dev)
 	}
 }
 
+/*
+ * Declare a region. The guest memory file backs every region, so it is
+ * registered with the first one.
+ */
+static int uml_vduse_shm_setup(struct vduse_guest_dev *dev, u8 id, u64 size)
+{
+	struct uml_vduse *u = uml_vduse_of(dev);
+	unsigned long long offset;
+	u32 index;
+	int err;
+
+	err = uml_vduse_user_shm_setup(u->fd, id, size);
+	if (err || u->mem_file >= 0)
+		return err;
+
+	err = uml_vduse_user_shm_reg_file(u->fd, phys_mapping(0, &offset),
+					  &index);
+	if (err)
+		return err;
+	u->mem_file = index;
+	return 0;
+}
+
+/* A page's offset in the guest memory file is its physical address. */
+static int uml_vduse_shm_map(struct vduse_guest_dev *dev, u8 id,
+			     const struct vduse_guest_shm_range *ranges,
+			     unsigned int nr)
+{
+	struct uml_vduse *u = uml_vduse_of(dev);
+	struct vduse_shm_range *r;
+	unsigned int i;
+	int err;
+
+	if (u->mem_file < 0)
+		return -EINVAL;
+
+	r = kvcalloc(nr, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	for (i = 0; i < nr; i++) {
+		if (ranges[i].phys > physmem_size ||
+		    ranges[i].size > physmem_size - ranges[i].phys) {
+			kvfree(r);
+			return -EINVAL;
+		}
+		r[i].offset = ranges[i].offset;
+		r[i].size = ranges[i].size;
+		r[i].file_offset = ranges[i].phys;
+		r[i].file = u->mem_file;
+	}
+
+	err = uml_vduse_user_shm_map(u->fd, id, r, nr);
+	kvfree(r);
+	return err;
+}
+
+static int uml_vduse_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
+			       u64 size)
+{
+	return uml_vduse_user_shm_unmap(uml_vduse_of(dev)->fd, id, offset,
+					size);
+}
+
 static const struct vduse_guest_host_ops uml_vduse_host_ops = {
 	.alloc = uml_vduse_alloc,
 	.free = uml_vduse_free,
@@ -577,6 +655,9 @@ static const struct vduse_guest_host_ops uml_vduse_host_ops = {
 	.map_log = uml_vduse_map_log,
 	.unmap_log = uml_vduse_unmap_log,
 	.drop_log = uml_vduse_drop_log,
+	.shm_setup = uml_vduse_shm_setup,
+	.shm_map = uml_vduse_shm_map,
+	.shm_unmap = uml_vduse_shm_unmap,
 };
 
 static struct vduse_guest_host uml_vduse_host = {

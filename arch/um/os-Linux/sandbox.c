@@ -24,7 +24,8 @@
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #if IS_ENABLED(CONFIG_UML_VDUSE)
-#include <linux/vduse.h>
+/* The tree's header, since the host's may lack newer VDUSE ioctls. */
+#include "../../../include/uapi/linux/vduse.h"
 #endif
 #if IS_ENABLED(CONFIG_UML_PCI_OVER_VFIO)
 #include <linux/vfio.h>
@@ -144,6 +145,10 @@ static const unsigned int allowed_ioctls[] = {
 	VDUSE_IOTLB_GET_INFO,
 	VDUSE_IOTLB_REG_UMEM,
 	VDUSE_IOTLB_DEREG_UMEM,
+	VDUSE_SHM_SETUP,
+	VDUSE_SHM_REG_FILE,
+	VDUSE_SHM_MAP,
+	VDUSE_SHM_UNMAP,
 #endif
 	TCGETS,
 	TCSETS,

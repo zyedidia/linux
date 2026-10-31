@@ -14,6 +14,10 @@
 
 #define VDUSE_API_VERSION_1	1
 
+/* Shared memory regions. */
+
+#define VDUSE_API_VERSION_2	2
+
 /*
  * Get the version of VDUSE API that kernel supported (VDUSE_API_VERSION).
  * This is used for future extension.
@@ -308,6 +312,124 @@ struct vduse_iotlb_entry_v2 {
  */
 #define VDUSE_IOTLB_GET_FD2	_IOWR(VDUSE_BASE, 0x1b, struct vduse_iotlb_entry_v2)
 
+/**
+ * struct vduse_shm_config - a shared memory region of a VDUSE device
+ * @id: the region's ID, as the device type defines it
+ * @padding: needs to be initialized to zero
+ * @size: the region's size, a nonzero multiple of the page size
+ * @reserved: for future use, needs to be initialized to zero
+ *
+ * Structure used by VDUSE_SHM_SETUP ioctl to declare a shared memory region.
+ * The region has no physical address. Its pages are ranges of memory files
+ * that the device maps into it with VDUSE_SHM_MAP, and a fault in a range
+ * that is not mapped sends a VDUSE_SHM_FAULT request to the device.
+ */
+struct vduse_shm_config {
+	__u8 id;
+	__u8 padding[7];
+	__u64 size;
+	__u32 reserved[4];
+};
+
+/*
+ * Declare a shared memory region, if VDUSE_API_VERSION >= 2. Make sure all
+ * regions have been declared before the device is attached to vDPA bus.
+ */
+#define VDUSE_SHM_SETUP		_IOW(VDUSE_BASE, 0x1c, struct vduse_shm_config)
+
+/**
+ * struct vduse_shm_file - a backing file of shared memory regions
+ * @fd: a shmem or hugetlbfs file, open for writing, without a seal that
+ *      forbids writes
+ * @index: the index that VDUSE_SHM_MAP names the file by, set by the ioctl
+ * @reserved: for future use, needs to be initialized to zero
+ *
+ * Structure used by VDUSE_SHM_REG_FILE ioctl to register a backing file.
+ */
+struct vduse_shm_file {
+	__s32 fd;
+	__u32 index;
+	__u32 reserved[4];
+};
+
+/*
+ * Register a backing file of the shared memory regions, if VDUSE_API_VERSION
+ * >= 2. VDUSE keeps the file until the device's file is closed, and the file
+ * counts as mapped writable meanwhile, so that it cannot be sealed against
+ * writes.
+ */
+#define VDUSE_SHM_REG_FILE	_IOWR(VDUSE_BASE, 0x1d, struct vduse_shm_file)
+
+/**
+ * struct vduse_shm_range - a range of a region and the file range behind it
+ * @offset: the page-aligned offset of the range in the region
+ * @size: the page-aligned size of the range
+ * @file_offset: the page-aligned offset of the range in the file
+ * @file: the index of a registered file
+ * @reserved: for future use, needs to be initialized to zero
+ */
+struct vduse_shm_range {
+	__u64 offset;
+	__u64 size;
+	__u64 file_offset;
+	__u32 file;
+	__u32 reserved[3];
+};
+
+/**
+ * struct vduse_shm_map - ranges to map into a shared memory region
+ * @id: the region
+ * @padding: needs to be initialized to zero
+ * @nr_ranges: the number of ranges
+ * @ranges: the address of an array of struct vduse_shm_range
+ * @reserved: for future use, needs to be initialized to zero
+ *
+ * Structure used by VDUSE_SHM_MAP ioctl.
+ */
+struct vduse_shm_map {
+	__u8 id;
+	__u8 padding[3];
+	__u32 nr_ranges;
+	__u64 ranges;
+	__u32 reserved[4];
+};
+
+/*
+ * Map ranges of files into a shared memory region, if VDUSE_API_VERSION >= 2.
+ * Either every range is mapped or none is. A range must lie within the region
+ * and its file, must be at most 4 GiB, and must not overlap a mapped range of
+ * the region or of the file. VDUSE pins the file's folios behind each range,
+ * and allocates a folio for a hole, until the range is unmapped. The driver's
+ * mappings of the region use the folios write-back.
+ */
+#define VDUSE_SHM_MAP		_IOW(VDUSE_BASE, 0x1e, struct vduse_shm_map)
+
+/**
+ * struct vduse_shm_unmap - a range of a shared memory region to unmap
+ * @id: the region
+ * @padding: needs to be initialized to zero
+ * @offset: the page-aligned offset in the region
+ * @size: the page-aligned size
+ * @reserved: for future use, needs to be initialized to zero
+ *
+ * Structure used by VDUSE_SHM_UNMAP ioctl.
+ */
+struct vduse_shm_unmap {
+	__u8 id;
+	__u8 padding[7];
+	__u64 offset;
+	__u64 size;
+	__u32 reserved[4];
+};
+
+/*
+ * Unmap every mapped range that lies within a range of a shared memory
+ * region, if VDUSE_API_VERSION >= 2. A mapped range that lies partly within
+ * it is an error. When the ioctl returns, the driver's mappings of the range
+ * are gone and VDUSE has released the folios.
+ */
+#define VDUSE_SHM_UNMAP		_IOW(VDUSE_BASE, 0x1f, struct vduse_shm_unmap)
+
 
 /* The control messages definition for read(2)/write(2) on /dev/vduse/$NAME */
 
@@ -319,12 +441,15 @@ struct vduse_iotlb_entry_v2 {
  *                      specified IOVA range via VDUSE_IOTLB_GET_FD ioctl
  * @VDUSE_SET_VQ_GROUP_ASID: Notify userspace to update the address space of a
  *                           virtqueue group.
+ * @VDUSE_SHM_FAULT: Ask userspace to map a range of a shared memory region
+ *                   that covers a faulting offset, or to refuse it
  */
 enum vduse_req_type {
 	VDUSE_GET_VQ_STATE,
 	VDUSE_SET_STATUS,
 	VDUSE_UPDATE_IOTLB,
 	VDUSE_SET_VQ_GROUP_ASID,
+	VDUSE_SHM_FAULT,
 };
 
 /**
@@ -373,6 +498,21 @@ struct vduse_iova_range_v2 {
 };
 
 /**
+ * struct vduse_shm_fault - a fault on an unmapped range of a region
+ * @id: the region
+ * @padding: padding
+ * @offset: the page-aligned offset of the fault in the region
+ *
+ * The fault is retried once the request completes, and fails if the request
+ * fails or the offset is still not mapped.
+ */
+struct vduse_shm_fault {
+	__u8 id;
+	__u8 padding[7];
+	__u64 offset;
+};
+
+/**
  * struct vduse_dev_request - control request
  * @type: request type
  * @request_id: request id
@@ -382,6 +522,7 @@ struct vduse_iova_range_v2 {
  * @iova: IOVA range for updating
  * @iova_v2: IOVA range for updating if API_VERSION >= 1
  * @vq_group_asid: ASID of a virtqueue group
+ * @shm_fault: fault on a shared memory region, if API_VERSION >= 2
  * @padding: padding
  *
  * Structure used by read(2) on /dev/vduse/$NAME.
@@ -399,6 +540,7 @@ struct vduse_dev_request {
 		 */
 		struct vduse_iova_range_v2 iova_v2;
 		struct vduse_vq_group_asid vq_group_asid;
+		struct vduse_shm_fault shm_fault;
 		__u32 padding[32];
 	};
 };

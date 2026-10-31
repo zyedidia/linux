@@ -6,10 +6,14 @@ enum {
 	UML_VDUSE_MSG_GET_VQ_STATE,
 	UML_VDUSE_MSG_SET_STATUS,
 	UML_VDUSE_MSG_UPDATE_IOTLB,
+	UML_VDUSE_MSG_SHM_FAULT,
 	UML_VDUSE_MSG_UNKNOWN,
 };
 
-/* A control message from the host. */
+/*
+ * A control message from the host. A shared memory fault carries the region
+ * in index and the offset in start.
+ */
 struct uml_vduse_user_msg {
 	int type;
 	uint32_t request_id;
@@ -40,13 +44,15 @@ struct uml_vduse_user_region {
 int uml_vduse_user_open_control(void);
 int uml_vduse_user_create(int control, const char *name, uint32_t device_id,
 			  uint64_t features, uint32_t vq_num, uint32_t vq_align,
-			  const void *config, uint32_t config_size);
+			  const void *config, uint32_t config_size,
+			  uint64_t api_version);
 int uml_vduse_user_destroy(int control, const char *name);
 int uml_vduse_user_open(const char *name);
 int uml_vduse_user_broker_create(int broker, const char *name,
 				 uint32_t device_id, uint64_t features,
 				 uint32_t vq_num, uint32_t vq_align,
-				 const void *config, uint32_t config_size);
+				 const void *config, uint32_t config_size,
+				 uint64_t api_version);
 int uml_vduse_user_broker_destroy(int broker, const char *name);
 int uml_vduse_user_broker_open(int broker, const char *name);
 int uml_vduse_user_broker_resize_log(int broker, const char *name,
@@ -80,6 +86,13 @@ int uml_vduse_user_map_window(void *addr, size_t size, int fd,
 void uml_vduse_user_unmap_window(void *addr, size_t size);
 int uml_vduse_user_reg_umem(int fd, void *addr, uint64_t size);
 int uml_vduse_user_dereg_umem(int fd, uint64_t size);
+
+int uml_vduse_user_shm_setup(int fd, uint8_t id, uint64_t size);
+int uml_vduse_user_shm_reg_file(int fd, int file, uint32_t *index);
+int uml_vduse_user_shm_map(int fd, uint8_t id, const void *ranges,
+			   unsigned int nr);
+int uml_vduse_user_shm_unmap(int fd, uint8_t id, uint64_t offset,
+			     uint64_t size);
 
 int uml_vduse_user_open_log(const char *path);
 int uml_vduse_user_log_size(int fd, uint64_t *size);

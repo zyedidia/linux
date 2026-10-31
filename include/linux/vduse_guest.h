@@ -11,11 +11,25 @@ struct seq_file;
 struct vduse_guest_dev;
 struct vduse_guest_host;
 
+/* A shared memory region of a device, a nonzero multiple of the page size. */
+struct vduse_guest_shm {
+	u8 id;
+	u64 size;
+};
+
+/* A page-aligned range of a shared memory region and the memory behind it. */
+struct vduse_guest_shm_range {
+	u64 offset;
+	u64 size;
+	phys_addr_t phys;
+};
+
 /*
  * The device that a backend describes at setup. Queue_sizes gives the size
  * of each of the num_queues queues, each a power of 2. Allow_reconnect lets
  * the device take over a device that an earlier guest left in use, and
- * without it setup fails when it finds one.
+ * without it setup fails when it finds one. A device with shared memory
+ * regions, num_shm of them in shm, cannot reconnect.
  */
 struct vduse_guest_config {
 	u32 device_id;
@@ -25,6 +39,8 @@ struct vduse_guest_config {
 	bool allow_reconnect;
 	const void *config;
 	u32 config_size;
+	const struct vduse_guest_shm *shm;
+	u32 num_shm;
 };
 
 /*
@@ -73,14 +89,29 @@ bool vduse_guest_notify_enable(struct vduse_guest_dev *dev,
 			       unsigned int index);
 bool vduse_guest_poll(struct vduse_guest_dev *dev, unsigned int index);
 
+/*
+ * Map ranges of guest memory into a shared memory region, all or none, or
+ * unmap the ranges within a range. When unmap returns, the host's mappings
+ * of the range are gone, and the memory may be reused.
+ */
+int vduse_guest_shm_map(struct vduse_guest_dev *dev, u8 id,
+			const struct vduse_guest_shm_range *ranges,
+			unsigned int nr);
+int vduse_guest_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
+			  u64 size);
+
 enum {
 	VDUSE_GUEST_MSG_GET_VQ_STATE,
 	VDUSE_GUEST_MSG_SET_STATUS,
 	VDUSE_GUEST_MSG_UPDATE_IOTLB,
+	VDUSE_GUEST_MSG_SHM_FAULT,
 	VDUSE_GUEST_MSG_UNKNOWN,
 };
 
-/* A control message from the host. */
+/*
+ * A control message from the host. A shared memory fault carries the region
+ * in index and the offset in start.
+ */
 struct vduse_guest_msg {
 	int type;
 	u32 request_id;
@@ -144,6 +175,11 @@ struct vduse_guest_region {
  * VDUSE. Bounce_size fails with -EINVAL until the host has made its first
  * streaming map.
  *
+ * Shm_setup declares a shared memory region before the host attaches the
+ * device. Shm_map maps ranges of guest memory into a region, all or none,
+ * and shm_unmap unmaps the ranges within a range. They are needed only for
+ * a device with regions.
+ *
  * Map_log maps the in-flight log, which outlives the guest. If its size
  * differs from the given one, it is resized when resize is set and is
  * otherwise an error, -EINVAL. Drop_log discards the log once the device
@@ -203,6 +239,13 @@ struct vduse_guest_host_ops {
 		       void **addr);
 	void (*unmap_log)(struct vduse_guest_dev *dev, void *addr, size_t size);
 	void (*drop_log)(struct vduse_guest_dev *dev);
+
+	int (*shm_setup)(struct vduse_guest_dev *dev, u8 id, u64 size);
+	int (*shm_map)(struct vduse_guest_dev *dev, u8 id,
+		       const struct vduse_guest_shm_range *ranges,
+		       unsigned int nr);
+	int (*shm_unmap)(struct vduse_guest_dev *dev, u8 id, u64 offset,
+			 u64 size);
 };
 
 /* A host, which serves the devices with its name, or every device. */

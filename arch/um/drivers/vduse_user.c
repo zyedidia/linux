@@ -11,7 +11,8 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <linux/vduse.h>
+/* The tree's header, since the host's may lack newer VDUSE ioctls. */
+#include "../../../include/uapi/linux/vduse.h"
 #include <um_malloc.h>
 
 #include "vduse_user.h"
@@ -35,10 +36,17 @@ int uml_vduse_user_open_control(void)
 	return fd;
 }
 
+/*
+ * The control device creates devices with the API version that was last
+ * set on it, so a device of a newer version sets it around its creation.
+ * From version 1 on, a device declares its queue groups and address spaces.
+ */
 int uml_vduse_user_create(int control, const char *name, uint32_t device_id,
 			  uint64_t features, uint32_t vq_num, uint32_t vq_align,
-			  const void *config, uint32_t config_size)
+			  const void *config, uint32_t config_size,
+			  uint64_t api_version)
 {
+	uint64_t version_0 = 0;
 	struct vduse_dev_config *cfg;
 	int err = 0;
 
@@ -55,10 +63,20 @@ int uml_vduse_user_create(int control, const char *name, uint32_t device_id,
 	cfg->features = features;
 	cfg->vq_num = vq_num;
 	cfg->vq_align = vq_align;
+	if (api_version) {
+		cfg->ngroups = 1;
+		cfg->nas = 1;
+	}
 	cfg->config_size = config_size;
 	memcpy(cfg->config, config, config_size);
 
-	if (ioctl(control, VDUSE_CREATE_DEV, cfg) < 0)
+	if (api_version && ioctl(control, VDUSE_SET_API_VERSION,
+				 &api_version) < 0)
+		err = -errno;
+	else if (ioctl(control, VDUSE_CREATE_DEV, cfg) < 0)
+		err = -errno;
+	if (api_version && ioctl(control, VDUSE_SET_API_VERSION,
+				 &version_0) < 0 && !err)
 		err = -errno;
 
 	kfree(cfg);
@@ -87,7 +105,7 @@ struct uml_vduse_broker_request {
 	uint64_t features;
 	uint64_t log_size;
 	uint32_t config_size;
-	uint32_t reserved;
+	uint32_t api_version;
 	char name[VDUSE_NAME_MAX];
 };
 
@@ -160,7 +178,8 @@ static int broker_name(struct uml_vduse_broker_request *req, uint32_t op,
 int uml_vduse_user_broker_create(int broker, const char *name,
 				 uint32_t device_id, uint64_t features,
 				 uint32_t vq_num, uint32_t vq_align,
-				 const void *config, uint32_t config_size)
+				 const void *config, uint32_t config_size,
+				 uint64_t api_version)
 {
 	struct uml_vduse_broker_request req;
 	int err;
@@ -173,6 +192,7 @@ int uml_vduse_user_broker_create(int broker, const char *name,
 	req.vq_num = vq_num;
 	req.vq_align = vq_align;
 	req.config_size = config_size;
+	req.api_version = api_version;
 	return broker_call(broker, &req, config, config_size, NULL);
 }
 
@@ -265,6 +285,11 @@ int uml_vduse_user_read_msg(int fd, struct uml_vduse_user_msg *msg)
 		msg->type = UML_VDUSE_MSG_UPDATE_IOTLB;
 		msg->start = req.iova.start;
 		msg->last = req.iova.last;
+		break;
+	case VDUSE_SHM_FAULT:
+		msg->type = UML_VDUSE_MSG_SHM_FAULT;
+		msg->index = req.shm_fault.id;
+		msg->start = req.shm_fault.offset;
 		break;
 	default:
 		msg->type = UML_VDUSE_MSG_UNKNOWN;
@@ -454,6 +479,54 @@ int uml_vduse_user_node_id(int fd, uint64_t *dev, uint64_t *ino)
 		return -errno;
 	*dev = st.st_dev;
 	*ino = st.st_ino;
+	return 0;
+}
+
+int uml_vduse_user_shm_setup(int fd, uint8_t id, uint64_t size)
+{
+	struct vduse_shm_config config = { .id = id, .size = size };
+
+	if (ioctl(fd, VDUSE_SHM_SETUP, &config) < 0)
+		return -errno;
+	return 0;
+}
+
+int uml_vduse_user_shm_reg_file(int fd, int file, uint32_t *index)
+{
+	struct vduse_shm_file sf = { .fd = file };
+
+	if (ioctl(fd, VDUSE_SHM_REG_FILE, &sf) < 0)
+		return -errno;
+	*index = sf.index;
+	return 0;
+}
+
+/* The ranges are an array of nr struct vduse_shm_range. */
+int uml_vduse_user_shm_map(int fd, uint8_t id, const void *ranges,
+			   unsigned int nr)
+{
+	struct vduse_shm_map map = {
+		.id = id,
+		.nr_ranges = nr,
+		.ranges = (uintptr_t)ranges,
+	};
+
+	if (ioctl(fd, VDUSE_SHM_MAP, &map) < 0)
+		return -errno;
+	return 0;
+}
+
+int uml_vduse_user_shm_unmap(int fd, uint8_t id, uint64_t offset,
+			     uint64_t size)
+{
+	struct vduse_shm_unmap unmap = {
+		.id = id,
+		.offset = offset,
+		.size = size,
+	};
+
+	if (ioctl(fd, VDUSE_SHM_UNMAP, &unmap) < 0)
+		return -errno;
 	return 0;
 }
 

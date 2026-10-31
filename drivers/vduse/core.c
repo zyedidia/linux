@@ -667,6 +667,19 @@ bool vduse_guest_notify_enable(struct vduse_guest_dev *dev,
 	return vringh_notify_enable_kern(&dev->vqs[index].vrh);
 }
 
+int vduse_guest_shm_map(struct vduse_guest_dev *dev, u8 id,
+			const struct vduse_guest_shm_range *ranges,
+			unsigned int nr)
+{
+	return dev->hops->shm_map(dev, id, ranges, nr);
+}
+
+int vduse_guest_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
+			  u64 size)
+{
+	return dev->hops->shm_unmap(dev, id, offset, size);
+}
+
 /*
  * Wait for the driver to make more buffers available, with notifications
  * still disabled, for up to the device's poll time or until the CPU is
@@ -1020,6 +1033,13 @@ static void vduse_guest_msg_work(struct work_struct *work)
 			if (!dev->running)
 				vduse_guest_unmap_range(dev, msg.start, msg.last);
 			break;
+		case VDUSE_GUEST_MSG_SHM_FAULT:
+			/*
+			 * The backends map every range of their regions in
+			 * full, so a fault outside them is refused.
+			 */
+			ok = false;
+			break;
 		default:
 			ok = false;
 			break;
@@ -1287,6 +1307,8 @@ static int __init vduse_guest_setup(struct vduse_guest_dev *dev)
 
 	if (!cfg.num_queues || !cfg.queue_sizes)
 		return -EINVAL;
+	if (cfg.num_shm && (cfg.allow_reconnect || !dev->hops->shm_setup))
+		return -EINVAL;
 	for (i = 0; i < cfg.num_queues; i++)
 		if (!is_power_of_2(cfg.queue_sizes[i]))
 			return -EINVAL;
@@ -1327,6 +1349,12 @@ static int __init vduse_guest_setup(struct vduse_guest_dev *dev)
 	if (dev->reconnect) {
 		err = vduse_guest_check_reconnect(dev,
 						  vduse_guest_features(&cfg));
+		if (err)
+			goto close;
+	}
+
+	for (i = 0; i < cfg.num_shm; i++) {
+		err = dev->hops->shm_setup(dev, cfg.shm[i].id, cfg.shm[i].size);
 		if (err)
 			goto close;
 	}
@@ -1503,6 +1531,7 @@ static const char *const vduse_guest_msg_names[] = {
 	[VDUSE_GUEST_MSG_GET_VQ_STATE] = "msg_get_vq_state",
 	[VDUSE_GUEST_MSG_SET_STATUS] = "msg_set_status",
 	[VDUSE_GUEST_MSG_UPDATE_IOTLB] = "msg_update_iotlb",
+	[VDUSE_GUEST_MSG_SHM_FAULT] = "msg_shm_fault",
 	[VDUSE_GUEST_MSG_UNKNOWN] = "msg_unknown",
 };
 
