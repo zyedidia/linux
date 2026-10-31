@@ -37,6 +37,15 @@ config VDUSE_GUEST_NET
 	  frame that the interface receives goes to the host, and the
 	  guest's own stack does not see it.
 
+config VDUSE_GUEST_GPU
+	bool "VDUSE virtio-gpu backend"
+	depends on VDUSE_GUEST && DRM && MMU
+	default y
+	help
+	  Export an amdgpu render node of the guest to the host as a
+	  virtio-gpu device with DRM native context, so that the host's
+	  Mesa drives the GPU through the guest's amdgpu.
+
 config VDUSE_GUEST_PCI
 	bool "VDUSE devices through a VMM's VDUSE proxy"
 	depends on PCI_MSI && 64BIT && !UML

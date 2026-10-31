@@ -195,6 +195,9 @@ static const struct vduse_guest_backend_ops *const vduse_guest_backends[] = {
 #ifdef CONFIG_VDUSE_GUEST_NET
 	&vduse_guest_net_ops,
 #endif
+#ifdef CONFIG_VDUSE_GUEST_GPU
+	&vduse_guest_gpu_ops,
+#endif
 };
 
 static const char *vduse_guest_args[VDUSE_GUEST_MAX_DEVICES];
