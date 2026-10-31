@@ -27,6 +27,7 @@ obj-$(CONFIG_EARLY_PRINTK) += early_printk.o
 obj-$(CONFIG_STACKTRACE) += stacktrace.o
 obj-$(CONFIG_SMP) += smp.o
 obj-$(CONFIG_INDIRECT_IOMEM_FALLBACK) += iomem.o
+obj-$(CONFIG_UML_PAGE_REPORTING) += page_reporting.o
 
 USER_OBJS := config.o
 

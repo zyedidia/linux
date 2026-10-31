@@ -210,6 +210,17 @@ config MCONSOLE
 
 	  It is safe to say 'Y' here.
 
+config UML_PAGE_REPORTING
+	bool "Return free memory to the host"
+	select PAGE_REPORTING
+	help
+	  Report blocks of free pages to the host, which then frees the memory
+	  behind them, so that memory that the guest used once and freed does
+	  not stay with the guest. The guest touches such a page again at the
+	  cost of a host page fault.
+
+	  If unsure, say N.
+
 config MAGIC_SYSRQ
 	bool "Magic SysRq key"
 	depends on MCONSOLE
