@@ -7,14 +7,32 @@
 #include <linux/virtio.h>
 #include <linux/virtio_byteorder.h>
 #include <linux/compiler_types.h>
+#include <linux/mm_types.h>
 #include <uapi/linux/virtio_config.h>
 
 struct irq_affinity;
 
+/*
+ * A shared memory region. A region with no_phys has no physical address,
+ * and addr is 0. The transport then inserts its pages on faults with
+ * shm_fault, and tells the driver which ranges become invalid. Only
+ * virtio_get_any_shm_region() returns such a region.
+ */
 struct virtio_shm_region {
 	u64 addr;
 	u64 len;
+	bool no_phys;
 };
+
+/*
+ * Called by a transport when a range of a shared memory region without a
+ * physical address becomes invalid. The driver zaps every mapping of the
+ * range before it returns, and later faults on the range go to the
+ * transport again. The function must not take a lock that the driver holds
+ * while it clears the function.
+ */
+typedef void virtio_shm_invalidate_t(struct virtio_device *vdev, u8 id,
+				     u64 offset, u64 len);
 
 typedef void vq_callback_t(struct virtqueue *);
 
@@ -96,6 +114,25 @@ struct virtqueue_info {
  * @set_vq_affinity: set the affinity for a virtqueue (optional).
  * @get_vq_affinity: get the affinity for a virtqueue (optional).
  * @get_shm_region: get a shared memory region based on the index.
+ * @shm_fault: handle a fault on a shared memory region without a physical
+ *	address (optional).
+ *	vdev: the virtio_device
+ *	id: the region
+ *	offset: the page-aligned offset of the fault in the region
+ *	vmf: the fault, in a shared VM_PFNMAP mapping
+ *	Returns a VM_FAULT_ code. The transport inserts the page behind the
+ *	offset, with the caching type that it chooses, under a lock that
+ *	keeps the range from becoming invalid meanwhile. With VM_FAULT_RETRY,
+ *	the transport has released the fault's lock, and the caller must not
+ *	use the VMA afterwards.
+ * @set_shm_invalidate: set the function that the transport calls when a
+ *	range of a shared memory region without a physical address becomes
+ *	invalid (optional).
+ *	vdev: the virtio_device
+ *	fn: the function, or NULL
+ *	Clearing the function returns once no call of the earlier function
+ *	runs. Before it clears the function, the driver zaps every mapping of
+ *	its regions and stops new faults from reaching the transport.
  * @disable_vq_and_reset: reset a queue individually (optional).
  *	vq: the virtqueue
  *	Returns 0 on success or error status
@@ -135,6 +172,10 @@ struct virtio_config_ops {
 						 int index);
 	bool (*get_shm_region)(struct virtio_device *vdev,
 			       struct virtio_shm_region *region, u8 id);
+	vm_fault_t (*shm_fault)(struct virtio_device *vdev, u8 id, u64 offset,
+				struct vm_fault *vmf);
+	void (*set_shm_invalidate)(struct virtio_device *vdev,
+				   virtio_shm_invalidate_t *fn);
 	int (*disable_vq_and_reset)(struct virtqueue *vq);
 	int (*enable_vq_after_reset)(struct virtqueue *vq);
 };
@@ -398,12 +439,47 @@ int virtqueue_set_affinity(struct virtqueue *vq, const struct cpumask *cpu_mask)
 }
 
 static inline
-bool virtio_get_shm_region(struct virtio_device *vdev,
-			   struct virtio_shm_region *region_out, u8 id)
+bool __virtio_get_shm_region(struct virtio_device *vdev,
+			     struct virtio_shm_region *region_out, u8 id)
 {
 	if (!vdev->config->get_shm_region)
 		return false;
+	region_out->no_phys = false;
 	return vdev->config->get_shm_region(vdev, region_out, id);
+}
+
+/* Get a shared memory region that may have no physical address. */
+static inline
+bool virtio_get_any_shm_region(struct virtio_device *vdev,
+			       struct virtio_shm_region *region_out, u8 id)
+{
+	return __virtio_get_shm_region(vdev, region_out, id);
+}
+
+/* Get a shared memory region with a physical address. */
+static inline
+bool virtio_get_shm_region(struct virtio_device *vdev,
+			   struct virtio_shm_region *region_out, u8 id)
+{
+	return __virtio_get_shm_region(vdev, region_out, id) &&
+	       !region_out->no_phys;
+}
+
+static inline
+vm_fault_t virtio_shm_fault(struct virtio_device *vdev, u8 id, u64 offset,
+			    struct vm_fault *vmf)
+{
+	if (!vdev->config->shm_fault)
+		return VM_FAULT_SIGBUS;
+	return vdev->config->shm_fault(vdev, id, offset, vmf);
+}
+
+static inline
+void virtio_set_shm_invalidate(struct virtio_device *vdev,
+			       virtio_shm_invalidate_t *fn)
+{
+	if (vdev->config->set_shm_invalidate)
+		vdev->config->set_shm_invalidate(vdev, fn);
 }
 
 static inline bool virtio_is_little_endian(struct virtio_device *vdev)

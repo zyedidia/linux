@@ -6,6 +6,7 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/virtio.h>
+#include <linux/virtio_config.h>
 #include <linux/vhost_iotlb.h>
 #include <linux/virtio_net.h>
 #include <linux/virtio_blk.h>
@@ -25,6 +26,18 @@ struct vdpa_callback {
 	irqreturn_t (*callback)(void *data);
 	void *private;
 	struct eventfd_ctx *trigger;
+};
+
+/**
+ * struct vdpa_shm_callback - vDPA callback for shared memory invalidations
+ * @invalidate: called when a range of a shared memory region without a
+ *              physical address becomes invalid, and zaps every mapping of
+ *              the range before it returns
+ * @private: the data for the callback
+ */
+struct vdpa_shm_callback {
+	void (*invalidate)(void *private, u8 id, u64 offset, u64 len);
+	void *private;
 };
 
 /**
@@ -366,6 +379,24 @@ struct vdpa_map_file {
  * @unbind_mm:			Unbind the device from the address space
  *				bound using the bind_mm callback. (optional)
  *				@vdev: vdpa device
+ * @get_shm_region:		Get a shared memory region (optional)
+ *				@vdev: vdpa device
+ *				@id: the region
+ *				@region: the region's address and size
+ *				Returns whether the region exists
+ * @shm_fault:			Handle a fault on a shared memory region
+ *				without a physical address (optional)
+ *				@vdev: vdpa device
+ *				@id: the region
+ *				@offset: the page-aligned offset in the region
+ *				@vmf: the fault
+ *				Returns a VM_FAULT_ code
+ * @set_shm_cb:			Set the callback for invalidations of ranges
+ *				of shared memory regions (optional)
+ *				@vdev: vdpa device
+ *				@cb: the callback, or NULL
+ *				Clearing the callback returns once no call
+ *				of the earlier callback runs
  * @free:			Free resources that belongs to vDPA (optional)
  *				@vdev: vdpa device
  */
@@ -440,6 +471,14 @@ struct vdpa_config_ops {
 	union virtio_map (*get_vq_map)(struct vdpa_device *vdev, u16 idx);
 	int (*bind_mm)(struct vdpa_device *vdev, struct mm_struct *mm);
 	void (*unbind_mm)(struct vdpa_device *vdev);
+
+	/* Shared memory ops. */
+	bool (*get_shm_region)(struct vdpa_device *vdev, u8 id,
+			       struct virtio_shm_region *region);
+	vm_fault_t (*shm_fault)(struct vdpa_device *vdev, u8 id, u64 offset,
+				struct vm_fault *vmf);
+	void (*set_shm_cb)(struct vdpa_device *vdev,
+			   const struct vdpa_shm_callback *cb);
 
 	/* Free device resources */
 	void (*free)(struct vdpa_device *vdev);

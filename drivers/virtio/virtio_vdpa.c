@@ -28,6 +28,7 @@ struct virtio_vdpa_device {
 	struct virtio_device vdev;
 	struct vdpa_device *vdpa;
 	u64 features;
+	virtio_shm_invalidate_t *shm_invalidate;
 };
 
 static inline struct virtio_vdpa_device *
@@ -430,6 +431,66 @@ virtio_vdpa_get_vq_affinity(struct virtio_device *vdev, int index)
 	return NULL;
 }
 
+static bool virtio_vdpa_get_shm_region(struct virtio_device *vdev,
+				       struct virtio_shm_region *region, u8 id)
+{
+	struct vdpa_device *vdpa = vd_get_vdpa(vdev);
+	const struct vdpa_config_ops *ops = vdpa->config;
+
+	if (!ops->get_shm_region)
+		return false;
+	return ops->get_shm_region(vdpa, id, region);
+}
+
+static vm_fault_t virtio_vdpa_shm_fault(struct virtio_device *vdev, u8 id,
+					u64 offset, struct vm_fault *vmf)
+{
+	struct vdpa_device *vdpa = vd_get_vdpa(vdev);
+	const struct vdpa_config_ops *ops = vdpa->config;
+
+	if (!ops->shm_fault)
+		return VM_FAULT_SIGBUS;
+	return ops->shm_fault(vdpa, id, offset, vmf);
+}
+
+static void virtio_vdpa_shm_invalidate(void *private, u8 id, u64 offset,
+				       u64 len)
+{
+	struct virtio_vdpa_device *vd_dev = private;
+	virtio_shm_invalidate_t *fn = READ_ONCE(vd_dev->shm_invalidate);
+
+	if (fn)
+		fn(&vd_dev->vdev, id, offset, len);
+}
+
+/*
+ * The vDPA device calls its callback under a lock that setting the
+ * callback takes, so the function is set before the callback and cleared
+ * after it.
+ */
+static void virtio_vdpa_set_shm_invalidate(struct virtio_device *vdev,
+					   virtio_shm_invalidate_t *fn)
+{
+	struct virtio_vdpa_device *vd_dev = to_virtio_vdpa_device(vdev);
+	struct vdpa_device *vdpa = vd_dev->vdpa;
+	const struct vdpa_config_ops *ops = vdpa->config;
+	struct vdpa_shm_callback cb = {
+		.invalidate = virtio_vdpa_shm_invalidate,
+		.private = vd_dev,
+	};
+
+	if (!ops->set_shm_cb)
+		return;
+
+	if (fn) {
+		WRITE_ONCE(vd_dev->shm_invalidate, fn);
+		ops->set_shm_cb(vdpa, &cb);
+	} else {
+		ops->set_shm_cb(vdpa, NULL);
+		WRITE_ONCE(vd_dev->shm_invalidate, NULL);
+	}
+}
+
 static const struct virtio_config_ops virtio_vdpa_config_ops = {
 	.get		= virtio_vdpa_get,
 	.set		= virtio_vdpa_set,
@@ -444,6 +505,9 @@ static const struct virtio_config_ops virtio_vdpa_config_ops = {
 	.bus_name	= virtio_vdpa_bus_name,
 	.set_vq_affinity = virtio_vdpa_set_vq_affinity,
 	.get_vq_affinity = virtio_vdpa_get_vq_affinity,
+	.get_shm_region	= virtio_vdpa_get_shm_region,
+	.shm_fault	= virtio_vdpa_shm_fault,
+	.set_shm_invalidate = virtio_vdpa_set_shm_invalidate,
 };
 
 static void virtio_vdpa_release_dev(struct device *_d)
@@ -498,8 +562,17 @@ err:
 static void virtio_vdpa_remove(struct vdpa_device *vdpa)
 {
 	struct virtio_vdpa_device *vd_dev = vdpa_get_drvdata(vdpa);
+	const struct vdpa_config_ops *ops = vdpa->config;
 
+	/*
+	 * The vDPA device must not call a driver that is gone, and the
+	 * reference keeps vd_dev until its callback is cleared.
+	 */
+	get_device(&vd_dev->vdev.dev);
 	unregister_virtio_device(&vd_dev->vdev);
+	if (ops->set_shm_cb)
+		ops->set_shm_cb(vdpa, NULL);
+	put_device(&vd_dev->vdev.dev);
 }
 
 static struct vdpa_driver virtio_vdpa_driver = {
