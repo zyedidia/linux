@@ -18,6 +18,7 @@
 #include <os.h>
 
 #include "vduse_user.h"
+#include "virt-pci.h"
 
 struct uml_vduse_vq {
 	struct vduse_guest_dev *dev;
@@ -580,7 +581,10 @@ static int uml_vduse_shm_setup(struct vduse_guest_dev *dev, u8 id, u64 size)
 	return 0;
 }
 
-/* A page's offset in the guest memory file is its physical address. */
+/*
+ * A page's offset in the guest memory file is its physical address. A BAR's
+ * file is its VDUSE index plus 1.
+ */
 static int uml_vduse_shm_map(struct vduse_guest_dev *dev, u8 id,
 			     const struct vduse_guest_shm_range *ranges,
 			     unsigned int nr)
@@ -590,22 +594,20 @@ static int uml_vduse_shm_map(struct vduse_guest_dev *dev, u8 id,
 	unsigned int i;
 	int err;
 
-	if (u->mem_file < 0)
-		return -EINVAL;
-
 	r = kvcalloc(nr, sizeof(*r), GFP_KERNEL);
 	if (!r)
 		return -ENOMEM;
 	for (i = 0; i < nr; i++) {
-		if (ranges[i].phys > physmem_size ||
-		    ranges[i].size > physmem_size - ranges[i].phys) {
+		if (!ranges[i].file &&
+		    (u->mem_file < 0 || ranges[i].phys > physmem_size ||
+		     ranges[i].size > physmem_size - ranges[i].phys)) {
 			kvfree(r);
 			return -EINVAL;
 		}
 		r[i].offset = ranges[i].offset;
 		r[i].size = ranges[i].size;
 		r[i].file_offset = ranges[i].phys;
-		r[i].file = u->mem_file;
+		r[i].file = ranges[i].file ? ranges[i].file - 1 : u->mem_file;
 	}
 
 	err = uml_vduse_user_shm_map(u->fd, id, r, nr);
@@ -618,6 +620,29 @@ static int uml_vduse_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
 {
 	return uml_vduse_user_shm_unmap(uml_vduse_of(dev)->fd, id, offset,
 					size);
+}
+
+/*
+ * Register a dma-buf of a passed-through device's BAR. VDUSE keeps the
+ * dma-buf, so UML's descriptor of it is closed.
+ */
+static int uml_vduse_shm_reg_bar(struct vduse_guest_dev *dev,
+				 struct pci_dev *pdev, int bar, u32 *file)
+{
+	struct uml_vduse *u = uml_vduse_of(dev);
+	u32 index;
+	int fd, err;
+
+	if (!IS_ENABLED(CONFIG_UML_PCI))
+		return -EOPNOTSUPP;
+	fd = um_pci_bar_dmabuf(pdev, bar);
+	if (fd < 0)
+		return fd;
+	err = uml_vduse_user_shm_reg_file(u->fd, fd, &index);
+	os_close_file(fd);
+	if (!err)
+		*file = index + 1;
+	return err;
 }
 
 static const struct vduse_guest_host_ops uml_vduse_host_ops = {
@@ -658,6 +683,7 @@ static const struct vduse_guest_host_ops uml_vduse_host_ops = {
 	.shm_setup = uml_vduse_shm_setup,
 	.shm_map = uml_vduse_shm_map,
 	.shm_unmap = uml_vduse_shm_unmap,
+	.shm_reg_bar = uml_vduse_shm_reg_bar,
 };
 
 static struct vduse_guest_host uml_vduse_host = {

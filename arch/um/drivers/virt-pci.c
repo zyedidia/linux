@@ -360,6 +360,20 @@ static long um_pci_map_bar(unsigned long addr, size_t size,
 	return data.offset;
 }
 
+/* Return a host file descriptor of a dma-buf of a device's BAR. */
+int um_pci_bar_dmabuf(struct pci_dev *pdev, int bar)
+{
+	struct um_pci_device *dev;
+
+	guard(mutex)(&um_pci_mtx);
+	if (!bridge || pdev->bus != bridge->bus || pdev->devfn / 8 >= MAX_DEVICES)
+		return -ENODEV;
+	dev = um_pci_devices[pdev->devfn / 8].dev;
+	if (!dev || !dev->ops->bar_dmabuf)
+		return -EOPNOTSUPP;
+	return dev->ops->bar_dmabuf(dev, bar);
+}
+
 static void __iomem *um_pci_map_bar_direct(unsigned long addr, size_t size)
 {
 	struct um_pci_find_bar_data data;

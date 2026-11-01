@@ -21,6 +21,24 @@
 
 #include "vfio_user.h"
 
+/* The uAPI of VFIO_DEVICE_FEATURE_DMA_BUF, which older headers lack. */
+#ifndef VFIO_DEVICE_FEATURE_DMA_BUF
+#define VFIO_DEVICE_FEATURE_DMA_BUF 11
+
+struct vfio_region_dma_range {
+	__u64 offset;
+	__u64 length;
+};
+
+struct vfio_device_feature_dma_buf {
+	__u32 region_index;
+	__u32 open_flags;
+	__u32 flags;
+	__u32 nr_ranges;
+	struct vfio_region_dma_range dma_ranges[];
+};
+#endif
+
 int uml_vfio_user_check_container(int fd)
 {
 	int r;
@@ -673,4 +691,28 @@ void uml_vfio_user_unmap_bar(struct uml_vfio_user_device *dev, int bar,
 			     void *addr)
 {
 	munmap(addr, PAGE_ALIGN_UP(dev->region[bar].size));
+}
+
+/* Return a dma-buf of the whole BAR, open for reading and writing. */
+int uml_vfio_user_bar_dmabuf(struct uml_vfio_user_device *dev, int bar)
+{
+	uint64_t buf[(sizeof(struct vfio_device_feature) +
+		      sizeof(struct vfio_device_feature_dma_buf) +
+		      sizeof(struct vfio_region_dma_range) + 7) / 8] = {};
+	struct vfio_device_feature *feature = (void *)buf;
+	struct vfio_device_feature_dma_buf *dma_buf = (void *)feature->data;
+	int fd;
+
+	if (bar < 0 || bar >= dev->num_regions || !dev->region[bar].size)
+		return -EINVAL;
+
+	feature->argsz = sizeof(buf);
+	feature->flags = VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_DMA_BUF;
+	dma_buf->region_index = bar;
+	dma_buf->open_flags = O_RDWR | O_CLOEXEC;
+	dma_buf->nr_ranges = 1;
+	dma_buf->dma_ranges[0].length = dev->region[bar].size;
+
+	fd = ioctl(dev->device, VFIO_DEVICE_FEATURE, buf);
+	return fd < 0 ? -errno : fd;
 }

@@ -40,6 +40,12 @@ struct um_pci_ops {
 	void __iomem *(*bar_map)(struct um_pci_device *dev, int bar);
 
 	/*
+	 * Optional. Return a host file descriptor of a dma-buf of the whole
+	 * BAR, which the caller closes, or a negative error.
+	 */
+	int (*bar_dmabuf)(struct um_pci_device *dev, int bar);
+
+	/*
 	 * Optional. Reset the device, or with probe, return 0 if it can be
 	 * reset. The guest uses it as a slot reset.
 	 */
@@ -66,6 +72,7 @@ struct um_pci_ops {
 };
 
 int um_pci_device_register(struct um_pci_device *dev);
+int um_pci_bar_dmabuf(struct pci_dev *pdev, int bar);
 void um_pci_device_unregister(struct um_pci_device *dev);
 
 int um_pci_platform_device_register(struct um_pci_device *dev);

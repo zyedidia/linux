@@ -75,6 +75,7 @@ int uml_vfio_user_bar_read(struct uml_vfio_user_device *dev, int bar,
 int uml_vfio_user_bar_write(struct uml_vfio_user_device *dev, int bar,
 			    unsigned int offset, const void *buf, int size);
 
+int uml_vfio_user_bar_dmabuf(struct uml_vfio_user_device *dev, int bar);
 void *uml_vfio_user_map_bar(struct uml_vfio_user_device *dev, int bar,
 			    const struct uml_vfio_user_range *shadow,
 			    int nr_shadow);

@@ -775,6 +775,15 @@ static void __iomem *uml_vfio_bar_map(struct um_pci_device *pdev, int bar)
 	return (void __iomem __force *)dev->bar_map[bar];
 }
 
+static int uml_vfio_bar_dmabuf(struct um_pci_device *pdev, int bar)
+{
+	struct uml_vfio_device *dev = to_vdev(pdev);
+
+	if (bar >= PCI_STD_NUM_BARS)
+		return -EINVAL;
+	return uml_vfio_user_bar_dmabuf(&dev->udev, bar);
+}
+
 /*
  * The first activation of a vector comes from MSI_FLAG_ACTIVATE_EARLY when
  * the vectors are allocated, which may sleep. Later activations from
@@ -916,6 +925,7 @@ static const struct um_pci_ops uml_vfio_um_pci_ops = {
 	.bar_copy_to	= uml_vfio_bar_copy_to,
 	.bar_set	= uml_vfio_bar_set,
 	.bar_map	= uml_vfio_bar_map,
+	.bar_dmabuf	= uml_vfio_bar_dmabuf,
 	.reset		= uml_vfio_reset,
 	.msi_activate	= uml_vfio_msi_activate,
 	.msi_deactivate	= uml_vfio_msi_deactivate,
