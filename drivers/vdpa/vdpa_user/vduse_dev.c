@@ -58,6 +58,7 @@
 #define VDUSE_MAX_SHM_FILES 16
 #define VDUSE_MAX_SHM_RANGES (1U << 16)
 #define VDUSE_MAX_SHM_RANGE_SIZE (1ULL << 32)
+#define VDUSE_SHM_FAULT_TRIES 8
 
 #define IRQ_UNBOUND -1
 
@@ -1482,12 +1483,35 @@ static bool vduse_vdpa_get_shm_region(struct vdpa_device *vdpa, u8 id,
 }
 
 /*
+ * Insert the page behind a mapped offset, under shm_lock, and return
+ * whether it was mapped.
+ */
+static bool vduse_shm_insert_page(struct vduse_dev *dev, struct vduse_shm *shm,
+				  u64 offset, struct vm_fault *vmf,
+				  vm_fault_t *ret, bool *revoked)
+{
+	struct vduse_shm_entry *e;
+
+	mutex_lock(&dev->shm_lock);
+	e = mtree_load(&shm->entries, offset >> PAGE_SHIFT);
+	if (e)
+		*ret = vmf_insert_pfn_prot(vmf->vma, vmf->address,
+					   vduse_shm_entry_pfn(e, offset),
+					   vm_get_page_prot(vmf->vma->vm_flags));
+	*revoked = dev->shm_revoked;
+	mutex_unlock(&dev->shm_lock);
+	return e;
+}
+
+/*
  * Insert the page behind a mapped offset. An unmapped offset sends the
- * device one request, while the fault's lock is dropped, and the retry
- * fails if the device did not map the offset. A fault that cannot be
- * retried fails on an unmapped offset without a request. A fault under
- * the VMA lock is retried under mmap_lock first, which then sends the
- * request.
+ * device a request while the fault's lock is dropped, and the fault is
+ * retried. A retried fault that still finds the offset unmapped, as when
+ * the device's memory moved again meanwhile, asks again while it holds its
+ * lock, so that it sees the answer, at most VDUSE_SHM_FAULT_TRIES times. It
+ * fails when the device refuses. A fault that cannot be retried fails on an
+ * unmapped offset without a request. A fault under the VMA lock is retried
+ * under mmap_lock first.
  */
 static vm_fault_t vduse_vdpa_shm_fault(struct vdpa_device *vdpa, u8 id,
 				       u64 offset, struct vm_fault *vmf)
@@ -1496,8 +1520,8 @@ static vm_fault_t vduse_vdpa_shm_fault(struct vdpa_device *vdpa, u8 id,
 	struct vduse_shm *shm = vduse_find_shm(dev, id);
 	struct vm_area_struct *vma = vmf->vma;
 	struct vduse_dev_msg msg = { 0 };
-	struct vduse_shm_entry *e;
-	vm_fault_t ret;
+	vm_fault_t ret = VM_FAULT_SIGBUS;
+	unsigned int tries;
 	bool revoked;
 
 	/*
@@ -1509,20 +1533,10 @@ static vm_fault_t vduse_vdpa_shm_fault(struct vdpa_device *vdpa, u8 id,
 	    is_cow_mapping(vma->vm_flags))
 		return VM_FAULT_SIGBUS;
 
-	mutex_lock(&dev->shm_lock);
-	e = mtree_load(&shm->entries, offset >> PAGE_SHIFT);
-	if (e) {
-		ret = vmf_insert_pfn_prot(vma, vmf->address,
-					  vduse_shm_entry_pfn(e, offset),
-					  vm_get_page_prot(vma->vm_flags));
-		mutex_unlock(&dev->shm_lock);
+	if (vduse_shm_insert_page(dev, shm, offset, vmf, &ret, &revoked))
 		return ret;
-	}
-	revoked = dev->shm_revoked;
-	mutex_unlock(&dev->shm_lock);
 
-	if (revoked || (vmf->flags & FAULT_FLAG_TRIED) ||
-	    !(vmf->flags & FAULT_FLAG_ALLOW_RETRY))
+	if (revoked || !(vmf->flags & FAULT_FLAG_ALLOW_RETRY))
 		return VM_FAULT_SIGBUS;
 	if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 		return VM_FAULT_RETRY;
@@ -1535,9 +1549,25 @@ static vm_fault_t vduse_vdpa_shm_fault(struct vdpa_device *vdpa, u8 id,
 	msg.req.type = VDUSE_SHM_FAULT;
 	msg.req.shm_fault.id = id;
 	msg.req.shm_fault.offset = offset;
-	release_fault_lock(vmf);
-	__vduse_dev_msg_sync(dev, &msg, false);
-	return VM_FAULT_RETRY;
+
+	if (!(vmf->flags & FAULT_FLAG_TRIED)) {
+		release_fault_lock(vmf);
+		__vduse_dev_msg_sync(dev, &msg, false);
+		return VM_FAULT_RETRY;
+	}
+
+	for (tries = 0; tries < VDUSE_SHM_FAULT_TRIES; tries++) {
+		memset(&msg.resp, 0, sizeof(msg.resp));
+		msg.completed = false;
+		if (__vduse_dev_msg_sync(dev, &msg, false))
+			return VM_FAULT_SIGBUS;
+		if (vduse_shm_insert_page(dev, shm, offset, vmf, &ret,
+					  &revoked))
+			return ret;
+		if (revoked)
+			return VM_FAULT_SIGBUS;
+	}
+	return VM_FAULT_SIGBUS;
 }
 
 static void vduse_vdpa_set_shm_cb(struct vdpa_device *vdpa,
