@@ -667,9 +667,10 @@ static void vduse_guest_gpu_async_error(struct vduse_guest_gpu_ctx *ctx)
 
 /*
  * Allocate the BO of a GEM_NEW request when the blob that names it is
- * created. The host can map the BO only in GTT, so a mappable blob whose BO
- * allows CPU access is placed there, whatever heap Mesa asked for. The
- * context that creates the blob gets the BO's handle.
+ * created. A mappable blob whose BO allows CPU access is placed in GTT,
+ * whatever heap Mesa asked for, unless the vram option is set and Mesa asked
+ * for VRAM. It is then created in CPU-visible VRAM, and mapping it keeps it
+ * there. The context that creates the blob gets the BO's handle.
  */
 int vduse_guest_gpu_amdgpu_create_bo(struct vduse_guest_gpu *gpu,
 				     struct vduse_guest_gpu_ctx *ctx,
@@ -680,6 +681,7 @@ int vduse_guest_gpu_amdgpu_create_bo(struct vduse_guest_gpu *gpu,
 	union drm_amdgpu_gem_create args = {};
 	struct drm_gem_object *obj;
 	u32 domains;
+	u64 flags;
 	int err;
 
 	req = xa_erase(&ctx->gem_reqs, blob_id);
@@ -693,14 +695,21 @@ int vduse_guest_gpu_amdgpu_create_bo(struct vduse_guest_gpu *gpu,
 		goto out;
 
 	domains = req->preferred_heap;
+	flags = req->flags;
 	if ((res->blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE) &&
-	    !(req->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS))
-		domains = AMDGPU_GEM_DOMAIN_GTT;
+	    !(flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)) {
+		if (gpu->vram && (domains & AMDGPU_GEM_DOMAIN_VRAM)) {
+			domains = AMDGPU_GEM_DOMAIN_VRAM;
+			flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+		} else {
+			domains = AMDGPU_GEM_DOMAIN_GTT;
+		}
+	}
 
 	args.in.bo_size = req->alloc_size;
 	args.in.alignment = req->phys_alignment;
 	args.in.domains = domains;
-	args.in.domain_flags = req->flags;
+	args.in.domain_flags = flags;
 	vduse_guest_gpu_ureset(gpu);
 	err = vduse_guest_gpu_ioctl(gpu, ctx->file, DRM_IOCTL_AMDGPU_GEM_CREATE,
 				    &args, sizeof(args));
@@ -722,7 +731,7 @@ int vduse_guest_gpu_amdgpu_create_bo(struct vduse_guest_gpu *gpu,
 
 	res->obj = obj;
 	res->bo_domains = domains;
-	res->bo_flags = req->flags;
+	res->bo_flags = flags;
 	vduse_guest_gpu_amdgpu_update_heaps(gpu, ctx);
 out:
 	if (err)
@@ -794,10 +803,31 @@ void vduse_guest_gpu_amdgpu_set_notify(struct vduse_guest_gpu_res *res,
 	amdgpu_gem_set_move_notify(res->obj, fn, res);
 }
 
-/* Pin the reserved BO in GTT for its lifetime. */
+/*
+ * Place a mappable BO in CPU-visible VRAM, with the BO reserved, and call fn
+ * with the offset in BAR0 and the size of each of its ranges, in order.
+ */
+int vduse_guest_gpu_amdgpu_vram(struct vduse_guest_gpu_res *res,
+				int (*fn)(void *arg, u64 offset, u64 size),
+				void *arg)
+{
+	if (!res->obj || res->bo_domains != AMDGPU_GEM_DOMAIN_VRAM ||
+	    (res->bo_flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS))
+		return -EINVAL;
+	return amdgpu_gem_vram_ranges(res->obj, fn, arg);
+}
+
+/* Register BAR0 of the BO's device, through which the host maps VRAM. */
+int vduse_guest_gpu_amdgpu_reg_bar(struct vduse_guest_gpu_res *res, u32 *file)
+{
+	return vduse_guest_shm_reg_bar(res->gpu->dev,
+				       to_pci_dev(res->obj->dev->dev), 0, file);
+}
+
+/* Pin the reserved BO where it is placed, for its lifetime. */
 int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res)
 {
-	return amdgpu_gem_pin_gtt(res->obj);
+	return amdgpu_gem_pin_placed(res->obj);
 }
 
 /* Return a resource's GEM handle in the context, or 0. */

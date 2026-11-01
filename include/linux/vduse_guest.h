@@ -7,6 +7,7 @@
 #include <linux/vringh.h>
 
 struct page;
+struct pci_dev;
 struct seq_file;
 struct vduse_guest_dev;
 struct vduse_guest_host;
@@ -18,11 +19,16 @@ struct vduse_guest_shm {
 	u64 size;
 };
 
-/* A page-aligned range of a shared memory region and the memory behind it. */
+/*
+ * A page-aligned range of a shared memory region and the memory behind it.
+ * File is 0 for guest memory at physical address phys, or a file that
+ * vduse_guest_shm_reg_bar() returned, at offset phys in it.
+ */
 struct vduse_guest_shm_range {
 	u64 offset;
 	u64 size;
 	phys_addr_t phys;
+	u32 file;
 };
 
 /*
@@ -104,6 +110,8 @@ int vduse_guest_shm_map(struct vduse_guest_dev *dev, u8 id,
 			unsigned int nr);
 int vduse_guest_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
 			  u64 size);
+int vduse_guest_shm_reg_bar(struct vduse_guest_dev *dev, struct pci_dev *pdev,
+			    int bar, u32 *file);
 void vduse_guest_shm_fault_done(struct vduse_guest_dev *dev,
 				const struct vduse_guest_msg *msg, bool ok);
 
@@ -183,9 +191,12 @@ struct vduse_guest_region {
  * streaming map.
  *
  * Shm_setup declares a shared memory region before the host attaches the
- * device. Shm_map maps ranges of guest memory into a region, all or none,
- * and shm_unmap unmaps the ranges within a range. They are needed only for
- * a device with regions.
+ * device. Shm_map maps ranges of guest memory or of registered BARs into a
+ * region, all or none, and shm_unmap unmaps the ranges within a range. They
+ * are needed only for a device with regions. Shm_reg_bar, if set, registers
+ * a passed-through PCI device's BAR, whose ranges the host maps
+ * write-combined, and returns the file that names it, which is not 0. The
+ * host unmaps the BAR's ranges while the PCI device's memory is disabled.
  *
  * Map_log maps the in-flight log, which outlives the guest. If its size
  * differs from the given one, it is resized when resize is set and is
@@ -253,6 +264,8 @@ struct vduse_guest_host_ops {
 		       unsigned int nr);
 	int (*shm_unmap)(struct vduse_guest_dev *dev, u8 id, u64 offset,
 			 u64 size);
+	int (*shm_reg_bar)(struct vduse_guest_dev *dev, struct pci_dev *pdev,
+			   int bar, u32 *file);
 };
 
 /* A host, which serves the devices with its name, or every device. */

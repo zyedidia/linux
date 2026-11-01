@@ -2,6 +2,7 @@
 
 #define pr_fmt(fmt) "vduse-guest-gpu: " fmt
 
+#include <drm/amdgpu_drm.h>
 #include <drm/drm_gem.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-resv.h>
@@ -213,24 +214,52 @@ static u32 vduse_guest_gpu_ctx_destroy(struct vduse_guest_gpu *gpu,
 }
 
 /*
+ * Map ranges into the region, which cover a range of it in order from
+ * offset. VDUSE takes at most VDUSE_GUEST_GPU_MAP_BATCH ranges in a call, so
+ * they go in batches. If a batch fails, the batches that were mapped are
+ * unmapped again, and stuck tells whether that unmap failed, so that the
+ * host may still map their memory.
+ */
+static int vduse_guest_gpu_map_ranges(struct vduse_guest_gpu *gpu, u64 offset,
+				      const struct vduse_guest_shm_range *ranges,
+				      unsigned long nr, bool *stuck)
+{
+	unsigned long done, n;
+	u64 end = offset;
+	int err = 0;
+
+	for (done = 0; done < nr; done += n) {
+		n = min(nr - done, VDUSE_GUEST_GPU_MAP_BATCH);
+		err = vduse_guest_shm_map(gpu->dev,
+					  VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+					  ranges + done, n);
+		if (err)
+			break;
+		end = ranges[done + n - 1].offset + ranges[done + n - 1].size;
+	}
+
+	*stuck = err && end > offset &&
+		 vduse_guest_shm_unmap(gpu->dev,
+				       VIRTIO_GPU_SHM_ID_HOST_VISIBLE, offset,
+				       end - offset);
+	return err;
+}
+
+/*
  * Map pages into the region at offset, one range for each run of contiguous
- * pages. VDUSE takes ranges of at most 4 GiB and at most
- * VDUSE_GUEST_GPU_MAP_BATCH of them in a call, so a run is split at 4 GiB
- * and the ranges go in batches. If a batch fails, the batches that were
- * mapped are unmapped again, and stuck tells whether that unmap failed,
- * so that the host may still map the pages. The host maps guest memory
- * write-back, which matches the GTT BOs of a guest that maps no GTT page
- * write-combined.
+ * pages, split at 4 GiB, the largest range that VDUSE takes. The host maps
+ * guest memory write-back, which matches the GTT BOs of a guest that maps no
+ * GTT page write-combined.
  */
 static int vduse_guest_gpu_map_pages(struct vduse_guest_gpu *gpu, u64 offset,
 				     struct page **pages,
 				     unsigned long nr_pages, bool *stuck)
 {
 	struct vduse_guest_shm_range *ranges;
-	unsigned long i, done, n, nr = 0;
-	u64 end = offset;
-	int err = 0;
+	unsigned long i, nr = 0;
+	int err;
 
+	*stuck = false;
 	ranges = kvcalloc(nr_pages, sizeof(*ranges), GFP_KERNEL);
 	if (!ranges)
 		return -ENOMEM;
@@ -248,22 +277,77 @@ static int vduse_guest_gpu_map_pages(struct vduse_guest_gpu *gpu, u64 offset,
 		nr++;
 	}
 
-	for (done = 0; done < nr; done += n) {
-		n = min(nr - done, VDUSE_GUEST_GPU_MAP_BATCH);
-		err = vduse_guest_shm_map(gpu->dev,
-					  VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
-					  ranges + done, n);
-		if (err)
-			break;
-		end = ranges[done + n - 1].offset + ranges[done + n - 1].size;
-	}
+	err = vduse_guest_gpu_map_ranges(gpu, offset, ranges, nr, stuck);
 	kvfree(ranges);
+	return err;
+}
 
-	/* The ranges cover the pages in order, so the mapped batches end at end. */
-	*stuck = err && end > offset &&
-		 vduse_guest_shm_unmap(gpu->dev,
-				       VIRTIO_GPU_SHM_ID_HOST_VISIBLE, offset,
-				       end - offset);
+/*
+ * The ranges of BAR0 behind a BO in VRAM, split at 4 GiB. A first pass
+ * counts them without ranges, and a second fills ranges with at most max of
+ * them. Pos is the offset in the BO that the ranges reach.
+ */
+struct vduse_guest_gpu_vram_map {
+	struct vduse_guest_gpu_res *res;
+	struct vduse_guest_shm_range *ranges;
+	unsigned long nr, max;
+	u64 pos;
+};
+
+static int vduse_guest_gpu_vram_range(void *arg, u64 offset, u64 size)
+{
+	struct vduse_guest_gpu_vram_map *m = arg;
+	struct vduse_guest_gpu_res *res = m->res;
+	u64 n;
+
+	for (size = min(size, res->size - m->pos); size; size -= n) {
+		n = min_t(u64, size, SZ_4G);
+		if (m->ranges) {
+			if (m->nr == m->max)
+				return -EINVAL;
+			m->ranges[m->nr].offset = res->map_offset + m->pos;
+			m->ranges[m->nr].size = n;
+			m->ranges[m->nr].phys = offset;
+			m->ranges[m->nr].file = res->gpu->bar_file;
+		}
+		m->nr++;
+		m->pos += n;
+		offset += n;
+	}
+	return 0;
+}
+
+/*
+ * Map a reserved BO in CPU-visible VRAM at its placement in the region, as
+ * ranges of BAR0. The host maps them write-combined, which x86 makes
+ * uncached while vfio-pci maps BAR0 uncached.
+ */
+static int vduse_guest_gpu_map_vram(struct vduse_guest_gpu_res *res,
+				    bool *stuck)
+{
+	struct vduse_guest_gpu_vram_map m = { .res = res };
+	int err;
+
+	*stuck = false;
+	err = vduse_guest_gpu_amdgpu_vram(res, vduse_guest_gpu_vram_range, &m);
+	if (err)
+		return err;
+	if (m.pos != res->size)
+		return -EINVAL;
+
+	m.ranges = kvcalloc(m.nr, sizeof(*m.ranges), GFP_KERNEL);
+	if (!m.ranges)
+		return -ENOMEM;
+	m.max = m.nr;
+	m.nr = 0;
+	m.pos = 0;
+	err = vduse_guest_gpu_amdgpu_vram(res, vduse_guest_gpu_vram_range, &m);
+	if (!err && m.pos != res->size)
+		err = -EINVAL;
+	if (!err)
+		err = vduse_guest_gpu_map_ranges(res->gpu, res->map_offset,
+						 m.ranges, m.nr, stuck);
+	kvfree(m.ranges);
 	return err;
 }
 
@@ -282,18 +366,26 @@ static void vduse_guest_gpu_bo_leak(struct vduse_guest_gpu_res *res)
 		       vduse_guest_name(res->gpu->dev), res->id, err);
 }
 
-/* Map a reserved BO's pages in GTT at its placement in the region. */
+/*
+ * Map a reserved BO, in VRAM or in GTT as it was created, at its placement
+ * in the region.
+ */
 static int vduse_guest_gpu_bo_map(struct vduse_guest_gpu_res *res)
 {
 	struct page **pages;
 	bool stuck = false;
 	int err;
 
-	err = vduse_guest_gpu_amdgpu_pages(res, &pages);
-	if (!err)
-		err = vduse_guest_gpu_map_pages(res->gpu, res->map_offset, pages,
-						res->size >> PAGE_SHIFT,
-						&stuck);
+	if (res->bo_domains == AMDGPU_GEM_DOMAIN_VRAM) {
+		err = vduse_guest_gpu_map_vram(res, &stuck);
+	} else {
+		err = vduse_guest_gpu_amdgpu_pages(res, &pages);
+		if (!err)
+			err = vduse_guest_gpu_map_pages(res->gpu,
+							res->map_offset, pages,
+							res->size >> PAGE_SHIFT,
+							&stuck);
+	}
 	if (stuck)
 		vduse_guest_gpu_bo_leak(res);
 	if (!err)
@@ -521,9 +613,10 @@ static u32 vduse_guest_gpu_create_blob(struct vduse_guest_gpu *gpu,
 
 /*
  * Place a mappable blob at the offset that the host's driver chose and map
- * its pages. A BO is added to the index of fault requests before it is
- * reserved, since a fault request holds fault_sem while it reserves the BO.
- * Its moves unmap it again until it is unmapped.
+ * it. A BO is added to the index of fault requests before it is reserved,
+ * since a fault request holds fault_sem while it reserves the BO. Its moves
+ * unmap it again until it is unmapped. BAR0 is registered before the first
+ * BO in VRAM is mapped, and its ranges are uncached on the host.
  */
 static u32 vduse_guest_gpu_map_blob(struct vduse_guest_gpu *gpu,
 				    const struct virtio_gpu_resource_map_blob *cmd,
@@ -531,7 +624,7 @@ static u32 vduse_guest_gpu_map_blob(struct vduse_guest_gpu *gpu,
 {
 	u64 offset = le64_to_cpu(cmd->offset);
 	struct vduse_guest_gpu_res *res;
-	bool stuck = false;
+	bool stuck = false, vram = false;
 	int err;
 
 	res = xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id));
@@ -543,7 +636,12 @@ static u32 vduse_guest_gpu_map_blob(struct vduse_guest_gpu *gpu,
 	res->map_offset = offset;
 
 	if (res->obj) {
-		err = vduse_guest_gpu_index_add(gpu, res);
+		vram = gpu->vram && res->bo_domains == AMDGPU_GEM_DOMAIN_VRAM &&
+		       !(res->bo_flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS);
+		err = vram && !gpu->bar_file ?
+			vduse_guest_gpu_amdgpu_reg_bar(res, &gpu->bar_file) : 0;
+		if (!err)
+			err = vduse_guest_gpu_index_add(gpu, res);
 		if (err)
 			goto fail;
 		dma_resv_lock(res->obj->resv, NULL);
@@ -567,7 +665,8 @@ static u32 vduse_guest_gpu_map_blob(struct vduse_guest_gpu *gpu,
 	if (err)
 		goto fail;
 
-	info->map_info = cpu_to_le32(VIRTIO_GPU_MAP_CACHE_CACHED);
+	info->map_info = cpu_to_le32(vram ? VIRTIO_GPU_MAP_CACHE_UNCACHED :
+					    VIRTIO_GPU_MAP_CACHE_CACHED);
 	return VIRTIO_GPU_RESP_OK_MAP_INFO;
 
 fail:
@@ -1024,15 +1123,18 @@ struct vduse_guest_gpu_fault {
 };
 
 /*
- * Map the BO placed at a fault request's offset at its pages in GTT, unless
- * it is no longer placed there or the device has stopped, and return
- * whether it is mapped.
+ * Map the BO placed at a fault request's offset where it now is, unless it
+ * is no longer placed there or the device has stopped, and return whether it
+ * is mapped. The host drops every range of BAR0 while the PCI device's
+ * memory is disabled, so a BO in VRAM that is mapped is mapped again, which
+ * fails with -EEXIST before it maps anything when the host has its ranges.
  */
 static bool vduse_guest_gpu_fault_map(struct vduse_guest_gpu *gpu,
 				      const struct vduse_guest_msg *msg)
 {
 	struct vduse_guest_gpu_res *res;
 	bool ok = false;
+	int err;
 
 	if (msg->index != VIRTIO_GPU_SHM_ID_HOST_VISIBLE ||
 	    !vduse_guest_gpu_running(gpu))
@@ -1042,8 +1144,13 @@ static bool vduse_guest_gpu_fault_map(struct vduse_guest_gpu *gpu,
 	res = mtree_load(&gpu->fault_index, msg->start >> PAGE_SHIFT);
 	if (res) {
 		dma_resv_lock(res->obj->resv, NULL);
-		if (res->mapped && !res->leaked)
+		if (res->mapped && !res->leaked && res->present &&
+		    res->bo_domains == AMDGPU_GEM_DOMAIN_VRAM) {
+			err = vduse_guest_gpu_bo_map(res);
+			ok = !err || err == -EEXIST;
+		} else if (res->mapped && !res->leaked) {
 			ok = res->present || !vduse_guest_gpu_bo_map(res);
+		}
 		dma_resv_unlock(res->obj->resv);
 	}
 	up_read(&gpu->fault_sem);
@@ -1136,12 +1243,15 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	const char *render = VDUSE_GUEST_GPU_RENDER;
 	u64 region = VDUSE_GUEST_GPU_REGION_SIZE;
 	struct vduse_guest_gpu *gpu;
+	bool vram = false;
 	char *opt, *end;
 	int err;
 
 	while ((opt = strsep(&opts, ","))) {
 		if (strstarts(opt, "render=")) {
 			render = opt + strlen("render=");
+		} else if (!strcmp(opt, "vram")) {
+			vram = true;
 		} else if (strstarts(opt, "region=")) {
 			region = memparse(opt + strlen("region="), &end);
 			if (*end || !region || !PAGE_ALIGNED(region))
@@ -1155,6 +1265,7 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	if (!gpu)
 		return ERR_PTR(-ENOMEM);
 	gpu->dev = dev;
+	gpu->vram = vram;
 	spin_lock_init(&gpu->lock);
 	spin_lock_init(&gpu->fence_lock);
 	INIT_LIST_HEAD(&gpu->waiting);

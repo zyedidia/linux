@@ -538,21 +538,6 @@ void amdgpu_gem_set_move_notify(struct drm_gem_object *gobj,
 }
 
 /**
- * amdgpu_gem_pin_gtt - pin a reserved BO in GTT
- * @gobj: GEM object of the BO
- *
- * The BO stays pinned for its lifetime, which keeps the pages that
- * amdgpu_gem_gtt_pages returned if the BO has not moved since.
- *
- * Return: 0 or a negative error.
- */
-int amdgpu_gem_pin_gtt(struct drm_gem_object *gobj)
-{
-	dma_resv_assert_held(gobj->resv);
-	return amdgpu_bo_pin(gem_to_amdgpu_bo(gobj), AMDGPU_GEM_DOMAIN_GTT);
-}
-
-/**
  * amdgpu_gem_pin_placed - pin a reserved BO in the domain where it is placed
  * @gobj: GEM object of the BO
  *

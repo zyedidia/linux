@@ -14,7 +14,6 @@ void amdgpu_gem_set_move_notify(struct drm_gem_object *gobj,
 int amdgpu_gem_vram_ranges(struct drm_gem_object *gobj,
 			   int (*fn)(void *arg, u64 offset, u64 size),
 			   void *arg);
-int amdgpu_gem_pin_gtt(struct drm_gem_object *gobj);
 int amdgpu_gem_pin_placed(struct drm_gem_object *gobj);
 
 #endif

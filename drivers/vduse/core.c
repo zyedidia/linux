@@ -688,6 +688,14 @@ int vduse_guest_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
 	return dev->hops->shm_unmap(dev, id, offset, size);
 }
 
+int vduse_guest_shm_reg_bar(struct vduse_guest_dev *dev, struct pci_dev *pdev,
+			    int bar, u32 *file)
+{
+	if (!dev->hops->shm_reg_bar)
+		return -EOPNOTSUPP;
+	return dev->hops->shm_reg_bar(dev, pdev, bar, file);
+}
+
 /*
  * Wait for the driver to make more buffers available, with notifications
  * still disabled, for up to the device's poll time or until the CPU is

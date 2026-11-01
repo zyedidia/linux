@@ -173,6 +173,14 @@ struct vduse_guest_gpu {
 	struct virtio_gpu_config config;
 	struct vduse_guest_shm region;
 	char *render_path;
+	/*
+	 * With vram, which the vram option sets, a mappable BO for which Mesa
+	 * asks VRAM is placed in CPU-visible VRAM. The host maps such BOs
+	 * through BAR0, which the command worker registers as bar_file before
+	 * it maps the first of them.
+	 */
+	bool vram;
+	u32 bar_file;
 
 	/*
 	 * Commands run in queue order on one worker. The running flag, under
@@ -257,6 +265,10 @@ int vduse_guest_gpu_amdgpu_pages(struct vduse_guest_gpu_res *res,
 				 struct page ***pages);
 void vduse_guest_gpu_amdgpu_set_notify(struct vduse_guest_gpu_res *res,
 				       void (*fn)(void *priv));
+int vduse_guest_gpu_amdgpu_vram(struct vduse_guest_gpu_res *res,
+				int (*fn)(void *arg, u64 offset, u64 size),
+				void *arg);
+int vduse_guest_gpu_amdgpu_reg_bar(struct vduse_guest_gpu_res *res, u32 *file);
 int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res);
 
 #endif
