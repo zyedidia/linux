@@ -455,6 +455,81 @@ void amdgpu_gem_unpin_gtt_pages(struct drm_gem_object *gobj)
 	amdgpu_bo_unreserve(bo);
 }
 
+/**
+ * amdgpu_gem_gtt_pages - place a reserved BO in GTT and get its pages
+ * @gobj: GEM object of a BO that may be placed in GTT
+ * @pages: returns the BO's pages
+ * @npages: returns the number of pages
+ *
+ * The caller holds the BO's reservation. The pages belong to the BO's TTM
+ * object and stay valid until the BO moves, which calls the BO's move
+ * notification first. A BO of user memory or of another device is refused,
+ * and so is a discardable BO, whose eviction frees its pages without a move.
+ *
+ * Return: 0 or a negative error.
+ */
+int amdgpu_gem_gtt_pages(struct drm_gem_object *gobj, struct page ***pages,
+			 unsigned long *npages)
+{
+	struct ttm_operation_ctx ctx = { .interruptible = false };
+	struct amdgpu_bo *bo;
+	int r;
+
+	if (gobj->funcs != &amdgpu_gem_object_funcs || drm_gem_is_imported(gobj))
+		return -EINVAL;
+	bo = gem_to_amdgpu_bo(gobj);
+	dma_resv_assert_held(gobj->resv);
+	if (!(bo->preferred_domains & AMDGPU_GEM_DOMAIN_GTT) ||
+	    (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE) ||
+	    amdgpu_ttm_tt_get_usermm(bo->tbo.ttm))
+		return -EINVAL;
+
+	amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
+	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+	if (r)
+		return r;
+	if (bo->tbo.resource->mem_type != TTM_PL_TT || !bo->tbo.ttm ||
+	    !ttm_tt_is_populated(bo->tbo.ttm))
+		return -EINVAL;
+	*pages = bo->tbo.ttm->pages;
+	*npages = bo->tbo.ttm->num_pages;
+	return 0;
+}
+
+/**
+ * amdgpu_gem_set_move_notify - set the function that a BO's moves call first
+ * @gobj: GEM object of the BO
+ * @fn: the function, or NULL
+ * @priv: the function's argument
+ *
+ * The caller holds the BO's reservation, and the function runs with it held,
+ * before the BO moves.
+ */
+void amdgpu_gem_set_move_notify(struct drm_gem_object *gobj,
+				void (*fn)(void *priv), void *priv)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(gobj);
+
+	dma_resv_assert_held(gobj->resv);
+	bo->move_notify = fn;
+	bo->move_priv = priv;
+}
+
+/**
+ * amdgpu_gem_pin_gtt - pin a reserved BO in GTT
+ * @gobj: GEM object of the BO
+ *
+ * The BO stays pinned for its lifetime, which keeps the pages that
+ * amdgpu_gem_gtt_pages returned if the BO has not moved since.
+ *
+ * Return: 0 or a negative error.
+ */
+int amdgpu_gem_pin_gtt(struct drm_gem_object *gobj)
+{
+	dma_resv_assert_held(gobj->resv);
+	return amdgpu_bo_pin(gem_to_amdgpu_bo(gobj), AMDGPU_GEM_DOMAIN_GTT);
+}
+
 /*
  * GEM ioctls.
  */

@@ -8,5 +8,10 @@ struct page;
 int amdgpu_gem_pin_gtt_pages(struct drm_gem_object *gobj, struct page ***pages,
 			     unsigned long *npages);
 void amdgpu_gem_unpin_gtt_pages(struct drm_gem_object *gobj);
+int amdgpu_gem_gtt_pages(struct drm_gem_object *gobj, struct page ***pages,
+			 unsigned long *npages);
+void amdgpu_gem_set_move_notify(struct drm_gem_object *gobj,
+				void (*fn)(void *priv), void *priv);
+int amdgpu_gem_pin_gtt(struct drm_gem_object *gobj);
 
 #endif

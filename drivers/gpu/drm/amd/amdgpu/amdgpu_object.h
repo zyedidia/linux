@@ -120,6 +120,13 @@ struct amdgpu_bo {
 	struct kgd_mem                  *kfd_bo;
 
 	/*
+	 * Called with move_priv when the BO is about to move, before anything
+	 * else. Protected by the BO's reservation.
+	 */
+	void				(*move_notify)(void *priv);
+	void				*move_priv;
+
+	/*
 	 * For GPUs with spatial partitioning, xcp partition number, -1 means
 	 * any partition. For other ASICs without spatial partition, always 0
 	 * for memory accounting.
