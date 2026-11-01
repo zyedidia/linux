@@ -101,6 +101,8 @@ struct vfio_pci_core_device {
 	const struct vfio_pci_device_ops *pci_ops;
 	void __iomem		*barmap[PCI_STD_NUM_BARS];
 	bool			bar_mmap_supported[PCI_STD_NUM_BARS];
+	/* Set for the BARs mapped with pci_iomap_wc(). */
+	bool			bar_wc[PCI_STD_NUM_BARS];
 	/* Flags modified at runtime - dedicated storage unit */
 	bool			virq_disabled;
 	bool			bardirty;

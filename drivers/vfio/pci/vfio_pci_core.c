@@ -74,6 +74,19 @@ int vfio_pci_eventfd_replace_locked(struct vfio_pci_core_device *vdev,
 	return 0;
 }
 
+/*
+ * Map the prefetchable memory BARs of a device write-combined when it is
+ * enabled, and map them write-combined for userspace. On x86, PAT gives every
+ * mapping of such a BAR, including those of userspace and of dma-buf
+ * importers, the memory type of this reservation, which stays UC- if another
+ * reservation overlapping the BAR is UC-. The setting applies to every device
+ * that vfio-pci opens while it is set.
+ */
+static bool prefetchable_wc;
+module_param(prefetchable_wc, bool, 0644);
+MODULE_PARM_DESC(prefetchable_wc,
+		 "Map prefetchable memory BARs write-combined, for the kernel and userspace, in devices opened while this is set (default: false)");
+
 /* List of PF's that vfio_pci_core_sriov_configure() has been called on */
 static DEFINE_MUTEX(vfio_pci_sriov_pfs_mutex);
 static LIST_HEAD(vfio_pci_sriov_pfs);
@@ -553,6 +566,7 @@ static void vfio_pci_core_map_bars(struct vfio_pci_core_device *vdev)
 		int bar = i + PCI_STD_RESOURCES;
 
 		vdev->barmap[bar] = IOMEM_ERR_PTR(-ENODEV);
+		vdev->bar_wc[bar] = false;
 
 		if (!pci_resource_len(pdev, i))
 			continue;
@@ -563,9 +577,16 @@ static void vfio_pci_core_map_bars(struct vfio_pci_core_device *vdev)
 			continue;
 		}
 
-		vdev->barmap[bar] = pci_iomap(pdev, bar, 0);
+		vdev->bar_wc[bar] = prefetchable_wc &&
+				    (pci_resource_flags(pdev, i) &
+				     IORESOURCE_PREFETCH);
+		if (vdev->bar_wc[bar])
+			vdev->barmap[bar] = pci_iomap_wc(pdev, bar, 0);
+		else
+			vdev->barmap[bar] = pci_iomap(pdev, bar, 0);
 		if (!vdev->barmap[bar]) {
 			pci_dbg(pdev, "Failed to iomap region %d\n", bar);
+			vdev->bar_wc[bar] = false;
 			pci_release_selected_regions(pdev, 1 << bar);
 			vdev->barmap[bar] = IOMEM_ERR_PTR(-ENOMEM);
 		}
@@ -744,6 +765,7 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 		pci_iounmap(pdev, vdev->barmap[bar]);
 		pci_release_selected_regions(pdev, 1 << bar);
 		vdev->barmap[bar] = NULL;
+		vdev->bar_wc[bar] = false;
 	}
 
 	list_for_each_entry_safe(dummy_res, tmp,
@@ -1859,7 +1881,10 @@ int vfio_pci_core_mmap(struct vfio_device *core_vdev, struct vm_area_struct *vma
 		return PTR_ERR(bar_io);
 
 	vma->vm_private_data = vdev;
-	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	if (vdev->bar_wc[index])
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	else
+		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 	vma->vm_page_prot = pgprot_decrypted(vma->vm_page_prot);
 
 	/*

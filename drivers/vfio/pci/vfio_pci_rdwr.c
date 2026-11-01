@@ -51,6 +51,10 @@ int vfio_pci_core_iowrite##size(struct vfio_pci_core_device *vdev,	\
 	}								\
 									\
 	vfio_iowrite##size(val, io);					\
+	if (memchr_inv(vdev->bar_wc, 0, sizeof(vdev->bar_wc))) {	\
+		/* Drain write-combining buffers to the device. */	\
+		wmb();							\
+	}								\
 									\
 	if (test_mem)							\
 		up_read(&vdev->memory_lock);				\
