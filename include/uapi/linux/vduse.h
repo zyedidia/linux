@@ -340,7 +340,8 @@ struct vduse_shm_config {
 /**
  * struct vduse_shm_file - a backing file of shared memory regions
  * @fd: a shmem or hugetlbfs file, open for writing, without a seal that
- *      forbids writes
+ *      forbids writes, or a VFIO dma-buf of one range of a BAR, open for
+ *      writing
  * @index: the index that VDUSE_SHM_MAP names the file by, set by the ioctl
  * @reserved: for future use, needs to be initialized to zero
  *
@@ -354,9 +355,11 @@ struct vduse_shm_file {
 
 /*
  * Register a backing file of the shared memory regions, if VDUSE_API_VERSION
- * >= 2. VDUSE keeps the file until the device's file is closed, and the file
- * counts as mapped writable meanwhile, so that it cannot be sealed against
- * writes.
+ * >= 2. VDUSE keeps the file until the device's file is closed, and a memory
+ * file counts as mapped writable meanwhile, so that it cannot be sealed
+ * against writes. Ranges of a VFIO dma-buf are mapped write-combined, and
+ * VFIO's revocation of the dma-buf unmaps all of them. A map of the dma-buf
+ * fails while it is revoked.
  */
 #define VDUSE_SHM_REG_FILE	_IOWR(VDUSE_BASE, 0x1d, struct vduse_shm_file)
 

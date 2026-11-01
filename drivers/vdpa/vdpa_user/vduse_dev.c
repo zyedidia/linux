@@ -27,6 +27,9 @@
 #include <linux/vmalloc.h>
 #include <linux/sched/mm.h>
 #include <linux/maple_tree.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
+#include <linux/vfio_pci_core.h>
 #include <linux/memfd.h>
 #include <linux/mm.h>
 #include <linux/shmem_fs.h>
@@ -114,15 +117,19 @@ struct vduse_as {
 };
 
 /*
- * A mapped range of a shared memory region. The folios behind its file
- * range stay pinned until it is unmapped, and pos holds the file position
- * at which each folio starts.
+ * A mapped range of region id. For a memory file, the folios behind its file
+ * range stay pinned until it is unmapped, and pos holds the file position at
+ * which each folio starts. For a VFIO dma-buf, mmio is set and the range
+ * maps the MMIO from pfn.
  */
 struct vduse_shm_entry {
 	u64 offset;
 	u64 size;
 	u64 file_offset;
 	u32 file;
+	u8 id;
+	bool mmio;
+	unsigned long pfn;
 	unsigned int nr_folios;
 	struct folio **folios;
 	loff_t *pos;
@@ -130,11 +137,29 @@ struct vduse_shm_entry {
 };
 
 /*
+ * A registered VFIO dma-buf, which VDUSE imports with attach, and the
+ * physical range of the BAR that it exports. VFIO revokes it through the
+ * attachment while the device's memory is disabled, and the range is read
+ * again when a map finds it revoked. The shm_lock mutex protects index,
+ * published, revoked and the range.
+ */
+struct vduse_shm_dmabuf {
+	struct vduse_dev *dev;
+	struct dma_buf_attachment *attach;
+	u32 index;
+	bool published;
+	bool revoked;
+	phys_addr_t phys;
+	u64 size;
+};
+
+/*
  * A backing file, with the entries that map its ranges keyed by the page
- * index in the file.
+ * index in the file, and dmabuf for a VFIO dma-buf.
  */
 struct vduse_shm_backing {
 	struct file *file;
+	struct vduse_shm_dmabuf *dmabuf;
 	struct maple_tree ranges;
 };
 
@@ -1036,6 +1061,9 @@ static unsigned long vduse_shm_entry_pfn(const struct vduse_shm_entry *e,
 	loff_t pos = e->file_offset + (offset - e->offset);
 	unsigned int lo = 0, hi = e->nr_folios;
 
+	if (e->mmio)
+		return e->pfn + ((offset - e->offset) >> PAGE_SHIFT);
+
 	while (hi - lo > 1) {
 		unsigned int mid = lo + (hi - lo) / 2;
 
@@ -1124,79 +1152,6 @@ static bool vduse_shm_file_registered(struct vduse_dev *dev,
 }
 
 /*
- * Register a backing file. Applications map its pages writable, so it must
- * be open for writing and have no seal that forbids writes, and it counts as
- * a writable mapping until it is dropped, so that no such seal can be added.
- * The index is written to the caller before the file is published, and the
- * write is repeated if another registration took that index meanwhile.
- */
-static int vduse_shm_reg_file(struct vduse_dev *dev, int fd,
-			      u32 __user *uindex)
-{
-	struct vduse_shm_backing *b;
-	struct file *file;
-	u32 index;
-	int ret;
-
-	file = fget(fd);
-	if (!file)
-		return -EBADF;
-
-	ret = -EINVAL;
-	if (!(file->f_mode & FMODE_WRITE) ||
-	    (!shmem_file(file) && !is_file_hugepages(file)) ||
-	    !vduse_shm_file_writable(file))
-		goto put;
-	ret = mapping_map_writable(file->f_mapping);
-	if (ret)
-		goto put;
-	if (!vduse_shm_file_writable(file)) {
-		ret = -EINVAL;
-		goto unmap;
-	}
-
-	for (;;) {
-		mutex_lock(&dev->shm_lock);
-		index = dev->shm_nr_files;
-		if (dev->shm_revoked)
-			ret = -ENODEV;
-		else if (index == VDUSE_MAX_SHM_FILES)
-			ret = -ENOSPC;
-		else if (vduse_shm_file_registered(dev, file))
-			ret = -EEXIST;
-		mutex_unlock(&dev->shm_lock);
-		if (ret)
-			goto unmap;
-
-		if (put_user(index, uindex)) {
-			ret = -EFAULT;
-			goto unmap;
-		}
-
-		mutex_lock(&dev->shm_map_lock);
-		mutex_lock(&dev->shm_lock);
-		if (!dev->shm_revoked && dev->shm_nr_files == index &&
-		    !vduse_shm_file_registered(dev, file)) {
-			b = &dev->shm_files[index];
-			b->file = file;
-			mt_init(&b->ranges);
-			dev->shm_nr_files++;
-			mutex_unlock(&dev->shm_lock);
-			mutex_unlock(&dev->shm_map_lock);
-			return 0;
-		}
-		mutex_unlock(&dev->shm_lock);
-		mutex_unlock(&dev->shm_map_lock);
-	}
-
-unmap:
-	mapping_unmap_writable(file->f_mapping);
-put:
-	fput(file);
-	return ret;
-}
-
-/*
  * Reserve an entry's file range, unless a mapped or reserved range of the
  * file overlaps it. A file range is mapped at most once, and is reserved
  * before it is pinned, so that a folio is pinned a bounded number of times.
@@ -1223,6 +1178,217 @@ static void vduse_shm_unreserve(struct vduse_dev *dev,
 		    e->file_offset >> PAGE_SHIFT);
 }
 
+/*
+ * Publish a backing file at the next index. The index is written to the
+ * caller before the file is published, and the write is repeated if another
+ * registration took that index meanwhile.
+ */
+static int vduse_shm_publish(struct vduse_dev *dev, struct file *file,
+			     struct vduse_shm_dmabuf *d, u32 __user *uindex)
+{
+	struct vduse_shm_backing *b;
+	u32 index;
+	int ret = 0;
+
+	for (;;) {
+		mutex_lock(&dev->shm_lock);
+		index = dev->shm_nr_files;
+		if (dev->shm_revoked)
+			ret = -ENODEV;
+		else if (index == VDUSE_MAX_SHM_FILES)
+			ret = -ENOSPC;
+		else if (vduse_shm_file_registered(dev, file))
+			ret = -EEXIST;
+		mutex_unlock(&dev->shm_lock);
+		if (ret)
+			return ret;
+
+		if (put_user(index, uindex))
+			return -EFAULT;
+
+		mutex_lock(&dev->shm_map_lock);
+		mutex_lock(&dev->shm_lock);
+		if (!dev->shm_revoked && dev->shm_nr_files == index &&
+		    !vduse_shm_file_registered(dev, file)) {
+			b = &dev->shm_files[index];
+			b->file = file;
+			b->dmabuf = d;
+			mt_init(&b->ranges);
+			if (d) {
+				d->index = index;
+				d->published = true;
+			}
+			dev->shm_nr_files++;
+			mutex_unlock(&dev->shm_lock);
+			mutex_unlock(&dev->shm_map_lock);
+			return 0;
+		}
+		mutex_unlock(&dev->shm_lock);
+		mutex_unlock(&dev->shm_map_lock);
+	}
+}
+
+/*
+ * Read a dma-buf's physical range from VFIO, with the dma-buf's reservation
+ * held. VFIO gives it only for a dma-buf of one range that is not revoked.
+ */
+static int vduse_shm_dmabuf_read(struct vduse_shm_dmabuf *d)
+{
+	typeof(&vfio_pci_dma_buf_iommufd_map) fn;
+	struct phys_vec phys;
+	int ret;
+
+	dma_resv_assert_held(d->attach->dmabuf->resv);
+	if (!IS_ENABLED(CONFIG_VFIO_PCI_DMABUF))
+		return -EOPNOTSUPP;
+	fn = symbol_get(vfio_pci_dma_buf_iommufd_map);
+	if (!fn)
+		return -EOPNOTSUPP;
+	ret = fn(d->attach, &phys);
+	symbol_put(vfio_pci_dma_buf_iommufd_map);
+	if (ret)
+		return ret;
+	if (!PAGE_ALIGNED(phys.paddr) || !PAGE_ALIGNED(phys.len) || !phys.len)
+		return -EINVAL;
+
+	mutex_lock(&d->dev->shm_lock);
+	d->phys = phys.paddr;
+	d->size = phys.len;
+	d->revoked = false;
+	mutex_unlock(&d->dev->shm_lock);
+	return 0;
+}
+
+/*
+ * Called by VFIO with the dma-buf's reservation held when it revokes the
+ * dma-buf or makes it usable again. Every range of the dma-buf is unmapped as
+ * vduse_shm_unmap() unmaps one, and faults on the ranges go to the device,
+ * which maps them again once the dma-buf is usable. The reservation is taken
+ * before shm_map_lock, and nothing that holds shm_map_lock takes it.
+ */
+static void vduse_shm_dmabuf_invalidate(struct dma_buf_attachment *attach)
+{
+	struct vduse_shm_dmabuf *d = attach->importer_priv;
+	struct vduse_dev *dev = d->dev;
+	struct vduse_shm_entry *e, *tmp;
+	unsigned long index = 0;
+	LIST_HEAD(entries);
+
+	mutex_lock(&dev->shm_map_lock);
+	mutex_lock(&dev->shm_lock);
+	d->revoked = true;
+	if (d->published && !dev->shm_revoked) {
+		mt_for_each(&dev->shm_files[d->index].ranges, e, index,
+			    ULONG_MAX) {
+			list_add_tail(&e->list, &entries);
+			cond_resched();
+		}
+		list_for_each_entry(e, &entries, list)
+			mtree_erase(&vduse_find_shm(dev, e->id)->entries,
+				    e->offset >> PAGE_SHIFT);
+	}
+	mutex_unlock(&dev->shm_lock);
+
+	list_for_each_entry(e, &entries, list)
+		vduse_shm_invalidate(dev, e->id, e->offset, e->size);
+	list_for_each_entry_safe(e, tmp, &entries, list) {
+		vduse_shm_unreserve(dev, e);
+		vduse_shm_entry_free(e);
+		cond_resched();
+	}
+	mutex_unlock(&dev->shm_map_lock);
+}
+
+static const struct dma_buf_attach_ops vduse_shm_dmabuf_ops = {
+	.allow_peer2peer = true,
+	.invalidate_mappings = vduse_shm_dmabuf_invalidate,
+};
+
+/*
+ * Register a VFIO dma-buf, open for writing, as an importer that VFIO can
+ * revoke, with its physical range.
+ */
+static int vduse_shm_reg_dmabuf(struct vduse_dev *dev, struct dma_buf *dmabuf,
+				u32 __user *uindex)
+{
+	struct vduse_shm_dmabuf *d;
+	int ret = -EINVAL;
+
+	if (!(dmabuf->file->f_mode & FMODE_WRITE))
+		goto put;
+	ret = -ENOMEM;
+	d = kzalloc_obj(*d, GFP_KERNEL_ACCOUNT);
+	if (!d)
+		goto put;
+	d->dev = dev;
+	d->revoked = true;
+	d->attach = dma_buf_dynamic_attach(dmabuf, dev->dev,
+					   &vduse_shm_dmabuf_ops, d);
+	if (IS_ERR(d->attach)) {
+		ret = PTR_ERR(d->attach);
+		goto free;
+	}
+
+	dma_resv_lock(dmabuf->resv, NULL);
+	ret = vduse_shm_dmabuf_read(d);
+	dma_resv_unlock(dmabuf->resv);
+	if (!ret)
+		ret = vduse_shm_publish(dev, dmabuf->file, d, uindex);
+	if (!ret)
+		return 0;
+
+	dma_buf_detach(dmabuf, d->attach);
+free:
+	kfree(d);
+put:
+	dma_buf_put(dmabuf);
+	return ret;
+}
+
+/*
+ * Register a backing file. Applications map a memory file's pages writable,
+ * so it must be open for writing and have no seal that forbids writes, and it
+ * counts as a writable mapping until it is dropped, so that no such seal can
+ * be added.
+ */
+static int vduse_shm_reg_file(struct vduse_dev *dev, int fd,
+			      u32 __user *uindex)
+{
+	struct dma_buf *dmabuf;
+	struct file *file;
+	int ret;
+
+	dmabuf = dma_buf_get(fd);
+	if (!IS_ERR(dmabuf))
+		return vduse_shm_reg_dmabuf(dev, dmabuf, uindex);
+
+	file = fget(fd);
+	if (!file)
+		return -EBADF;
+
+	ret = -EINVAL;
+	if (!(file->f_mode & FMODE_WRITE) ||
+	    (!shmem_file(file) && !is_file_hugepages(file)) ||
+	    !vduse_shm_file_writable(file))
+		goto put;
+	ret = mapping_map_writable(file->f_mapping);
+	if (ret)
+		goto put;
+	if (!vduse_shm_file_writable(file)) {
+		ret = -EINVAL;
+		goto unmap;
+	}
+
+	ret = vduse_shm_publish(dev, file, NULL, uindex);
+	if (!ret)
+		return 0;
+unmap:
+	mapping_unmap_writable(file->f_mapping);
+put:
+	fput(file);
+	return ret;
+}
+
 /* Insert an entry into its region, unless it overlaps a mapped range. */
 static int vduse_shm_insert(struct vduse_shm *shm, struct vduse_shm_entry *e)
 {
@@ -1236,17 +1402,64 @@ static int vduse_shm_insert(struct vduse_shm *shm, struct vduse_shm_entry *e)
 				 GFP_KERNEL_ACCOUNT);
 }
 
+/* Point an entry of a VFIO dma-buf at the MMIO behind its file range. */
+static int vduse_shm_entry_mmio(struct vduse_dev *dev,
+				struct vduse_shm_entry *e,
+				struct vduse_shm_dmabuf *d)
+{
+	int ret = 0;
+
+	e->mmio = true;
+	mutex_lock(&dev->shm_lock);
+	if (d->revoked)
+		ret = -ENODEV;
+	else if (e->file_offset + e->size > d->size)
+		ret = -EINVAL;
+	else
+		e->pfn = PHYS_PFN(d->phys + e->file_offset);
+	mutex_unlock(&dev->shm_lock);
+	return ret;
+}
+
+/*
+ * Read the range of each revoked dma-buf again, which VFIO gives once the
+ * device's memory is enabled. This takes the reservations before
+ * shm_map_lock.
+ */
+static void vduse_shm_dmabuf_refresh(struct vduse_dev *dev)
+{
+	struct vduse_shm_dmabuf *d;
+	u32 i;
+
+	for (i = 0; i < VDUSE_MAX_SHM_FILES; i++) {
+		mutex_lock(&dev->shm_lock);
+		d = i < dev->shm_nr_files ? dev->shm_files[i].dmabuf : NULL;
+		if (d && !d->revoked)
+			d = NULL;
+		mutex_unlock(&dev->shm_lock);
+		if (!d)
+			continue;
+		dma_resv_lock(d->attach->dmabuf->resv, NULL);
+		vduse_shm_dmabuf_read(d);
+		dma_resv_unlock(d->attach->dmabuf->resv);
+	}
+}
+
 /*
  * Reserve and pin every range of the request, then insert them all into
  * the region or none, under shm_lock so that faults see all or none. The
  * files stay registered while an ioctl runs, since only closing the
- * device's file drops them.
+ * device's file drops them. VFIO cannot revoke a dma-buf meanwhile, since
+ * its revocation waits for shm_map_lock. The ranges are copied in first, so
+ * that no fault on user memory, which may take VFIO's memory_lock, happens
+ * under shm_map_lock.
  */
 static int vduse_shm_map(struct vduse_dev *dev,
 			 const struct vduse_shm_map *map)
 {
 	struct vduse_shm_range __user *uranges = u64_to_user_ptr(map->ranges);
 	struct vduse_shm *shm = vduse_find_shm(dev, map->id);
+	struct vduse_shm_range *ranges;
 	struct vduse_shm_entry *e, *tmp;
 	unsigned int i, inserted = 0;
 	LIST_HEAD(entries);
@@ -1258,14 +1471,16 @@ static int vduse_shm_map(struct vduse_dev *dev,
 	    !map->nr_ranges || map->nr_ranges > VDUSE_MAX_SHM_RANGES)
 		return -EINVAL;
 
+	ranges = vmemdup_array_user(uranges, map->nr_ranges, sizeof(*ranges));
+	if (IS_ERR(ranges))
+		return PTR_ERR(ranges);
+
+	vduse_shm_dmabuf_refresh(dev);
 	mutex_lock(&dev->shm_map_lock);
 	for (i = 0; i < map->nr_ranges; i++) {
 		struct vduse_shm_backing *b = NULL;
-		struct vduse_shm_range r;
+		struct vduse_shm_range r = ranges[i];
 
-		ret = -EFAULT;
-		if (copy_from_user(&r, &uranges[i], sizeof(r)))
-			goto free;
 		ret = -EINVAL;
 		if (!is_mem_zero((const char *)r.reserved, sizeof(r.reserved)) ||
 		    !vduse_shm_range_valid(shm, r.offset, r.size) ||
@@ -1278,7 +1493,7 @@ static int vduse_shm_map(struct vduse_dev *dev,
 		if (r.file < dev->shm_nr_files)
 			b = &dev->shm_files[r.file];
 		mutex_unlock(&dev->shm_lock);
-		if (!b || !vduse_shm_file_writable(b->file))
+		if (!b || (!b->dmabuf && !vduse_shm_file_writable(b->file)))
 			goto free;
 
 		ret = -ENOMEM;
@@ -1289,6 +1504,7 @@ static int vduse_shm_map(struct vduse_dev *dev,
 		e->size = r.size;
 		e->file_offset = r.file_offset;
 		e->file = r.file;
+		e->id = map->id;
 
 		ret = vduse_shm_reserve(b, e);
 		if (ret) {
@@ -1297,7 +1513,10 @@ static int vduse_shm_map(struct vduse_dev *dev,
 		}
 		list_add_tail(&e->list, &entries);
 
-		ret = vduse_shm_entry_pin(e, b->file);
+		if (b->dmabuf)
+			ret = vduse_shm_entry_mmio(dev, e, b->dmabuf);
+		else
+			ret = vduse_shm_entry_pin(e, b->file);
 		if (ret)
 			goto free;
 		cond_resched();
@@ -1330,6 +1549,7 @@ free:
 	}
 unlock:
 	mutex_unlock(&dev->shm_map_lock);
+	kvfree(ranges);
 	return ret;
 }
 
@@ -1427,6 +1647,7 @@ static void vduse_shm_fail_faults(struct vduse_dev *dev)
  */
 static void vduse_shm_revoke(struct vduse_dev *dev)
 {
+	struct vduse_shm_dmabuf *dmabufs[VDUSE_MAX_SHM_FILES];
 	struct file *files[VDUSE_MAX_SHM_FILES];
 	struct vduse_shm_entry *e, *tmp;
 	unsigned long index;
@@ -1449,6 +1670,7 @@ static void vduse_shm_revoke(struct vduse_dev *dev)
 	nr_files = dev->shm_nr_files;
 	for (i = 0; i < nr_files; i++) {
 		files[i] = dev->shm_files[i].file;
+		dmabufs[i] = dev->shm_files[i].dmabuf;
 		mtree_destroy(&dev->shm_files[i].ranges);
 	}
 	dev->shm_nr_files = 0;
@@ -1462,8 +1684,18 @@ static void vduse_shm_revoke(struct vduse_dev *dev)
 	}
 	mutex_unlock(&dev->shm_map_lock);
 
+	/*
+	 * Detaching takes a dma-buf's reservation, which VFIO holds while it
+	 * waits for shm_map_lock.
+	 */
 	for (i = 0; i < nr_files; i++) {
-		mapping_unmap_writable(files[i]->f_mapping);
+		if (dmabufs[i]) {
+			dma_buf_detach(dmabufs[i]->attach->dmabuf,
+				       dmabufs[i]->attach);
+			kfree(dmabufs[i]);
+		} else {
+			mapping_unmap_writable(files[i]->f_mapping);
+		}
 		fput(files[i]);
 	}
 }
@@ -1494,10 +1726,14 @@ static bool vduse_shm_insert_page(struct vduse_dev *dev, struct vduse_shm *shm,
 
 	mutex_lock(&dev->shm_lock);
 	e = mtree_load(&shm->entries, offset >> PAGE_SHIFT);
-	if (e)
+	if (e) {
+		pgprot_t prot = vm_get_page_prot(vmf->vma->vm_flags);
+
+		if (e->mmio)
+			prot = pgprot_writecombine(prot);
 		*ret = vmf_insert_pfn_prot(vmf->vma, vmf->address,
-					   vduse_shm_entry_pfn(e, offset),
-					   vm_get_page_prot(vmf->vma->vm_flags));
+					   vduse_shm_entry_pfn(e, offset), prot);
+	}
 	*revoked = dev->shm_revoked;
 	mutex_unlock(&dev->shm_lock);
 	return e;
@@ -3375,5 +3611,6 @@ static void vduse_exit(void)
 module_exit(vduse_exit);
 
 MODULE_LICENSE(DRV_LICENSE);
+MODULE_IMPORT_NS("DMA_BUF");
 MODULE_AUTHOR(DRV_AUTHOR);
 MODULE_DESCRIPTION(DRV_DESC);
