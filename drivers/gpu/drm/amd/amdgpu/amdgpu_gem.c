@@ -46,6 +46,7 @@
 #include "amdgpu_display.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_hmm.h"
+#include "amdgpu_res_cursor.h"
 #include "amdgpu_xgmi.h"
 #include "amdgpu_vm.h"
 
@@ -398,6 +399,44 @@ const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
 	.vm_ops = &amdgpu_gem_vm_ops,
 };
 
+/*
+ * Place a reserved BO of the device in a domain, and wait for the kernel's
+ * copies and clears of its memory, as a CPU fault does before it maps the
+ * memory. The BOs that share the reservation, such as the per-VM BOs of the
+ * BO's VM, may be evicted to make room. A BO of user memory or of another
+ * device is refused, and so is a discardable BO, whose eviction frees its
+ * pages without a move.
+ */
+static int amdgpu_gem_place(struct drm_gem_object *gobj, u32 domain,
+			    struct amdgpu_bo **pbo)
+{
+	struct ttm_operation_ctx ctx = {
+		.interruptible = false,
+		.resv = gobj->resv,
+		.allow_res_evict = true,
+	};
+	struct amdgpu_bo *bo;
+	long r;
+
+	if (gobj->funcs != &amdgpu_gem_object_funcs || drm_gem_is_imported(gobj))
+		return -EINVAL;
+	bo = gem_to_amdgpu_bo(gobj);
+	dma_resv_assert_held(gobj->resv);
+	if (!(bo->preferred_domains & domain) ||
+	    (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE) ||
+	    amdgpu_ttm_tt_get_usermm(bo->tbo.ttm))
+		return -EINVAL;
+
+	amdgpu_bo_placement_from_domain(bo, domain);
+	*pbo = bo;
+	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+	if (r)
+		return r;
+	r = dma_resv_wait_timeout(gobj->resv, DMA_RESV_USAGE_KERNEL, false,
+				  MAX_SCHEDULE_TIMEOUT);
+	return r < 0 ? r : 0;
+}
+
 /**
  * amdgpu_gem_gtt_pages - place a reserved BO in GTT and get its pages
  * @gobj: GEM object of a BO that may be placed in GTT
@@ -416,29 +455,10 @@ const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
 int amdgpu_gem_gtt_pages(struct drm_gem_object *gobj, struct page ***pages,
 			 unsigned long *npages)
 {
-	/*
-	 * The BOs that share the reservation, such as the per-VM BOs of the
-	 * BO's VM, may be evicted to make room.
-	 */
-	struct ttm_operation_ctx ctx = {
-		.interruptible = false,
-		.resv = gobj->resv,
-		.allow_res_evict = true,
-	};
 	struct amdgpu_bo *bo;
 	int r;
 
-	if (gobj->funcs != &amdgpu_gem_object_funcs || drm_gem_is_imported(gobj))
-		return -EINVAL;
-	bo = gem_to_amdgpu_bo(gobj);
-	dma_resv_assert_held(gobj->resv);
-	if (!(bo->preferred_domains & AMDGPU_GEM_DOMAIN_GTT) ||
-	    (bo->flags & AMDGPU_GEM_CREATE_DISCARDABLE) ||
-	    amdgpu_ttm_tt_get_usermm(bo->tbo.ttm))
-		return -EINVAL;
-
-	amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
-	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+	r = amdgpu_gem_place(gobj, AMDGPU_GEM_DOMAIN_GTT, &bo);
 	if (r)
 		return r;
 	if (bo->tbo.resource->mem_type != TTM_PL_TT || !bo->tbo.ttm ||
@@ -446,6 +466,55 @@ int amdgpu_gem_gtt_pages(struct drm_gem_object *gobj, struct page ***pages,
 		return -EINVAL;
 	*pages = bo->tbo.ttm->pages;
 	*npages = bo->tbo.ttm->num_pages;
+	return 0;
+}
+
+/**
+ * amdgpu_gem_vram_ranges - place a reserved BO in CPU-visible VRAM
+ * @gobj: GEM object of a BO that may be placed in VRAM
+ * @fn: called with the offset in BAR0 and the size of each contiguous range
+ *      of the BO, in order
+ * @arg: the argument of fn
+ *
+ * The caller holds the BO's reservation. As a CPU fault does, this marks the
+ * BO as accessed by the CPU, so that later placements keep it in visible
+ * VRAM where they can. The ranges stay valid until the BO moves, which calls
+ * the BO's move notification first. The CPU must access VRAM through BAR0,
+ * so that an offset in VRAM is the same offset in BAR0. BOs are refused as
+ * in amdgpu_gem_gtt_pages, and BOs that share the reservation may be evicted
+ * to make room, with their move notifications run in the caller.
+ *
+ * Return: 0, a negative error, or the first nonzero return of fn.
+ */
+int amdgpu_gem_vram_ranges(struct drm_gem_object *gobj,
+			   int (*fn)(void *arg, u64 offset, u64 size),
+			   void *arg)
+{
+	struct amdgpu_device *adev = drm_to_adev(gobj->dev);
+	struct amdgpu_res_cursor cursor;
+	struct amdgpu_bo *bo;
+	int r;
+
+	if (adev->gmc.aper_base != pci_resource_start(adev->pdev, 0) ||
+	    gobj->funcs != &amdgpu_gem_object_funcs)
+		return -EINVAL;
+	dma_resv_assert_held(gobj->resv);
+	gem_to_amdgpu_bo(gobj)->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+	r = amdgpu_gem_place(gobj, AMDGPU_GEM_DOMAIN_VRAM, &bo);
+	if (r)
+		return r;
+	if (bo->tbo.resource->mem_type != TTM_PL_VRAM)
+		return -EINVAL;
+
+	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &cursor);
+	while (cursor.remaining) {
+		if (cursor.start + cursor.size > adev->gmc.visible_vram_size)
+			return -EINVAL;
+		r = fn(arg, cursor.start, cursor.size);
+		if (r)
+			return r;
+		amdgpu_res_next(&cursor, cursor.size);
+	}
 	return 0;
 }
 
@@ -481,6 +550,25 @@ int amdgpu_gem_pin_gtt(struct drm_gem_object *gobj)
 {
 	dma_resv_assert_held(gobj->resv);
 	return amdgpu_bo_pin(gem_to_amdgpu_bo(gobj), AMDGPU_GEM_DOMAIN_GTT);
+}
+
+/**
+ * amdgpu_gem_pin_placed - pin a reserved BO in the domain where it is placed
+ * @gobj: GEM object of the BO
+ *
+ * The BO stays pinned for its lifetime, which keeps the pages or VRAM that
+ * amdgpu_gem_gtt_pages or amdgpu_gem_vram_ranges returned if the BO has not
+ * moved since.
+ *
+ * Return: 0 or a negative error.
+ */
+int amdgpu_gem_pin_placed(struct drm_gem_object *gobj)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(gobj);
+
+	dma_resv_assert_held(gobj->resv);
+	return amdgpu_bo_pin(bo,
+			     amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type));
 }
 
 /*
