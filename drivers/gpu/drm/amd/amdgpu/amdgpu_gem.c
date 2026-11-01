@@ -408,13 +408,23 @@ const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
  * object and stay valid until the BO moves, which calls the BO's move
  * notification first. A BO of user memory or of another device is refused,
  * and so is a discardable BO, whose eviction frees its pages without a move.
+ * BOs that share the reservation may be evicted to make room, and their move
+ * notifications run in the caller.
  *
  * Return: 0 or a negative error.
  */
 int amdgpu_gem_gtt_pages(struct drm_gem_object *gobj, struct page ***pages,
 			 unsigned long *npages)
 {
-	struct ttm_operation_ctx ctx = { .interruptible = false };
+	/*
+	 * The BOs that share the reservation, such as the per-VM BOs of the
+	 * BO's VM, may be evicted to make room.
+	 */
+	struct ttm_operation_ctx ctx = {
+		.interruptible = false,
+		.resv = gobj->resv,
+		.allow_res_evict = true,
+	};
 	struct amdgpu_bo *bo;
 	int r;
 
