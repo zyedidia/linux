@@ -39,7 +39,7 @@ config VDUSE_GUEST_NET
 
 config VDUSE_GUEST_GPU
 	bool "VDUSE virtio-gpu backend"
-	depends on VDUSE_GUEST && DRM && MMU
+	depends on VDUSE_GUEST && DRM_AMDGPU=y && MMU
 	default y
 	help
 	  Export an amdgpu render node of the guest to the host as a
