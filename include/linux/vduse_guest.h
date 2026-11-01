@@ -10,6 +10,7 @@ struct page;
 struct seq_file;
 struct vduse_guest_dev;
 struct vduse_guest_host;
+struct vduse_guest_msg;
 
 /* A shared memory region of a device, a nonzero multiple of the page size. */
 struct vduse_guest_shm {
@@ -49,7 +50,10 @@ struct vduse_guest_config {
  * when the host's driver sets DRIVER_OK, and stop when it resets the
  * device. After stop returns, the backend makes no more calls on the queues
  * until the next start. Kick can run in interrupt context. Show, if set,
- * prints the backend's counters into /proc/vduse_guest.
+ * prints the backend's counters into /proc/vduse_guest. Shm_fault, if set,
+ * takes a fault request on a shared memory region, which the backend answers
+ * later with vduse_guest_shm_fault_done() from a context that can sleep.
+ * Without it, fault requests are refused.
  */
 struct vduse_guest_backend_ops {
 	const char *type;
@@ -60,6 +64,7 @@ struct vduse_guest_backend_ops {
 	void (*stop)(void *priv);
 	void (*kick)(void *priv, unsigned int index);
 	void (*show)(void *priv, struct seq_file *m);
+	void (*shm_fault)(void *priv, const struct vduse_guest_msg *msg);
 };
 
 extern const struct vduse_guest_backend_ops vduse_guest_blk_ops;
@@ -99,6 +104,8 @@ int vduse_guest_shm_map(struct vduse_guest_dev *dev, u8 id,
 			unsigned int nr);
 int vduse_guest_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
 			  u64 size);
+void vduse_guest_shm_fault_done(struct vduse_guest_dev *dev,
+				const struct vduse_guest_msg *msg, bool ok);
 
 enum {
 	VDUSE_GUEST_MSG_GET_VQ_STATE,

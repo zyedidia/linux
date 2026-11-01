@@ -399,63 +399,6 @@ const struct drm_gem_object_funcs amdgpu_gem_object_funcs = {
 };
 
 /**
- * amdgpu_gem_pin_gtt_pages - pin a BO in GTT and get its pages
- * @gobj: GEM object of a BO that may be placed in GTT
- * @pages: returns the BO's pages, valid until the BO is unpinned
- * @npages: returns the number of pages
- *
- * The pages belong to the BO's TTM object. A BO of user memory or of another
- * device is refused.
- *
- * Return: 0 or a negative error.
- */
-int amdgpu_gem_pin_gtt_pages(struct drm_gem_object *gobj, struct page ***pages,
-			     unsigned long *npages)
-{
-	struct amdgpu_bo *bo;
-	int r;
-
-	if (gobj->funcs != &amdgpu_gem_object_funcs || drm_gem_is_imported(gobj))
-		return -EINVAL;
-	bo = gem_to_amdgpu_bo(gobj);
-	if (!(bo->preferred_domains & AMDGPU_GEM_DOMAIN_GTT))
-		return -EINVAL;
-
-	r = amdgpu_bo_reserve(bo, false);
-	if (r)
-		return r;
-	if (amdgpu_ttm_tt_get_usermm(bo->tbo.ttm)) {
-		amdgpu_bo_unreserve(bo);
-		return -EINVAL;
-	}
-	r = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_GTT);
-	if (!r && (bo->tbo.resource->mem_type != TTM_PL_TT || !bo->tbo.ttm ||
-		   !ttm_tt_is_populated(bo->tbo.ttm))) {
-		amdgpu_bo_unpin(bo);
-		r = -EINVAL;
-	}
-	if (!r) {
-		*pages = bo->tbo.ttm->pages;
-		*npages = bo->tbo.ttm->num_pages;
-	}
-	amdgpu_bo_unreserve(bo);
-	return r;
-}
-
-/**
- * amdgpu_gem_unpin_gtt_pages - unpin a BO that amdgpu_gem_pin_gtt_pages pinned
- * @gobj: GEM object of the BO
- */
-void amdgpu_gem_unpin_gtt_pages(struct drm_gem_object *gobj)
-{
-	struct amdgpu_bo *bo = gem_to_amdgpu_bo(gobj);
-
-	amdgpu_bo_reserve(bo, true);
-	amdgpu_bo_unpin(bo);
-	amdgpu_bo_unreserve(bo);
-}
-
-/**
  * amdgpu_gem_gtt_pages - place a reserved BO in GTT and get its pages
  * @gobj: GEM object of a BO that may be placed in GTT
  * @pages: returns the BO's pages

@@ -4,6 +4,8 @@
 
 #include <linux/kthread.h>
 #include <linux/list.h>
+#include <linux/maple_tree.h>
+#include <linux/rwsem.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/vduse_guest.h>
@@ -98,13 +100,17 @@ static_assert(sizeof(struct vduse_guest_gpu_shmem) == 88);
 /*
  * A blob resource, which belongs to the device rather than to the context
  * that created it. Blob 0, a context's shared memory buffer, owns its pages
- * and maps them at vaddr. Any other blob holds a reference to its BO, whose
- * pages are pinned while it is mapped. A blob is mapped into the
- * host-visible region at map_offset while mapped is set. If an unmap fails,
- * the host may still map the pages, so leaked keeps them for the device's
- * lifetime.
+ * and maps them at vaddr. Any other blob holds a reference to its BO. A blob
+ * is placed in the host-visible region at map_offset while mapped is set.
+ * Blob 0's pages stay mapped meanwhile. A BO's pages are mapped while
+ * present is set, which a move of the BO clears and a fault request sets
+ * again, and the BO's reservation protects mapped and present. If an unmap
+ * fails, the host may still map the pages, so leaked keeps them, and the
+ * BO's reference, for the device's lifetime. A leaked BO is pinned, unless
+ * the unmap failed in a move, which frees or replaces its pages anyway.
  */
 struct vduse_guest_gpu_res {
+	struct vduse_guest_gpu *gpu;
 	u32 id;
 	u32 blob_flags;
 	u64 size;
@@ -115,6 +121,7 @@ struct vduse_guest_gpu_res {
 	u32 bo_domains;
 	u64 bo_flags;
 	bool mapped;
+	bool present;
 	bool leaked;
 	u64 map_offset;
 };
@@ -147,13 +154,18 @@ struct vduse_guest_gpu_ctx {
 /*
  * The number of commands answered with an error is in invalid_commands, and
  * the numbers of contexts and resources that exist are in contexts and
- * resources.
+ * resources. The number of times that a mapped BO moved and was unmapped is
+ * in moves, and the numbers of fault requests answered with a mapping and
+ * refused are in faults and faults_refused.
  */
 struct vduse_guest_gpu_stats {
 	atomic64_t commands;
 	atomic64_t invalid_commands;
 	atomic_t contexts;
 	atomic_t resources;
+	atomic64_t moves;
+	atomic64_t faults;
+	atomic64_t faults_refused;
 };
 
 struct vduse_guest_gpu {
@@ -180,6 +192,20 @@ struct vduse_guest_gpu {
 	spinlock_t fence_lock;
 	struct list_head waiting;
 	struct list_head signaled;
+
+	/*
+	 * Fault requests wait in faults, under fault_lock, for the fault work
+	 * on a worker of their own. The fault work finds a BO's resource by
+	 * its region offset in fault_index, while it holds fault_sem for
+	 * reading, and the worker that runs commands holds fault_sem for
+	 * writing when it adds or removes a resource there.
+	 */
+	struct kthread_worker *fault_worker;
+	struct kthread_work fault_work;
+	spinlock_t fault_lock;
+	struct list_head faults;
+	struct rw_semaphore fault_sem;
+	struct maple_tree fault_index;
 
 	/*
 	 * The worker's own state, which the works use without a lock. The
@@ -227,7 +253,10 @@ int vduse_guest_gpu_amdgpu_attach(struct vduse_guest_gpu_ctx *ctx,
 				  struct vduse_guest_gpu_res *res);
 void vduse_guest_gpu_amdgpu_detach(struct vduse_guest_gpu_ctx *ctx,
 				   u32 res_id);
+int vduse_guest_gpu_amdgpu_pages(struct vduse_guest_gpu_res *res,
+				 struct page ***pages);
+void vduse_guest_gpu_amdgpu_set_notify(struct vduse_guest_gpu_res *res,
+				       void (*fn)(void *priv));
 int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res);
-void vduse_guest_gpu_amdgpu_unpin(struct vduse_guest_gpu_res *res);
 
 #endif

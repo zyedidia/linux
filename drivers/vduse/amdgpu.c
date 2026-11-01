@@ -767,36 +767,37 @@ void vduse_guest_gpu_amdgpu_detach(struct vduse_guest_gpu_ctx *ctx,
 }
 
 /*
- * Pin a mappable BO's pages in GTT. A BO without CPU access cannot be
- * mapped, as natively.
+ * Place a mappable BO in GTT and get its pages, with the BO reserved. A BO
+ * without CPU access cannot be mapped, as natively. The pages stay valid
+ * until the BO moves, which calls its move notification first.
  */
-int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res)
+int vduse_guest_gpu_amdgpu_pages(struct vduse_guest_gpu_res *res,
+				 struct page ***pages)
 {
 	unsigned long npages;
-	struct page **pages;
 	int err;
 
 	if (!res->obj || res->bo_domains != AMDGPU_GEM_DOMAIN_GTT ||
 	    (res->bo_flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS))
 		return -EINVAL;
 
-	err = amdgpu_gem_pin_gtt_pages(res->obj, &pages, &npages);
+	err = amdgpu_gem_gtt_pages(res->obj, pages, &npages);
 	if (err)
 		return err;
-	if (npages < res->size >> PAGE_SHIFT) {
-		amdgpu_gem_unpin_gtt_pages(res->obj);
-		return -EINVAL;
-	}
-	res->pages = pages;
-	res->nr_pages = res->size >> PAGE_SHIFT;
-	return 0;
+	return npages < res->size >> PAGE_SHIFT ? -EINVAL : 0;
 }
 
-void vduse_guest_gpu_amdgpu_unpin(struct vduse_guest_gpu_res *res)
+/* Set the function that a move of the reserved BO calls first, or NULL. */
+void vduse_guest_gpu_amdgpu_set_notify(struct vduse_guest_gpu_res *res,
+				       void (*fn)(void *priv))
 {
-	amdgpu_gem_unpin_gtt_pages(res->obj);
-	res->pages = NULL;
-	res->nr_pages = 0;
+	amdgpu_gem_set_move_notify(res->obj, fn, res);
+}
+
+/* Pin the reserved BO in GTT for its lifetime. */
+int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res)
+{
+	return amdgpu_gem_pin_gtt(res->obj);
 }
 
 /* Return a resource's GEM handle in the context, or 0. */

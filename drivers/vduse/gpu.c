@@ -4,6 +4,7 @@
 
 #include <drm/drm_gem.h>
 #include <linux/dma-fence.h>
+#include <linux/dma-resv.h>
 #include <linux/err.h>
 #include <linux/kthread.h>
 #include <linux/mm.h>
@@ -212,9 +213,157 @@ static u32 vduse_guest_gpu_ctx_destroy(struct vduse_guest_gpu *gpu,
 }
 
 /*
- * Unmap a resource from the region, and unpin a BO's pages. Once the unmap
- * returns, the host maps none of the pages. If the unmap fails, the host may
- * still map them, so the resource leaks them.
+ * Map pages into the region at offset, one range for each run of contiguous
+ * pages. VDUSE takes ranges of at most 4 GiB and at most
+ * VDUSE_GUEST_GPU_MAP_BATCH of them in a call, so a run is split at 4 GiB
+ * and the ranges go in batches. If a batch fails, the batches that were
+ * mapped are unmapped again, and stuck tells whether that unmap failed,
+ * so that the host may still map the pages. The host maps guest memory
+ * write-back, which matches the GTT BOs of a guest that maps no GTT page
+ * write-combined.
+ */
+static int vduse_guest_gpu_map_pages(struct vduse_guest_gpu *gpu, u64 offset,
+				     struct page **pages,
+				     unsigned long nr_pages, bool *stuck)
+{
+	struct vduse_guest_shm_range *ranges;
+	unsigned long i, done, n, nr = 0;
+	u64 end = offset;
+	int err = 0;
+
+	ranges = kvcalloc(nr_pages, sizeof(*ranges), GFP_KERNEL);
+	if (!ranges)
+		return -ENOMEM;
+	for (i = 0; i < nr_pages; i++) {
+		phys_addr_t phys = page_to_phys(pages[i]);
+
+		if (nr && ranges[nr - 1].phys + ranges[nr - 1].size == phys &&
+		    ranges[nr - 1].size < SZ_4G) {
+			ranges[nr - 1].size += PAGE_SIZE;
+			continue;
+		}
+		ranges[nr].offset = offset + ((u64)i << PAGE_SHIFT);
+		ranges[nr].size = PAGE_SIZE;
+		ranges[nr].phys = phys;
+		nr++;
+	}
+
+	for (done = 0; done < nr; done += n) {
+		n = min(nr - done, VDUSE_GUEST_GPU_MAP_BATCH);
+		err = vduse_guest_shm_map(gpu->dev,
+					  VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+					  ranges + done, n);
+		if (err)
+			break;
+		end = ranges[done + n - 1].offset + ranges[done + n - 1].size;
+	}
+	kvfree(ranges);
+
+	/* The ranges cover the pages in order, so the mapped batches end at end. */
+	*stuck = err && end > offset &&
+		 vduse_guest_shm_unmap(gpu->dev,
+				       VIRTIO_GPU_SHM_ID_HOST_VISIBLE, offset,
+				       end - offset);
+	return err;
+}
+
+/*
+ * Mark a reserved BO leaked and pin it, so that its pages stay with it while
+ * the host may still map them.
+ */
+static void vduse_guest_gpu_bo_leak(struct vduse_guest_gpu_res *res)
+{
+	int err;
+
+	res->leaked = true;
+	err = vduse_guest_gpu_amdgpu_pin(res);
+	if (err)
+		pr_err("%s: cannot pin the leaked BO of resource %u: %d\n",
+		       vduse_guest_name(res->gpu->dev), res->id, err);
+}
+
+/* Map a reserved BO's pages in GTT at its placement in the region. */
+static int vduse_guest_gpu_bo_map(struct vduse_guest_gpu_res *res)
+{
+	struct page **pages;
+	bool stuck = false;
+	int err;
+
+	err = vduse_guest_gpu_amdgpu_pages(res, &pages);
+	if (!err)
+		err = vduse_guest_gpu_map_pages(res->gpu, res->map_offset, pages,
+						res->size >> PAGE_SHIFT,
+						&stuck);
+	if (stuck)
+		vduse_guest_gpu_bo_leak(res);
+	if (!err)
+		res->present = true;
+	return err;
+}
+
+/*
+ * Unmap a reserved BO's pages. Once the unmap returns, the host maps none
+ * of them. VDUSE fails the unmap of a range that the backend mapped only
+ * through a bug, and the host may then still map pages that TTM reuses.
+ */
+static void vduse_guest_gpu_bo_unmap(struct vduse_guest_gpu_res *res)
+{
+	int err;
+
+	if (!res->present)
+		return;
+	err = vduse_guest_shm_unmap(res->gpu->dev,
+				    VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+				    res->map_offset, res->size);
+	res->present = false;
+	if (err) {
+		pr_err("%s: cannot unmap the BO of resource %u: %d\n",
+		       vduse_guest_name(res->gpu->dev), res->id, err);
+		res->leaked = true;
+	}
+}
+
+/*
+ * Called with the BO reserved before it moves, which frees its pages or
+ * gives it others. A fault request maps it again.
+ */
+static void vduse_guest_gpu_bo_moved(void *priv)
+{
+	struct vduse_guest_gpu_res *res = priv;
+
+	if (!res->present)
+		return;
+	vduse_guest_gpu_bo_unmap(res);
+	atomic64_inc(&res->gpu->stats.moves);
+}
+
+/* Add or remove a BO's placement in the index that fault requests use. */
+static int vduse_guest_gpu_index_add(struct vduse_guest_gpu *gpu,
+				     struct vduse_guest_gpu_res *res)
+{
+	unsigned long first = res->map_offset >> PAGE_SHIFT;
+	int err;
+
+	down_write(&gpu->fault_sem);
+	err = mtree_insert_range(&gpu->fault_index, first,
+				 first + (res->size >> PAGE_SHIFT) - 1, res,
+				 GFP_KERNEL);
+	up_write(&gpu->fault_sem);
+	return err;
+}
+
+static void vduse_guest_gpu_index_del(struct vduse_guest_gpu *gpu,
+				      struct vduse_guest_gpu_res *res)
+{
+	down_write(&gpu->fault_sem);
+	mtree_erase(&gpu->fault_index, res->map_offset >> PAGE_SHIFT);
+	up_write(&gpu->fault_sem);
+}
+
+/*
+ * Unmap a resource from the region. Once the unmap returns, the host maps
+ * none of its pages. If the unmap fails, the host may still map them, so
+ * the resource leaks them.
  */
 static void vduse_guest_gpu_res_unmap(struct vduse_guest_gpu *gpu,
 				      struct vduse_guest_gpu_res *res)
@@ -223,6 +372,21 @@ static void vduse_guest_gpu_res_unmap(struct vduse_guest_gpu *gpu,
 
 	if (!res->mapped)
 		return;
+
+	if (res->obj) {
+		vduse_guest_gpu_index_del(gpu, res);
+		dma_resv_lock(res->obj->resv, NULL);
+		if (res->present) {
+			vduse_guest_gpu_bo_unmap(res);
+			if (res->leaked)
+				vduse_guest_gpu_bo_leak(res);
+		}
+		vduse_guest_gpu_amdgpu_set_notify(res, NULL);
+		res->mapped = false;
+		dma_resv_unlock(res->obj->resv);
+		return;
+	}
+
 	err = vduse_guest_shm_unmap(gpu->dev, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
 				    res->map_offset, res->size);
 	res->mapped = false;
@@ -230,10 +394,7 @@ static void vduse_guest_gpu_res_unmap(struct vduse_guest_gpu *gpu,
 		pr_warn("%s: cannot unmap resource %u: %d\n",
 			vduse_guest_name(gpu->dev), res->id, err);
 		res->leaked = true;
-		return;
 	}
-	if (res->obj)
-		vduse_guest_gpu_amdgpu_unpin(res);
 }
 
 /*
@@ -333,6 +494,7 @@ static u32 vduse_guest_gpu_create_blob(struct vduse_guest_gpu *gpu,
 	res = kzalloc_obj(*res);
 	if (!res)
 		return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+	res->gpu = gpu;
 	res->id = id;
 	res->blob_flags = le32_to_cpu(cmd->blob_flags);
 	res->size = size;
@@ -358,24 +520,19 @@ static u32 vduse_guest_gpu_create_blob(struct vduse_guest_gpu *gpu,
 }
 
 /*
- * Map a mappable blob at the offset that the host's driver chose, one range
- * for each run of contiguous pages. VDUSE takes ranges of at most 4 GiB and
- * at most VDUSE_GUEST_GPU_MAP_BATCH of them in a call, so a run is split at
- * 4 GiB and the ranges go in batches. If a batch fails, the batches that
- * were mapped are unmapped again. A BO's pages stay pinned while it is
- * mapped. The host maps guest memory write-back, which matches the GTT BOs
- * of a guest that maps no GTT page write-combined.
+ * Place a mappable blob at the offset that the host's driver chose and map
+ * its pages. A BO is added to the index of fault requests before it is
+ * reserved, since a fault request holds fault_sem while it reserves the BO.
+ * Its moves unmap it again until it is unmapped.
  */
 static u32 vduse_guest_gpu_map_blob(struct vduse_guest_gpu *gpu,
 				    const struct virtio_gpu_resource_map_blob *cmd,
 				    struct virtio_gpu_resp_map_info *info)
 {
 	u64 offset = le64_to_cpu(cmd->offset);
-	struct vduse_guest_shm_range *ranges;
 	struct vduse_guest_gpu_res *res;
-	unsigned long i, done, n, nr = 0;
-	u64 end = offset;
-	int err = 0;
+	bool stuck = false;
+	int err;
 
 	res = xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id));
 	if (!res)
@@ -383,67 +540,37 @@ static u32 vduse_guest_gpu_map_blob(struct vduse_guest_gpu *gpu,
 	if (!(res->blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE) ||
 	    res->mapped || res->leaked || !PAGE_ALIGNED(offset))
 		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
-	if (res->obj && vduse_guest_gpu_amdgpu_pin(res))
-		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+	res->map_offset = offset;
 
-	ranges = kvcalloc(res->nr_pages, sizeof(*ranges), GFP_KERNEL);
-	if (!ranges) {
-		err = -ENOMEM;
-		goto unpin;
-	}
-	for (i = 0; i < res->nr_pages; i++) {
-		phys_addr_t phys = page_to_phys(res->pages[i]);
-
-		if (nr && ranges[nr - 1].phys + ranges[nr - 1].size == phys &&
-		    ranges[nr - 1].size < SZ_4G) {
-			ranges[nr - 1].size += PAGE_SIZE;
-			continue;
-		}
-		ranges[nr].offset = offset + ((u64)i << PAGE_SHIFT);
-		ranges[nr].size = PAGE_SIZE;
-		ranges[nr].phys = phys;
-		nr++;
-	}
-
-	for (done = 0; done < nr; done += n) {
-		n = min(nr - done, VDUSE_GUEST_GPU_MAP_BATCH);
-		err = vduse_guest_shm_map(gpu->dev,
-					  VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
-					  ranges + done, n);
+	if (res->obj) {
+		err = vduse_guest_gpu_index_add(gpu, res);
 		if (err)
-			break;
-		end = ranges[done + n - 1].offset + ranges[done + n - 1].size;
-	}
-	kvfree(ranges);
-	/*
-	 * The ranges cover the blob in order, so the mapped batches end at end.
-	 * If their unmap fails, the host may still map the pages, so they are
-	 * kept.
-	 */
-	if (err && end > offset) {
-		int uerr = vduse_guest_shm_unmap(gpu->dev,
-						 VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
-						 offset, end - offset);
-
-		if (uerr) {
-			pr_warn("%s: cannot unmap resource %u: %d\n",
-				vduse_guest_name(gpu->dev), res->id, uerr);
-			res->leaked = true;
-			return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+			goto fail;
+		dma_resv_lock(res->obj->resv, NULL);
+		err = vduse_guest_gpu_bo_map(res);
+		if (!err) {
+			res->mapped = true;
+			vduse_guest_gpu_amdgpu_set_notify(res,
+							  vduse_guest_gpu_bo_moved);
 		}
+		dma_resv_unlock(res->obj->resv);
+		if (err)
+			vduse_guest_gpu_index_del(gpu, res);
+	} else {
+		err = vduse_guest_gpu_map_pages(gpu, offset, res->pages,
+						res->nr_pages, &stuck);
+		if (stuck)
+			res->leaked = true;
+		if (!err)
+			res->mapped = true;
 	}
 	if (err)
-		goto unpin;
-
-	res->mapped = true;
-	res->map_offset = offset;
+		goto fail;
 
 	info->map_info = cpu_to_le32(VIRTIO_GPU_MAP_CACHE_CACHED);
 	return VIRTIO_GPU_RESP_OK_MAP_INFO;
 
-unpin:
-	if (res->obj)
-		vduse_guest_gpu_amdgpu_unpin(res);
+fail:
 	return err == -ENOMEM ? VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY :
 				VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
 }
@@ -890,9 +1017,92 @@ static void vduse_guest_gpu_drop_fences(struct vduse_guest_gpu *gpu)
 		vduse_guest_gpu_fence_free(f);
 }
 
+/* A fault request that waits for the fault work. */
+struct vduse_guest_gpu_fault {
+	struct list_head list;
+	struct vduse_guest_msg msg;
+};
+
 /*
- * A reset drops the commands that wait for fences, unmaps and frees every
- * resource and destroys every context.
+ * Map the BO placed at a fault request's offset at its pages in GTT, unless
+ * it is no longer placed there or the device has stopped, and return
+ * whether it is mapped.
+ */
+static bool vduse_guest_gpu_fault_map(struct vduse_guest_gpu *gpu,
+				      const struct vduse_guest_msg *msg)
+{
+	struct vduse_guest_gpu_res *res;
+	bool ok = false;
+
+	if (msg->index != VIRTIO_GPU_SHM_ID_HOST_VISIBLE ||
+	    !vduse_guest_gpu_running(gpu))
+		return false;
+
+	down_read(&gpu->fault_sem);
+	res = mtree_load(&gpu->fault_index, msg->start >> PAGE_SHIFT);
+	if (res) {
+		dma_resv_lock(res->obj->resv, NULL);
+		if (res->mapped && !res->leaked)
+			ok = res->present || !vduse_guest_gpu_bo_map(res);
+		dma_resv_unlock(res->obj->resv);
+	}
+	up_read(&gpu->fault_sem);
+	return ok;
+}
+
+static void vduse_guest_gpu_fault_work(struct kthread_work *work)
+{
+	struct vduse_guest_gpu *gpu =
+		container_of(work, struct vduse_guest_gpu, fault_work);
+	struct vduse_guest_gpu_fault *f;
+	bool ok;
+
+	for (;;) {
+		spin_lock(&gpu->fault_lock);
+		f = list_first_entry_or_null(&gpu->faults,
+					     struct vduse_guest_gpu_fault, list);
+		if (f)
+			list_del(&f->list);
+		spin_unlock(&gpu->fault_lock);
+		if (!f)
+			break;
+
+		ok = vduse_guest_gpu_fault_map(gpu, &f->msg);
+		atomic64_inc(ok ? &gpu->stats.faults :
+				  &gpu->stats.faults_refused);
+		vduse_guest_shm_fault_done(gpu->dev, &f->msg, ok);
+		kfree(f);
+		cond_resched();
+	}
+}
+
+/*
+ * Take a fault request on the host-visible region, which the fault work
+ * answers.
+ */
+static void vduse_guest_gpu_shm_fault(void *priv,
+				      const struct vduse_guest_msg *msg)
+{
+	struct vduse_guest_gpu *gpu = priv;
+	struct vduse_guest_gpu_fault *f;
+
+	f = kmalloc_obj(*f);
+	if (!f) {
+		atomic64_inc(&gpu->stats.faults_refused);
+		vduse_guest_shm_fault_done(gpu->dev, msg, false);
+		return;
+	}
+	f->msg = *msg;
+	spin_lock(&gpu->fault_lock);
+	list_add_tail(&f->list, &gpu->faults);
+	spin_unlock(&gpu->fault_lock);
+	kthread_queue_work(gpu->fault_worker, &gpu->fault_work);
+}
+
+/*
+ * A reset drops the commands that wait for fences, refuses the fault
+ * requests that wait, unmaps and frees every resource and destroys every
+ * context.
  */
 static void vduse_guest_gpu_stop(void *priv)
 {
@@ -905,6 +1115,7 @@ static void vduse_guest_gpu_stop(void *priv)
 	gpu->running = false;
 	spin_unlock_irq(&gpu->lock);
 	kthread_flush_worker(gpu->worker);
+	kthread_flush_worker(gpu->fault_worker);
 	vduse_guest_gpu_drop_fences(gpu);
 
 	xa_for_each(&gpu->resources, id, res) {
@@ -950,6 +1161,11 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	INIT_LIST_HEAD(&gpu->signaled);
 	xa_init(&gpu->contexts);
 	xa_init(&gpu->resources);
+	spin_lock_init(&gpu->fault_lock);
+	INIT_LIST_HEAD(&gpu->faults);
+	init_rwsem(&gpu->fault_sem);
+	mt_init(&gpu->fault_index);
+	kthread_init_work(&gpu->fault_work, vduse_guest_gpu_fault_work);
 	kthread_init_work(&gpu->ctrl_work, vduse_guest_gpu_ctrl_work);
 	kthread_init_work(&gpu->cursor_work, vduse_guest_gpu_cursor_work);
 	kthread_init_work(&gpu->fence_work, vduse_guest_gpu_fence_work);
@@ -963,6 +1179,12 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	gpu->worker = kthread_run_worker(0, "vduse-gpu-%s", name);
 	if (IS_ERR(gpu->worker)) {
 		err = PTR_ERR(gpu->worker);
+		goto free;
+	}
+	gpu->fault_worker = kthread_run_worker(0, "vduse-gpufault-%s", name);
+	if (IS_ERR(gpu->fault_worker)) {
+		err = PTR_ERR(gpu->fault_worker);
+		kthread_destroy_worker(gpu->worker);
 		goto free;
 	}
 
@@ -1009,9 +1231,11 @@ static void vduse_guest_gpu_release(void *priv)
 {
 	struct vduse_guest_gpu *gpu = priv;
 
+	kthread_destroy_worker(gpu->fault_worker);
 	kthread_destroy_worker(gpu->worker);
 	if (gpu->mm)
 		mmput(gpu->mm);
+	mtree_destroy(&gpu->fault_index);
 	kfree(gpu->render_path);
 	kfree(gpu);
 }
@@ -1026,6 +1250,10 @@ static void vduse_guest_gpu_show(void *priv, struct seq_file *m)
 		   atomic64_read(&s->invalid_commands));
 	seq_printf(m, "  %-18s %d\n", "contexts", atomic_read(&s->contexts));
 	seq_printf(m, "  %-18s %d\n", "resources", atomic_read(&s->resources));
+	seq_printf(m, "  %-18s %lld\n", "moves", atomic64_read(&s->moves));
+	seq_printf(m, "  %-18s %lld\n", "faults", atomic64_read(&s->faults));
+	seq_printf(m, "  %-18s %lld\n", "faults_refused",
+		   atomic64_read(&s->faults_refused));
 }
 
 const struct vduse_guest_backend_ops vduse_guest_gpu_ops = {
@@ -1036,4 +1264,5 @@ const struct vduse_guest_backend_ops vduse_guest_gpu_ops = {
 	.stop = vduse_guest_gpu_stop,
 	.kick = vduse_guest_gpu_kick,
 	.show = vduse_guest_gpu_show,
+	.shm_fault = vduse_guest_gpu_shm_fault,
 };

@@ -2,6 +2,7 @@
 
 #define pr_fmt(fmt) "vduse-guest: " fmt
 
+#include <linux/atomic.h>
 #include <linux/cpumask.h>
 #include <linux/module.h>
 #include <linux/kstrtox.h>
@@ -18,6 +19,7 @@
 #include <linux/sort.h>
 #include <linux/string.h>
 #include <linux/vduse_guest.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <uapi/linux/virtio_config.h>
 #include <uapi/linux/virtio_ring.h>
@@ -137,6 +139,12 @@ struct vduse_guest_dev {
 	const struct vduse_guest_host_ops *hops;
 	void *host_data;
 	struct work_struct msg_work;
+	/*
+	 * The fault requests that the backend has taken and not answered,
+	 * which the release waits for before it closes the device.
+	 */
+	atomic_t shm_faults;
+	wait_queue_head_t shm_faults_wq;
 
 	unsigned int num_queues;
 	struct vduse_guest_vq *vqs;
@@ -1034,10 +1042,12 @@ static void vduse_guest_msg_work(struct work_struct *work)
 				vduse_guest_unmap_range(dev, msg.start, msg.last);
 			break;
 		case VDUSE_GUEST_MSG_SHM_FAULT:
-			/*
-			 * The backends map every range of their regions in
-			 * full, so a fault outside them is refused.
-			 */
+			/* A backend that takes fault requests answers them. */
+			if (dev->ops->shm_fault) {
+				atomic_inc(&dev->shm_faults);
+				dev->ops->shm_fault(dev->priv, &msg);
+				continue;
+			}
 			ok = false;
 			break;
 		default:
@@ -1053,6 +1063,18 @@ static void vduse_guest_msg_work(struct work_struct *work)
 
 	if (err != -EAGAIN)
 		pr_warn("%s: cannot read a message: %d\n", dev->name, err);
+}
+
+void vduse_guest_shm_fault_done(struct vduse_guest_dev *dev,
+				const struct vduse_guest_msg *msg, bool ok)
+{
+	int err = dev->hops->reply(dev, msg, ok, 0);
+
+	if (err)
+		pr_warn("%s: cannot answer a fault request: %d\n", dev->name,
+			err);
+	if (atomic_dec_and_test(&dev->shm_faults))
+		wake_up(&dev->shm_faults_wq);
 }
 
 void vduse_guest_msg_event(struct vduse_guest_dev *dev)
@@ -1447,6 +1469,7 @@ static void __init vduse_guest_add(const char *arg)
 	mutex_init(&dev->map_lock);
 	mutex_init(&dev->umem_lock);
 	INIT_WORK(&dev->msg_work, vduse_guest_msg_work);
+	init_waitqueue_head(&dev->shm_faults_wq);
 
 	dev->type = kstrdup(arg, GFP_KERNEL);
 	if (!dev->type)
@@ -1652,6 +1675,7 @@ static void vduse_guest_release(struct vduse_guest_dev *dev)
 
 	if (dev->running)
 		vduse_guest_stop(dev);
+	wait_event(dev->shm_faults_wq, !atomic_read(&dev->shm_faults));
 	vduse_guest_unmap_range(dev, 0, U64_MAX);
 	vduse_guest_close_vqs(dev, dev->num_queues);
 	dev->hops->close(dev);
