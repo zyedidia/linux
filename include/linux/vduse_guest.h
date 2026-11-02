@@ -105,6 +105,13 @@ bool vduse_guest_notify_enable(struct vduse_guest_dev *dev,
 bool vduse_guest_poll(struct vduse_guest_dev *dev, unsigned int index);
 
 /*
+ * Copy len bytes at a device address into buf, from the bounce region or the
+ * host's coherent allocations. An address outside them fails with -EFAULT.
+ */
+int vduse_guest_read(struct vduse_guest_dev *dev, u64 addr, void *buf,
+		     size_t len);
+
+/*
  * Map ranges of guest memory into a shared memory region, all or none, or
  * unmap the ranges within a range. When unmap returns, the host's mappings
  * of the range are gone, and the memory may be reused.

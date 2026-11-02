@@ -437,16 +437,13 @@ static void vduse_guest_register_umem(struct vduse_guest_dev *dev)
 }
 
 /*
- * Give vringh the region that holds a buffer or an indirect table. The host
- * maps the bounce region and coherent allocations for both reading and
- * writing, so a range covers a whole region.
+ * Find the region that holds a device address. The host maps the bounce
+ * region and coherent allocations for both reading and writing, so a range
+ * covers a whole region.
  */
-static bool vduse_guest_getrange(struct vringh *vrh, u64 addr,
-				 struct vringh_range *range)
+static bool vduse_guest_range(struct vduse_guest_dev *dev, u64 addr,
+			      struct vringh_range *range)
 {
-	struct vduse_guest_vq *vq = container_of(vrh, struct vduse_guest_vq,
-						 vrh);
-	struct vduse_guest_dev *dev = vq->dev;
 	struct vduse_guest_mapping *m;
 
 	if (smp_load_acquire(&dev->umem_wanted))
@@ -472,6 +469,34 @@ static bool vduse_guest_getrange(struct vringh *vrh, u64 addr,
 	range->end_incl = m->region.last;
 	range->offset = (unsigned long)m->region.addr - m->region.start;
 	return true;
+}
+
+/* Give vringh the region that holds a buffer or an indirect table. */
+static bool vduse_guest_getrange(struct vringh *vrh, u64 addr,
+				 struct vringh_range *range)
+{
+	struct vduse_guest_vq *vq = container_of(vrh, struct vduse_guest_vq,
+						 vrh);
+
+	return vduse_guest_range(vq->dev, addr, range);
+}
+
+int vduse_guest_read(struct vduse_guest_dev *dev, u64 addr, void *buf,
+		     size_t len)
+{
+	struct vringh_range range;
+	size_t n;
+
+	while (len) {
+		if (!vduse_guest_range(dev, addr, &range))
+			return -EFAULT;
+		n = min_t(u64, len - 1, range.end_incl - addr) + 1;
+		memcpy(buf, (void *)(unsigned long)(addr + range.offset), n);
+		addr += n;
+		buf += n;
+		len -= n;
+	}
+	return 0;
 }
 
 static void vduse_guest_unmap_range(struct vduse_guest_dev *dev, u64 start,
