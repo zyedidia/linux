@@ -259,6 +259,13 @@ struct virtio_gpu_device {
 	bool has_host_visible;
 	bool has_context_init;
 	bool has_blob_alignment;
+	/*
+	 * With VIRTIO_GPU_F_FLIP_FENCE, the flush fences of each output are on
+	 * the output's own dma-fence context, from flip_fence_context, since
+	 * the device signals them at that output's flips.
+	 */
+	bool has_flip_fence;
+	u64 flip_fence_context;
 	struct virtio_shm_region host_visible_region;
 	struct drm_mm host_visible_mm;
 
@@ -471,6 +478,8 @@ struct drm_plane *virtio_gpu_plane_init(struct virtio_gpu_device *vgdev,
 struct virtio_gpu_fence *virtio_gpu_fence_alloc(struct virtio_gpu_device *vgdev,
 						uint64_t base_fence_ctx,
 						uint32_t ring_idx);
+struct virtio_gpu_fence *virtio_gpu_fence_alloc_on(struct virtio_gpu_device *vgdev,
+						   uint64_t fence_context);
 void virtio_gpu_fence_emit(struct virtio_gpu_device *vgdev,
 			  struct virtio_gpu_ctrl_hdr *cmd_hdr,
 			  struct virtio_gpu_fence *fence);

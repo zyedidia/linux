@@ -208,6 +208,11 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
 		vgdev->has_context_init = true;
 
+	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_FLIP_FENCE)) {
+		vgdev->has_flip_fence = true;
+		vgdev->flip_fence_context =
+			dma_fence_context_alloc(VIRTIO_GPU_MAX_SCANOUTS);
+	}
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_BLOB_ALIGNMENT)) {
 		vgdev->has_blob_alignment = true;
 		virtio_cread_le(vgdev->vdev, struct virtio_gpu_config,

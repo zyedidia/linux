@@ -55,11 +55,10 @@ static const struct dma_fence_ops virtio_gpu_fence_ops = {
 	.signaled            = virtio_gpu_fence_signaled,
 };
 
-struct virtio_gpu_fence *virtio_gpu_fence_alloc(struct virtio_gpu_device *vgdev,
-						uint64_t base_fence_ctx,
-						uint32_t ring_idx)
+static struct virtio_gpu_fence *
+virtio_gpu_fence_init(struct virtio_gpu_device *vgdev, uint64_t fence_context,
+		      uint32_t ring_idx, bool emit_fence_info)
 {
-	uint64_t fence_context = base_fence_ctx + ring_idx;
 	struct virtio_gpu_fence_driver *drv = &vgdev->fence_drv;
 	struct virtio_gpu_fence *fence = kzalloc_obj(struct virtio_gpu_fence);
 
@@ -68,7 +67,7 @@ struct virtio_gpu_fence *virtio_gpu_fence_alloc(struct virtio_gpu_device *vgdev,
 
 	fence->drv = drv;
 	fence->ring_idx = ring_idx;
-	fence->emit_fence_info = !(base_fence_ctx == drv->context);
+	fence->emit_fence_info = emit_fence_info;
 
 	/* This only partially initializes the fence because the seqno is
 	 * unknown yet.  The fence must not be used outside of the driver
@@ -79,6 +78,24 @@ struct virtio_gpu_fence *virtio_gpu_fence_alloc(struct virtio_gpu_device *vgdev,
 		       fence_context, 0);
 
 	return fence;
+}
+
+struct virtio_gpu_fence *virtio_gpu_fence_alloc(struct virtio_gpu_device *vgdev,
+						uint64_t base_fence_ctx,
+						uint32_t ring_idx)
+{
+	return virtio_gpu_fence_init(vgdev, base_fence_ctx + ring_idx, ring_idx,
+				     base_fence_ctx != vgdev->fence_drv.context);
+}
+
+/*
+ * Allocate a fence of the device's global fence ids on a dma-fence context of
+ * its own, which no fence of another context signals when it signals.
+ */
+struct virtio_gpu_fence *virtio_gpu_fence_alloc_on(struct virtio_gpu_device *vgdev,
+						   uint64_t fence_context)
+{
+	return virtio_gpu_fence_init(vgdev, fence_context, 0, false);
 }
 
 void virtio_gpu_fence_emit(struct virtio_gpu_device *vgdev,

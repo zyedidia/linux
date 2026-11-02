@@ -72,6 +72,12 @@
  * must be aligned to that value.
  */
 #define VIRTIO_GPU_F_BLOB_ALIGNMENT      5
+/*
+ * A fenced VIRTIO_GPU_CMD_RESOURCE_FLUSH of a resource that a scanout shows
+ * completes when the resource is on the display. This bit is specific to
+ * invirtio, outside the bits that the virtio-gpu specification assigns.
+ */
+#define VIRTIO_GPU_F_FLIP_FENCE          23
 
 enum virtio_gpu_ctrl_type {
 	VIRTIO_GPU_UNDEFINED = 0,

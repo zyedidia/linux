@@ -353,6 +353,7 @@ static int virtio_gpu_plane_prepare_fb(struct drm_plane *plane,
 	struct virtio_gpu_device *vgdev = dev->dev_private;
 	struct virtio_gpu_framebuffer *vgfb;
 	struct virtio_gpu_plane_state *vgplane_st;
+	struct virtio_gpu_output *output;
 	struct virtio_gpu_object *bo;
 	struct drm_gem_object *obj;
 	int ret;
@@ -366,11 +367,25 @@ static int virtio_gpu_plane_prepare_fb(struct drm_plane *plane,
 
 	drm_gem_plane_helper_prepare_fb(plane, new_state);
 
-	if (!bo || (plane->type == DRM_PLANE_TYPE_PRIMARY && !bo->guest_blob))
+	if (!bo || (plane->type == DRM_PLANE_TYPE_PRIMARY && !bo->guest_blob &&
+		    !(bo->host3d_blob && vgdev->has_flip_fence)))
 		return 0;
 
+	/*
+	 * With VIRTIO_GPU_F_FLIP_FENCE, the flush of a blob on the primary
+	 * plane is fenced on its output's fence context, and the device
+	 * signals the fence when the blob is on the display. Dumb objects are
+	 * fenced for their transfers and imported ones for their flushes.
+	 */
 	obj = new_state->fb->obj[0];
-	if (bo->dumb || drm_gem_is_imported(obj)) {
+	if (plane->type == DRM_PLANE_TYPE_PRIMARY && vgdev->has_flip_fence &&
+	    new_state->crtc) {
+		output = drm_crtc_to_virtio_gpu_output(new_state->crtc);
+		vgplane_st->fence = virtio_gpu_fence_alloc_on(vgdev,
+			vgdev->flip_fence_context + output->index);
+		if (!vgplane_st->fence)
+			return -ENOMEM;
+	} else if (bo->dumb || drm_gem_is_imported(obj)) {
 		vgplane_st->fence = virtio_gpu_fence_alloc(vgdev,
 						     vgdev->fence_drv.context,
 						     0);

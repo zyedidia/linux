@@ -129,9 +129,13 @@ static void virtio_gpu_crtc_atomic_flush(struct drm_crtc *crtc,
 					 struct drm_atomic_commit *state)
 {
 	struct drm_device *dev = crtc->dev;
+	struct virtio_gpu_device *vgdev = dev->dev_private;
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
+	struct drm_plane_state *plane_state =
+		drm_atomic_get_new_plane_state(state, crtc->primary);
 	struct drm_pending_vblank_event *event;
+	struct virtio_gpu_fence *fence = NULL;
 
 	/*
 	 * virtio-gpu can't do modeset and plane update operations
@@ -142,13 +146,25 @@ static void virtio_gpu_crtc_atomic_flush(struct drm_crtc *crtc,
 	if (drm_atomic_crtc_needs_modeset(crtc_state))
 		output->needs_modeset = true;
 
+	/*
+	 * With VIRTIO_GPU_F_FLIP_FENCE, a primary plane whose flush fence
+	 * signaled is on the display, so the flip event goes out at once. A
+	 * fence that was never emitted has no seqno. Otherwise the vblank timer
+	 * sends the event.
+	 */
+	if (vgdev->has_flip_fence && plane_state && plane_state->fb)
+		fence = to_virtio_gpu_plane_state(plane_state)->fence;
+	if (fence && !fence->f.seqno)
+		fence = NULL;
+
 	spin_lock_irq(&dev->event_lock);
 
 	event = crtc_state->event;
 	crtc_state->event = NULL;
 
 	if (event) {
-		if (drm_crtc_vblank_get(crtc) == 0)
+		if ((!fence || !dma_fence_is_signaled(&fence->f)) &&
+		    drm_crtc_vblank_get(crtc) == 0)
 			drm_crtc_arm_vblank_event(crtc, event);
 		else
 			drm_crtc_send_vblank_event(crtc, event);
