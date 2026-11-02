@@ -929,10 +929,32 @@ static void vduse_vdpa_get_config(struct vdpa_device *vdpa, unsigned int offset,
 	memcpy(buf, dev->config + offset, len);
 }
 
+/*
+ * A device of API version 2 gets the driver's writes to its configuration
+ * space, and updates the space itself. The configuration space of older
+ * devices is read-only.
+ */
 static void vduse_vdpa_set_config(struct vdpa_device *vdpa, unsigned int offset,
 			const void *buf, unsigned int len)
 {
-	/* Now we only support read-only configuration space */
+	struct vduse_dev *dev = vdpa_to_vduse(vdpa);
+	struct vduse_dev_msg msg;
+	unsigned int n;
+
+	if (dev->api_version < VDUSE_API_VERSION_2 ||
+	    offset > dev->config_size || len > dev->config_size - offset)
+		return;
+
+	for (; len; offset += n, buf += n, len -= n) {
+		n = min_t(unsigned int, len, VDUSE_CONFIG_WRITE_MAX);
+		memset(&msg, 0, sizeof(msg));
+		msg.req.type = VDUSE_SET_CONFIG;
+		msg.req.config_write.offset = offset;
+		msg.req.config_write.length = n;
+		memcpy(msg.req.config_write.data, buf, n);
+		if (__vduse_dev_msg_sync(dev, &msg, false))
+			return;
+	}
 }
 
 static int vduse_vdpa_reset(struct vdpa_device *vdpa)

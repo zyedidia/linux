@@ -446,6 +446,9 @@ struct vduse_shm_unmap {
  *                           virtqueue group.
  * @VDUSE_SHM_FAULT: Ask userspace to map a range of a shared memory region
  *                   that covers a faulting offset, or to refuse it
+ * @VDUSE_SET_CONFIG: Pass a write of the driver to the configuration space
+ *                    to userspace, which updates the configuration space
+ *                    with VDUSE_DEV_SET_CONFIG as the device requires
  */
 enum vduse_req_type {
 	VDUSE_GET_VQ_STATE,
@@ -453,6 +456,7 @@ enum vduse_req_type {
 	VDUSE_UPDATE_IOTLB,
 	VDUSE_SET_VQ_GROUP_ASID,
 	VDUSE_SHM_FAULT,
+	VDUSE_SET_CONFIG,
 };
 
 /**
@@ -515,6 +519,24 @@ struct vduse_shm_fault {
 	__u64 offset;
 };
 
+#define VDUSE_CONFIG_WRITE_MAX 64
+
+/**
+ * struct vduse_config_write - a write to the configuration space
+ * @offset: the offset of the write in the configuration space
+ * @length: the number of bytes written, at most VDUSE_CONFIG_WRITE_MAX
+ * @data: the bytes written
+ *
+ * A device of VDUSE_API_VERSION >= 2 gets the driver's writes to its
+ * configuration space, split into requests of at most VDUSE_CONFIG_WRITE_MAX
+ * bytes. VDUSE drops a write that the device fails.
+ */
+struct vduse_config_write {
+	__u32 offset;
+	__u32 length;
+	__u8 data[VDUSE_CONFIG_WRITE_MAX];
+};
+
 /**
  * struct vduse_dev_request - control request
  * @type: request type
@@ -544,6 +566,7 @@ struct vduse_dev_request {
 		struct vduse_iova_range_v2 iova_v2;
 		struct vduse_vq_group_asid vq_group_asid;
 		struct vduse_shm_fault shm_fault;
+		struct vduse_config_write config_write;
 		__u32 padding[32];
 	};
 };
