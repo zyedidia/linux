@@ -171,7 +171,12 @@ int copy_thread(struct task_struct * p, const struct kernel_clone_args *args)
 		handler = new_thread_handler;
 	}
 
-	new_thread(task_stack_page(p), &p->thread.switch_buf, handler);
+	ret = os_alloc_shstk(&p->thread.shstk);
+	if (ret)
+		return ret;
+
+	new_thread(task_stack_page(p), &p->thread.switch_buf, handler,
+		   p->thread.shstk);
 
 	if (!args->fn) {
 		clear_flushed_tls(p);
@@ -202,8 +207,14 @@ int arch_dup_task_struct(struct task_struct *dst,
 	} else {
 		memcpy(dst, src, arch_task_struct_size);
 	}
+	dst->thread.shstk = 0;
 
 	return 0;
+}
+
+void arch_release_task_struct(struct task_struct *tsk)
+{
+	os_free_shstk(tsk->thread.shstk);
 }
 
 void um_idle_sleep(void)

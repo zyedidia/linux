@@ -5,8 +5,12 @@
 #include <sysdep/archsetjmp.h>
 #include <os.h>
 
-extern int setjmp(jmp_buf);
-extern void longjmp(jmp_buf, int);
+/*
+ * These attributes keep setjmp and longjmp from being tail-called, which
+ * setjmp_64.S needs.
+ */
+extern int setjmp(jmp_buf) __attribute__((returns_twice));
+extern void longjmp(jmp_buf, int) __attribute__((noreturn));
 
 #define UML_LONGJMP(buf, val) do { \
 	longjmp(*buf, val);	\

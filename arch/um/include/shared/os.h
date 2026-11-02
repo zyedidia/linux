@@ -292,13 +292,31 @@ int map(struct mm_id *mm_idp, unsigned long virt,
 	unsigned long long offset);
 int unmap(struct mm_id *mm_idp, unsigned long addr, unsigned long len);
 
+/* shstk.c */
+#ifdef CONFIG_UML_SHADOW_STACK
+extern int os_alloc_shstk(unsigned long *ssp);
+extern void os_free_shstk(unsigned long ssp);
+#else
+static inline int os_alloc_shstk(unsigned long *ssp)
+{
+	*ssp = 0;
+	return 0;
+}
+
+static inline void os_free_shstk(unsigned long ssp)
+{
+}
+#endif
+
 /* skas/process.c */
 extern int is_skas_winch(int pid, int fd, void *data);
 extern int start_userspace(struct mm_id *mm_id);
 extern void userspace(struct uml_pt_regs *regs);
-extern void new_thread(void *stack, jmp_buf *buf, void (*handler)(void));
+extern void new_thread(void *stack, jmp_buf *buf, void (*handler)(void),
+		       unsigned long ssp);
 extern void switch_threads(jmp_buf *me, jmp_buf *you);
-extern int start_idle_thread(void *stack, jmp_buf *switch_buf);
+extern int start_idle_thread(void *stack, jmp_buf *switch_buf,
+			     unsigned long ssp);
 extern void initial_thread_cb_skas(void (*proc)(void *),
 				 void *arg);
 extern void halt_skas(void);

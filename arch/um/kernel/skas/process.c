@@ -31,6 +31,8 @@ char cpu_irqstacks[NR_CPUS][THREAD_SIZE] __aligned(THREAD_SIZE);
 
 int __init start_uml(void)
 {
+	int err;
+
 	stack_protections((unsigned long) &cpu_irqstacks[0]);
 	set_sigstack(cpu_irqstacks[0], THREAD_SIZE);
 
@@ -38,8 +40,13 @@ int __init start_uml(void)
 
 	init_task.thread.request.thread.proc = start_kernel_proc;
 	init_task.thread.request.thread.arg = NULL;
+	err = os_alloc_shstk(&init_task.thread.shstk);
+	if (err)
+		panic("Failed to allocate the shadow stack, err = %d", err);
+
 	return start_idle_thread(task_stack_page(&init_task),
-				 &init_task.thread.switch_buf);
+				 &init_task.thread.switch_buf,
+				 init_task.thread.shstk);
 }
 
 unsigned long current_stub_stack(void)

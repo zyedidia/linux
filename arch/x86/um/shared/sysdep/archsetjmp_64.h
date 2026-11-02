@@ -15,11 +15,13 @@ struct __jmp_buf {
 	unsigned long __r14;
 	unsigned long __r15;
 	unsigned long __rip;
+	unsigned long __ssp;
 };
 
 typedef struct __jmp_buf jmp_buf[1];
 
 #define JB_IP __rip
 #define JB_SP __rsp
+#define JB_SSP __ssp
 
 #endif				/* _SETJMP_H */

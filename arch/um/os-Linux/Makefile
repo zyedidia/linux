@@ -15,9 +15,10 @@ CFLAGS_signal.o += -Wframe-larger-than=4096
 CFLAGS_main.o += -Wno-frame-larger-than
 
 obj-$(CONFIG_SMP) += smp.o
+obj-$(CONFIG_UML_SHADOW_STACK) += shstk.o
 
 USER_OBJS := $(user-objs-y) elf_aux.o execvp.o file.o helper.o irq.o \
 	main.o mem.o pin.o process.o registers.o sandbox.o sigio.o signal.o \
-	start_up.o time.o tty.o umid.o util.o smp.o
+	start_up.o time.o tty.o umid.o util.o smp.o shstk.o
 
 include $(srctree)/arch/um/scripts/Makefile.rules

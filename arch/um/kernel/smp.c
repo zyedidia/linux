@@ -158,7 +158,7 @@ void uml_start_secondary(void *opaque)
 	idle->thread.request.thread.arg = NULL;
 
 	new_thread(task_stack_page(idle), &idle->thread.switch_buf,
-		   new_thread_handler);
+		   new_thread_handler, idle->thread.shstk);
 	os_start_secondary(opaque, &idle->thread.switch_buf);
 }
 

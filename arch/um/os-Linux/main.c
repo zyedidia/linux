@@ -139,6 +139,42 @@ static void __init setup_env_path(void)
 	}
 }
 
+#ifdef CONFIG_UML_SHADOW_STACK
+#include <sys/syscall.h>
+#include <asm/prctl.h>
+
+/*
+ * A call through the libc syscall wrapper would return to an address that is
+ * not on the new shadow stack, so the system call is made inline.
+ */
+static __always_inline long shstk_prctl(int op, unsigned long features)
+{
+	long ret;
+
+	asm volatile("syscall"
+		     : "=a" (ret)
+		     : "0" (__NR_arch_prctl), "D" (op), "S" (features)
+		     : "rcx", "r11", "memory");
+	return ret;
+}
+
+/*
+ * Locking the shadow stack keeps the guest from turning it off, and locking
+ * WRSS keeps the guest from enabling writes to the shadow stack. This must
+ * be inlined into a function that never returns.
+ */
+static __always_inline void enable_shstk(void)
+{
+	long err = shstk_prctl(ARCH_SHSTK_ENABLE, ARCH_SHSTK_SHSTK);
+
+	if (err)
+		os_warn("Running without shadow stacks, errno = %ld\n", -err);
+	else if (shstk_prctl(ARCH_SHSTK_LOCK,
+			     ARCH_SHSTK_SHSTK | ARCH_SHSTK_WRSS))
+		os_warn("Failed to lock the shadow stack\n");
+}
+#endif
+
 int __init main(int argc, char **argv, char **envp)
 {
 	char **new_argv;
@@ -160,6 +196,11 @@ int __init main(int argc, char **argv, char **envp)
 	}
 
 	set_stklim();
+
+#ifdef CONFIG_UML_SHADOW_STACK
+	/* Main exits rather than returning, so it can enable shadow stacks. */
+	enable_shstk();
+#endif
 
 	setup_env_path();
 
@@ -227,7 +268,7 @@ int __init main(int argc, char **argv, char **envp)
 		perror("Failed to exec kernel");
 		ret = 1;
 	}
-	return uml_exitcode;
+	exit(uml_exitcode);
 }
 
 extern void *__real_malloc(int);

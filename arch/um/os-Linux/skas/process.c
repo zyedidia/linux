@@ -795,11 +795,15 @@ void userspace(struct uml_pt_regs *regs)
 	}
 }
 
-void new_thread(void *stack, jmp_buf *buf, void (*handler)(void))
+void new_thread(void *stack, jmp_buf *buf, void (*handler)(void),
+		unsigned long ssp)
 {
 	(*buf)[0].JB_IP = (unsigned long) handler;
 	(*buf)[0].JB_SP = (unsigned long) stack + UM_THREAD_SIZE -
 		sizeof(void *);
+#ifdef CONFIG_UML_SHADOW_STACK
+	(*buf)[0].JB_SSP = ssp;
+#endif
 }
 
 #define INIT_JMP_NEW_THREAD 0
@@ -821,7 +825,7 @@ static __thread void (*cb_proc)(void *arg);
 static __thread void *cb_arg;
 static __thread jmp_buf *cb_back;
 
-int start_idle_thread(void *stack, jmp_buf *switch_buf)
+int start_idle_thread(void *stack, jmp_buf *switch_buf, unsigned long ssp)
 {
 	int n;
 
@@ -841,6 +845,9 @@ int start_idle_thread(void *stack, jmp_buf *switch_buf)
 		(*switch_buf)[0].JB_IP = (unsigned long) uml_finishsetup;
 		(*switch_buf)[0].JB_SP = (unsigned long) stack +
 			UM_THREAD_SIZE - sizeof(void *);
+#ifdef CONFIG_UML_SHADOW_STACK
+		(*switch_buf)[0].JB_SSP = ssp;
+#endif
 		break;
 	case INIT_JMP_CALLBACK:
 		(*cb_proc)(cb_arg);

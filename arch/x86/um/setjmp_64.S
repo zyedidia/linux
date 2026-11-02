@@ -15,6 +15,15 @@
 #	%r14
 #	%r15
 #	<return address>
+#	<address of a shadow stack restore token>
+#
+# With shadow stacks, kernel_longjmp pops its own return address, switches
+# to the shadow stack of the target and leaves a restore token on the old
+# one, just below the shadow stack pointer of its caller's frame. A jmp_buf
+# that kernel_setjmp filled therefore points to a valid token only once
+# kernel_longjmp has been called from the frame that called kernel_setjmp.
+# That call must be a real call rather than a tail jump, so that the return
+# address it pops is its own.
 #
 
 	.text
@@ -33,6 +42,11 @@ kernel_setjmp:
 	movq %r14,40(%rdi)
 	movq %r15,48(%rdi)
 	movq %rsi,56(%rdi)		# Return address
+#ifdef CONFIG_UML_SHADOW_STACK
+	xorl %ecx,%ecx
+	rdsspq %rcx			# This is zero without a shadow stack.
+	movq %rcx,64(%rdi)		# Longjmp leaves the token here.
+#endif
 	RET
 
 	.size kernel_setjmp,.-kernel_setjmp
@@ -43,6 +57,18 @@ kernel_setjmp:
 	.type kernel_longjmp, @function
 kernel_longjmp:
 	movl %esi,%eax			# Return value (int)
+#ifdef CONFIG_UML_SHADOW_STACK
+	xorl %ecx,%ecx
+	rdsspq %rcx
+	testq %rcx,%rcx
+	jz 1f
+	movl $1,%ecx
+	incsspq %rcx			# Pop the return address.
+	movq 64(%rdi),%rcx
+	rstorssp (%rcx)			# Switch to the target's shadow stack.
+	saveprevssp			# Leave a token on the old one.
+1:
+#endif
 	movq (%rdi),%rbx
 	movq 8(%rdi),%rsp
 	movq 16(%rdi),%rbp

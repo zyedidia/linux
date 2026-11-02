@@ -278,7 +278,7 @@ void fatal_sigsegv(void)
 /**
  * segv_handler() - the SIGSEGV handler
  * @sig:	the signal number
- * @unused_si:	the signal info struct; unused in this handler
+ * @si:		the signal info struct
  * @regs:	the ptrace register information
  * @mc:		the mcontext of the signal
  *
@@ -286,10 +286,20 @@ void fatal_sigsegv(void)
  * If the userfault did not happen in an UML userspace process, bad_segv is called.
  * Otherwise the signal did happen in a cloned userspace process, handle it.
  */
-void segv_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs,
+void segv_handler(int sig, struct siginfo *si, struct uml_pt_regs *regs,
 		  void *mc)
 {
 	struct faultinfo * fi = UPT_FAULTINFO(regs);
+
+	/*
+	 * A SEGV_CPERR in UML means that a return or a shadow stack switch did
+	 * not match the shadow stack. The faultinfo holds no fault address for
+	 * it.
+	 */
+	if (!UPT_IS_USER(regs) && si->si_code == SEGV_CPERR) {
+		show_regs(container_of(regs, struct pt_regs, regs));
+		panic("Shadow stack violation at 0x%lx", UPT_IP(regs));
+	}
 
 	if (UPT_IS_USER(regs) && !SEGV_IS_FIXABLE(fi)) {
 		show_segv_info(regs);

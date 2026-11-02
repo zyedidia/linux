@@ -254,6 +254,25 @@ config KERNEL_STACK_ORDER
 	  increase in the size of the state which needs to be saved when handling
 	  signals.
 
+config UML_SHADOW_STACK
+	bool "Run UML threads on host shadow stacks"
+	depends on 64BIT
+	help
+	  Enable the host's x86 user shadow stacks for UML, so that the
+	  CPU checks every return in UML against a protected copy of the
+	  return address. Every UML thread gets a shadow stack of its own,
+	  and switching between threads switches between their shadow
+	  stacks. UML locks the shadow stack at startup so that it cannot
+	  be turned off later. This needs a CPU with shadow stacks and a
+	  host kernel built with CONFIG_X86_USER_SHADOW_STACK. Without
+	  them, UML prints a warning and runs without shadow stacks.
+
+	  The host's glibc does not unwind the shadow stack in its own longjmp,
+	  so a glibc call that recovers from an error that way, such as a
+	  name lookup that fails to load an NSS module, stops UML.
+
+	  If unsure, say N.
+
 config PGTABLE_LEVELS
 	int
 	default 4 if 64BIT

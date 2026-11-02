@@ -58,7 +58,7 @@ extern unsigned long from_irq_stack(int nested);
 
 extern int singlestepping(void);
 
-extern void segv_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs,
+extern void segv_handler(int sig, struct siginfo *si, struct uml_pt_regs *regs,
 			 void *mc);
 extern void winch(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs,
 		  void *mc);

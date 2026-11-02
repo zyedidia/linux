@@ -81,6 +81,9 @@ static const unsigned int allowed_syscalls[] = {
 	__NR_fstat,
 	__NR_mmap,
 	__NR_munmap,
+#if IS_ENABLED(CONFIG_UML_SHADOW_STACK)
+	__NR_map_shadow_stack,
+#endif
 	__NR_mprotect,
 	__NR_madvise,
 	__NR_memfd_create,

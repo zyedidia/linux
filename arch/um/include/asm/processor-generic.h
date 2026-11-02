@@ -33,6 +33,12 @@ struct thread_struct {
 
 	void *segv_continue;
 
+	/*
+	 * This holds the address of the restore token that the thread's shadow
+	 * stack was created with, or zero without shadow stacks.
+	 */
+	unsigned long shstk;
+
 	/* Contains variable sized FP registers */
 	struct pt_regs regs;
 };
