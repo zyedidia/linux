@@ -419,9 +419,15 @@ static int virtio_gpu_queue_ctrl_sgs(struct virtio_gpu_device *vgdev,
 	struct virtqueue *vq = vgdev->ctrlq.vq;
 	int ret, idx;
 
+	/*
+	 * The objects of a command that a removed device never sees are
+	 * released at once, since their delayed release may come after the
+	 * device itself is released.
+	 */
 	if (!drm_dev_enter(vgdev->ddev, &idx)) {
 		if (fence && vbuf->objs)
 			virtio_gpu_array_unlock_resv(vbuf->objs);
+		virtio_gpu_array_put_free(vbuf->objs);
 		free_vbuf(vgdev, vbuf);
 		return -ENODEV;
 	}
