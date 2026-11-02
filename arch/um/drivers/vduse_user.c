@@ -291,6 +291,17 @@ int uml_vduse_user_read_msg(int fd, struct uml_vduse_user_msg *msg)
 		msg->index = req.shm_fault.id;
 		msg->start = req.shm_fault.offset;
 		break;
+	case VDUSE_SET_CONFIG:
+		if (req.config_write.length > sizeof(msg->data)) {
+			msg->type = UML_VDUSE_MSG_UNKNOWN;
+			break;
+		}
+		msg->type = UML_VDUSE_MSG_SET_CONFIG;
+		msg->start = req.config_write.offset;
+		msg->last = req.config_write.length;
+		memcpy(msg->data, req.config_write.data,
+		       req.config_write.length);
+		break;
 	default:
 		msg->type = UML_VDUSE_MSG_UNKNOWN;
 		break;

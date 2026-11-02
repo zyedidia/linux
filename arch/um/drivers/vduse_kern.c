@@ -262,6 +262,9 @@ static int uml_vduse_read_msg(struct vduse_guest_dev *dev,
 	BUILD_BUG_ON((int)UML_VDUSE_MSG_UPDATE_IOTLB !=
 		     VDUSE_GUEST_MSG_UPDATE_IOTLB);
 	BUILD_BUG_ON((int)UML_VDUSE_MSG_SHM_FAULT != VDUSE_GUEST_MSG_SHM_FAULT);
+	BUILD_BUG_ON((int)UML_VDUSE_MSG_SET_CONFIG !=
+		     VDUSE_GUEST_MSG_SET_CONFIG);
+	BUILD_BUG_ON(sizeof(m.data) != sizeof(msg->data));
 	BUILD_BUG_ON((int)UML_VDUSE_MSG_UNKNOWN != VDUSE_GUEST_MSG_UNKNOWN);
 
 	err = uml_vduse_user_read_msg(uml_vduse_of(dev)->fd, &m);
@@ -274,6 +277,7 @@ static int uml_vduse_read_msg(struct vduse_guest_dev *dev,
 	msg->status = m.status;
 	msg->start = m.start;
 	msg->last = m.last;
+	memcpy(msg->data, m.data, sizeof(msg->data));
 	return 0;
 }
 

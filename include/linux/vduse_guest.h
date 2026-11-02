@@ -59,7 +59,10 @@ struct vduse_guest_config {
  * prints the backend's counters into /proc/vduse_guest. Shm_fault, if set,
  * takes a fault request on a shared memory region, which the backend answers
  * later with vduse_guest_shm_fault_done() from a context that can sleep.
- * Without it, fault requests are refused.
+ * Without it, fault requests are refused. Config_write, if set, takes a write
+ * of the host's driver to the configuration space, which the backend applies
+ * with vduse_guest_set_config() as the device requires. Without it, writes
+ * are dropped.
  */
 struct vduse_guest_backend_ops {
 	const char *type;
@@ -71,6 +74,7 @@ struct vduse_guest_backend_ops {
 	void (*kick)(void *priv, unsigned int index);
 	void (*show)(void *priv, struct seq_file *m);
 	void (*shm_fault)(void *priv, const struct vduse_guest_msg *msg);
+	void (*config_write)(void *priv, u32 offset, const void *buf, u32 len);
 };
 
 extern const struct vduse_guest_backend_ops vduse_guest_blk_ops;
@@ -120,12 +124,16 @@ enum {
 	VDUSE_GUEST_MSG_SET_STATUS,
 	VDUSE_GUEST_MSG_UPDATE_IOTLB,
 	VDUSE_GUEST_MSG_SHM_FAULT,
+	VDUSE_GUEST_MSG_SET_CONFIG,
 	VDUSE_GUEST_MSG_UNKNOWN,
 };
 
+#define VDUSE_GUEST_CONFIG_WRITE_MAX 64
+
 /*
  * A control message from the host. A shared memory fault carries the region
- * in index and the offset in start.
+ * in index and the offset in start. A configuration write carries its offset
+ * in start, its length in last and its bytes in data.
  */
 struct vduse_guest_msg {
 	int type;
@@ -134,6 +142,7 @@ struct vduse_guest_msg {
 	u8 status;
 	u64 start;
 	u64 last;
+	u8 data[VDUSE_GUEST_CONFIG_WRITE_MAX];
 };
 
 struct vduse_guest_vq_info {

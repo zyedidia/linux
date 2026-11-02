@@ -1049,6 +1049,12 @@ static void vduse_guest_msg_work(struct work_struct *work)
 			if (!dev->running)
 				vduse_guest_unmap_range(dev, msg.start, msg.last);
 			break;
+		case VDUSE_GUEST_MSG_SET_CONFIG:
+			if (dev->ops->config_write &&
+			    msg.last <= VDUSE_GUEST_CONFIG_WRITE_MAX)
+				dev->ops->config_write(dev->priv, msg.start,
+						       msg.data, msg.last);
+			break;
 		case VDUSE_GUEST_MSG_SHM_FAULT:
 			/* A backend that takes fault requests answers them. */
 			if (dev->ops->shm_fault) {
@@ -1563,6 +1569,7 @@ static const char *const vduse_guest_msg_names[] = {
 	[VDUSE_GUEST_MSG_SET_STATUS] = "msg_set_status",
 	[VDUSE_GUEST_MSG_UPDATE_IOTLB] = "msg_update_iotlb",
 	[VDUSE_GUEST_MSG_SHM_FAULT] = "msg_shm_fault",
+	[VDUSE_GUEST_MSG_SET_CONFIG] = "msg_set_config",
 	[VDUSE_GUEST_MSG_UNKNOWN] = "msg_unknown",
 };
 

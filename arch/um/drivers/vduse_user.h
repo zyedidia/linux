@@ -7,6 +7,7 @@ enum {
 	UML_VDUSE_MSG_SET_STATUS,
 	UML_VDUSE_MSG_UPDATE_IOTLB,
 	UML_VDUSE_MSG_SHM_FAULT,
+	UML_VDUSE_MSG_SET_CONFIG,
 	UML_VDUSE_MSG_UNKNOWN,
 };
 
@@ -21,6 +22,7 @@ struct uml_vduse_user_msg {
 	uint8_t status;
 	uint64_t start;
 	uint64_t last;
+	uint8_t data[64];
 };
 
 struct uml_vduse_user_vq_info {
