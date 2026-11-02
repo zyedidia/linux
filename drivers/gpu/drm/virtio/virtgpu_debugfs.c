@@ -91,7 +91,9 @@ virtio_gpu_debugfs_host_visible_mm(struct seq_file *m, void *data)
 	}
 
 	p = drm_seq_file_printer(m);
+	spin_lock(&vgdev->host_visible_lock);
 	drm_mm_print(&vgdev->host_visible_mm, &p);
+	spin_unlock(&vgdev->host_visible_lock);
 	return 0;
 }
 
