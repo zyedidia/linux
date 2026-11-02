@@ -2,11 +2,12 @@
 /*
  * Scanouts of the virtio-gpu backend on the guest's KMS. Each connector of
  * the DRM device behind the render node is a scanout. SET_SCANOUT_BLOB makes
- * a framebuffer from a blob's BO and commits it, without waiting for the flip
+ * a framebuffer from a blob's BO, and SET_SCANOUT shows the dumb buffer of a
+ * 2D resource. Either commits the framebuffer without waiting for the flip
  * unless the commit sets a mode, and the flip signals a fence. A fenced
- * RESOURCE_FLUSH of a blob on a scanout completes at that flip. The commands
- * run on the command worker, and the hotplug callback only raises display
- * events.
+ * RESOURCE_FLUSH of a resource on a scanout completes at that flip. The
+ * commands run on the command worker, and the hotplug callback only raises
+ * display events.
  */
 
 #define pr_fmt(fmt) "vduse-guest-gpu: " fmt
@@ -44,8 +45,8 @@
 #define VDUSE_GUEST_GPU_CURSOR 64
 
 /*
- * A scanout shows res_id on crtc, which it takes when it is enabled and keeps
- * until a disable of it succeeds, in mode.
+ * A scanout shows the rectangle rect of res_id on crtc, which it takes when
+ * it is enabled and keeps until a disable of it succeeds, in mode.
  * Flip is the fence of its latest commit, which signals at the flip, on the
  * scanout's own fence context, and flip_start when its command arrived. The
  * host shows a cursor while cursor_on is set, with its top left corner at
@@ -59,6 +60,7 @@ struct vduse_guest_gpu_scanout {
 	struct drm_crtc *crtc;
 	struct drm_display_mode mode;
 	u32 res_id;
+	struct drm_rect rect;
 	struct drm_client_buffer *cursors[2];
 	unsigned int cursor_cur;
 	bool cursor_on;
@@ -549,8 +551,8 @@ retry:
 }
 
 /*
- * Count the time from a scanout's latest SET_SCANOUT_BLOB to its flip, once
- * the flip has signaled, unless it was a modeset.
+ * Count the time from a scanout's latest command that showed a resource to
+ * its flip, once the flip has signaled, unless it was a modeset.
  */
 static void vduse_guest_gpu_time_flip(struct vduse_guest_gpu *gpu,
 				      struct vduse_guest_gpu_scanout *so)
@@ -648,7 +650,7 @@ retry:
 
 /*
  * Copy a resource's cursor image into the guest's cursor buffer that is not
- * current, which becomes the current one. The image is a blob of 64x64
+ * current, which becomes the current one. The image is a resource of 64x64
  * ARGB8888 pixels, read through TTM's access to the BO, which reaches VRAM
  * that the CPU cannot map. A BO whose writes take over 100 ms is refused, and
  * the read is repeated once if a move of the BO was pending. The image goes
@@ -666,7 +668,8 @@ static int vduse_guest_gpu_cursor_image(struct vduse_guest_gpu_display *d,
 	u8 *image;
 	int err;
 
-	if (!res->obj || res->size < row * VDUSE_GUEST_GPU_CURSOR)
+	if (!res->obj || res->size < row * VDUSE_GUEST_GPU_CURSOR ||
+	    (res->buf && res->buf->fb->pitches[0] != row))
 		return -EINVAL;
 	image = kmalloc(row * VDUSE_GUEST_GPU_CURSOR, GFP_KERNEL);
 	if (!image)
@@ -798,47 +801,22 @@ static u32 vduse_guest_gpu_fourcc(u32 format)
 }
 
 /*
- * Show a blob on a scanout, in the connector's mode for the rectangle's size.
- * A new mode or a scanout that was off needs a modeset, which the command
- * waits for, and otherwise the command returns before the flip.
+ * Show a framebuffer of a resource on a scanout, in the connector's mode for
+ * the size of the rectangle at x and y. A new mode or a scanout that was off
+ * needs a modeset, which the command waits for, and otherwise the command
+ * returns before the flip. The framebuffer's reference is dropped.
  */
-u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
-				     const struct virtio_gpu_set_scanout_blob *cmd)
+static u32 vduse_guest_gpu_show_fb(struct vduse_guest_gpu *gpu, u32 id,
+				   u32 res_id, struct drm_framebuffer *fb,
+				   u32 x, u32 y, u32 w, u32 h)
 {
 	struct vduse_guest_gpu_display *d = gpu->display;
-	u32 id = le32_to_cpu(cmd->scanout_id);
-	u32 res_id = le32_to_cpu(cmd->resource_id);
-	u32 x = le32_to_cpu(cmd->r.x), y = le32_to_cpu(cmd->r.y);
-	u32 w = le32_to_cpu(cmd->r.width), h = le32_to_cpu(cmd->r.height);
+	struct vduse_guest_gpu_scanout *so = &d->scanouts[id];
 	struct vduse_guest_gpu_commit c = {};
-	struct drm_mode_fb_cmd2 fb_cmd = {};
-	struct vduse_guest_gpu_scanout *so;
 	struct drm_display_mode *mode;
-	struct vduse_guest_gpu_res *res;
 	ktime_t start = ktime_get(), commit;
 	bool took;
 	int err;
-
-	if (!d || id >= d->nr_scanouts)
-		return VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
-	so = &d->scanouts[id];
-	if (!res_id) {
-		vduse_guest_gpu_disable(d, so);
-		return VIRTIO_GPU_RESP_OK_NODATA;
-	}
-	res = xa_load(&gpu->resources, res_id);
-	if (!res || !res->obj)
-		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
-
-	fb_cmd.width = le32_to_cpu(cmd->width);
-	fb_cmd.height = le32_to_cpu(cmd->height);
-	fb_cmd.pixel_format = vduse_guest_gpu_fourcc(le32_to_cpu(cmd->format));
-	fb_cmd.pitches[0] = le32_to_cpu(cmd->strides[0]);
-	fb_cmd.offsets[0] = le32_to_cpu(cmd->offsets[0]);
-	if (!fb_cmd.pixel_format || !w || !h || x > fb_cmd.width ||
-	    w > fb_cmd.width - x || y > fb_cmd.height ||
-	    h > fb_cmd.height - y)
-		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
 
 	mutex_lock(&d->drm->mode_config.mutex);
 	mode = vduse_guest_gpu_mode(so->connector, w, h);
@@ -846,15 +824,12 @@ u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
 		drm_mode_copy(&c.mode_buf, mode);
 	mutex_unlock(&d->drm->mode_config.mutex);
 	took = !so->crtc;
-	if (!mode || !vduse_guest_gpu_take_crtc(d, so))
+	if (!mode || !vduse_guest_gpu_take_crtc(d, so)) {
+		drm_framebuffer_put(fb);
 		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
-
-	c.fb = vduse_guest_gpu_amdgpu_fb(gpu, res, &fb_cmd);
-	if (IS_ERR(c.fb)) {
-		err = PTR_ERR(c.fb);
-		goto fail;
 	}
 
+	c.fb = fb;
 	c.so = so;
 	c.mode = &c.mode_buf;
 	c.modeset = !so->res_id || !drm_mode_equal(&so->mode, c.mode);
@@ -893,6 +868,7 @@ u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
 	if (!c.modeset)
 		atomic64_add(ktime_to_us(commit), &gpu->stats.flip_commit_us);
 	so->res_id = res_id;
+	drm_rect_init(&so->rect, x, y, w, h);
 	drm_mode_copy(&so->mode, c.mode);
 	/* A CRTC that a modeset lit shows the host's cursor again. */
 	if (c.modeset && so->cursor_on &&
@@ -908,20 +884,253 @@ fail:
 				VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
 }
 
+/* Show a blob on a scanout, through a framebuffer of its BO. */
+u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
+				     const struct virtio_gpu_set_scanout_blob *cmd)
+{
+	struct vduse_guest_gpu_display *d = gpu->display;
+	u32 id = le32_to_cpu(cmd->scanout_id);
+	u32 res_id = le32_to_cpu(cmd->resource_id);
+	u32 x = le32_to_cpu(cmd->r.x), y = le32_to_cpu(cmd->r.y);
+	u32 w = le32_to_cpu(cmd->r.width), h = le32_to_cpu(cmd->r.height);
+	struct drm_mode_fb_cmd2 fb_cmd = {};
+	struct vduse_guest_gpu_res *res;
+	struct drm_framebuffer *fb;
+
+	if (!d || id >= d->nr_scanouts)
+		return VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+	if (!res_id) {
+		vduse_guest_gpu_disable(d, &d->scanouts[id]);
+		return VIRTIO_GPU_RESP_OK_NODATA;
+	}
+	res = xa_load(&gpu->resources, res_id);
+	if (!res || !res->obj || res->buf)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+	fb_cmd.width = le32_to_cpu(cmd->width);
+	fb_cmd.height = le32_to_cpu(cmd->height);
+	fb_cmd.pixel_format = vduse_guest_gpu_fourcc(le32_to_cpu(cmd->format));
+	fb_cmd.pitches[0] = le32_to_cpu(cmd->strides[0]);
+	fb_cmd.offsets[0] = le32_to_cpu(cmd->offsets[0]);
+	if (!fb_cmd.pixel_format || !w || !h || x > fb_cmd.width ||
+	    w > fb_cmd.width - x || y > fb_cmd.height ||
+	    h > fb_cmd.height - y)
+		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	fb = vduse_guest_gpu_amdgpu_fb(gpu, res, &fb_cmd);
+	if (IS_ERR(fb))
+		return PTR_ERR(fb) == -ENOMEM ?
+			VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY :
+			VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+	return vduse_guest_gpu_show_fb(gpu, id, res_id, fb, x, y, w, h);
+}
+
 /*
- * SET_SCANOUT disables a scanout. SET_SCANOUT with a 2D resource is refused.
+ * SET_SCANOUT shows a 2D resource on a scanout through the framebuffer of its
+ * dumb buffer, or disables the scanout with resource 0.
  */
 u32 vduse_guest_gpu_set_scanout(struct vduse_guest_gpu *gpu,
 				const struct virtio_gpu_set_scanout *cmd)
 {
 	struct vduse_guest_gpu_display *d = gpu->display;
 	u32 id = le32_to_cpu(cmd->scanout_id);
+	u32 res_id = le32_to_cpu(cmd->resource_id);
+	u32 x = le32_to_cpu(cmd->r.x), y = le32_to_cpu(cmd->r.y);
+	u32 w = le32_to_cpu(cmd->r.width), h = le32_to_cpu(cmd->r.height);
+	struct vduse_guest_gpu_res *res;
 
 	if (!d || id >= d->nr_scanouts)
 		return VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
-	if (cmd->resource_id)
+	if (!res_id) {
+		vduse_guest_gpu_disable(d, &d->scanouts[id]);
+		return VIRTIO_GPU_RESP_OK_NODATA;
+	}
+	res = xa_load(&gpu->resources, res_id);
+	if (!res || !res->buf)
 		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
-	vduse_guest_gpu_disable(d, &d->scanouts[id]);
+	if (!w || !h || x > res->width || w > res->width - x ||
+	    y > res->height || h > res->height - y)
+		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	drm_framebuffer_get(res->buf->fb);
+	return vduse_guest_gpu_show_fb(gpu, id, res_id, res->buf->fb, x, y, w,
+				       h);
+}
+
+/*
+ * Make the dumb buffer of a 2D resource, in the resource's format, which the
+ * display's client keeps until the resource is freed.
+ */
+int vduse_guest_gpu_buffer_init(struct vduse_guest_gpu *gpu,
+				struct vduse_guest_gpu_res *res)
+{
+	struct vduse_guest_gpu_display *d = gpu->display;
+	const struct drm_mode_config *mc = &d->drm->mode_config;
+	struct drm_client_buffer *buf;
+	u32 format = vduse_guest_gpu_fourcc(res->format);
+
+	if (!format || !res->width || !res->height ||
+	    res->width > mc->max_width || res->height > mc->max_height)
+		return -EINVAL;
+	buf = drm_client_buffer_create_dumb(&d->client, res->width,
+					    res->height, format);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+	res->buf = buf;
+	res->obj = buf->fb->obj[0];
+	drm_gem_object_get(res->obj);
+	res->size = res->obj->size;
+	return 0;
+}
+
+/*
+ * Delete the dumb buffer of a 2D resource. A scanout that shows it is
+ * disabled first, since deleting the buffer would turn its CRTC off without
+ * the scanout knowing.
+ */
+void vduse_guest_gpu_buffer_fini(struct vduse_guest_gpu_res *res)
+{
+	struct vduse_guest_gpu_display *d = res->gpu->display;
+	unsigned int i;
+
+	for (i = 0; i < d->nr_scanouts; i++) {
+		if (d->scanouts[i].res_id == res->id)
+			vduse_guest_gpu_disable(d, &d->scanouts[i]);
+	}
+	drm_client_buffer_delete(res->buf);
+	res->buf = NULL;
+}
+
+/*
+ * RESOURCE_FLUSH of a 2D resource commits its framebuffer again on each
+ * scanout that shows it, so that a panel that refreshes itself shows what
+ * the transfers wrote. A scanout whose flip is still pending scans out the
+ * transfers anyway, so it gets no commit, which would wait for that flip. A
+ * flush of a blob needs no commit.
+ */
+u32 vduse_guest_gpu_flush(struct vduse_guest_gpu *gpu,
+			  const struct virtio_gpu_resource_flush *cmd)
+{
+	struct vduse_guest_gpu_display *d = gpu->display;
+	u32 res_id = le32_to_cpu(cmd->resource_id);
+	struct vduse_guest_gpu_res *res;
+	struct drm_rect *r;
+	u32 type = VIRTIO_GPU_RESP_OK_NODATA, t;
+	unsigned int i;
+
+	if (!d)
+		return VIRTIO_GPU_RESP_ERR_UNSPEC;
+	res = xa_load(&gpu->resources, res_id);
+	if (!res || !res->buf)
+		return VIRTIO_GPU_RESP_OK_NODATA;
+	for (i = 0; i < d->nr_scanouts; i++) {
+		if (d->scanouts[i].res_id != res_id ||
+		    (d->scanouts[i].flip &&
+		     !dma_fence_is_signaled(d->scanouts[i].flip)))
+			continue;
+		r = &d->scanouts[i].rect;
+		drm_framebuffer_get(res->buf->fb);
+		t = vduse_guest_gpu_show_fb(gpu, i, res_id, res->buf->fb,
+					    r->x1, r->y1, drm_rect_width(r),
+					    drm_rect_height(r));
+		if (t != VIRTIO_GPU_RESP_OK_NODATA)
+			type = t;
+	}
+	return type;
+}
+
+/* Copy len bytes of a 2D resource's backing, from offset, into buf. */
+static int vduse_guest_gpu_backing_read(struct vduse_guest_gpu *gpu,
+					struct vduse_guest_gpu_res *res,
+					u64 offset, void *buf, size_t len)
+{
+	unsigned int lo = 0, hi = res->nr_backing, i;
+	struct vduse_guest_gpu_backing *b;
+	size_t n;
+	int err;
+
+	/* The last range that starts at or before offset. */
+	while (hi - lo > 1) {
+		i = lo + (hi - lo) / 2;
+		if (res->backing[i].offset <= offset)
+			lo = i;
+		else
+			hi = i;
+	}
+	for (i = lo; len; i++) {
+		if (i == res->nr_backing)
+			return -EFAULT;
+		b = &res->backing[i];
+		if (offset - b->offset >= b->len)
+			continue;
+		n = min_t(u64, len, b->len - (offset - b->offset));
+		err = vduse_guest_read(gpu->dev, b->addr + offset - b->offset,
+				       buf, n);
+		if (err)
+			return err;
+		offset += n;
+		buf += n;
+		len -= n;
+	}
+	return 0;
+}
+
+/*
+ * Copy a rectangle of a 2D resource from its backing, whose rows are the
+ * resource's width apart from offset on, into its dumb buffer. A row at a
+ * time goes through a bounce buffer, and the dumb buffer is written once
+ * its clear or move has finished.
+ */
+u32 vduse_guest_gpu_transfer_2d(struct vduse_guest_gpu *gpu,
+				const struct virtio_gpu_transfer_to_host_2d *cmd)
+{
+	u32 x = le32_to_cpu(cmd->r.x), y = le32_to_cpu(cmd->r.y);
+	u32 w = le32_to_cpu(cmd->r.width), h = le32_to_cpu(cmd->r.height);
+	u64 offset = le64_to_cpu(cmd->offset);
+	struct vduse_guest_gpu_res *res;
+	struct drm_framebuffer *fb;
+	struct iosys_map map;
+	u32 cpp, row, i;
+	u64 stride;
+	void *line;
+	int err;
+
+	res = xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id));
+	if (!res || !res->buf)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+	fb = res->buf->fb;
+	cpp = fb->format->cpp[0];
+	stride = (u64)res->width * cpp;
+	row = w * cpp;
+	if (!w || !h || x > res->width || w > res->width - x ||
+	    y > res->height || h > res->height - y ||
+	    offset > res->backing_size ||
+	    (h - 1) * stride + row > res->backing_size - offset)
+		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	line = kmalloc(row, GFP_KERNEL);
+	if (!line)
+		return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+	err = drm_client_buffer_vmap_local(res->buf, &map);
+	if (err)
+		goto out;
+	dma_resv_wait_timeout(res->obj->resv, DMA_RESV_USAGE_KERNEL, false,
+			      MAX_SCHEDULE_TIMEOUT);
+	for (i = 0; i < h && !err; i++) {
+		err = vduse_guest_gpu_backing_read(gpu, res,
+						   offset + i * stride, line,
+						   row);
+		if (!err)
+			iosys_map_memcpy_to(&map, (y + i) * fb->pitches[0] +
+					    x * cpp, line, row);
+	}
+	drm_client_buffer_vunmap_local(res->buf);
+out:
+	kfree(line);
+	if (err)
+		return err == -ENOMEM ? VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY :
+					VIRTIO_GPU_RESP_ERR_UNSPEC;
+	atomic64_inc(&gpu->stats.transfers);
 	return VIRTIO_GPU_RESP_OK_NODATA;
 }
 
@@ -1028,7 +1237,7 @@ static void vduse_guest_gpu_edid_checksum(u8 *block)
 
 /*
  * Return an EDID of a connector that lists one mode for each size, the one
- * that SET_SCANOUT_BLOB sets for it, so that the host can only choose modes
+ * that a scanout command sets for it, so that the host can only choose modes
  * that the backend sets. It is a base block alone, with the mode that
  * vduse_guest_gpu_preferred() returns and up to three more, since a CTA-861
  * extension makes the host add modes of its own. The connector's physical
@@ -1087,6 +1296,10 @@ static size_t vduse_guest_gpu_edid(struct drm_connector *c, u8 *edid)
 	return VDUSE_GUEST_GPU_EDID_BLOCK;
 }
 
+/*
+ * GET_EDID answers a scanout without an EDID, such as a connector without a
+ * monitor, with an empty one.
+ */
 u32 vduse_guest_gpu_get_edid(struct vduse_guest_gpu *gpu,
 			     const struct virtio_gpu_cmd_get_edid *cmd,
 			     struct virtio_gpu_resp_edid *resp)
@@ -1102,8 +1315,6 @@ u32 vduse_guest_gpu_get_edid(struct vduse_guest_gpu *gpu,
 	vduse_guest_gpu_probe(d, d->scanouts[id].connector);
 	size = vduse_guest_gpu_edid(d->scanouts[id].connector, resp->edid);
 	mutex_unlock(&d->drm->mode_config.mutex);
-	if (!size)
-		return VIRTIO_GPU_RESP_ERR_UNSPEC;
 	resp->size = cpu_to_le32(size);
 	return VIRTIO_GPU_RESP_OK_EDID;
 }

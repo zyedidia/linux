@@ -47,6 +47,12 @@
 #define VDUSE_GUEST_GPU_SUBMIT_MAX SZ_1M
 
 /*
+ * The most ranges of a 2D resource's backing, as many as the pages of a
+ * resource of 16384 by 16384 pixels.
+ */
+#define VDUSE_GUEST_GPU_BACKING_MAX (SZ_1G / PAGE_SIZE)
+
+/*
  * The worker's memory, which holds the arguments of the ioctls that it
  * runs, including a CS_SUBMIT's translated chunks.
  */
@@ -83,6 +89,10 @@ union vduse_guest_gpu_req {
 	struct virtio_gpu_resource_map_blob map_blob;
 	struct virtio_gpu_resource_unmap_blob unmap_blob;
 	struct virtio_gpu_resource_unref unref;
+	struct virtio_gpu_resource_create_2d create_2d;
+	struct virtio_gpu_resource_attach_backing attach_backing;
+	struct virtio_gpu_resource_detach_backing detach_backing;
+	struct virtio_gpu_transfer_to_host_2d transfer_2d;
 	struct virtio_gpu_cmd_submit submit;
 	struct virtio_gpu_set_scanout set_scanout;
 	struct virtio_gpu_set_scanout_blob set_scanout_blob;
@@ -510,6 +520,9 @@ static void vduse_guest_gpu_res_free(struct vduse_guest_gpu *gpu,
 		vduse_guest_gpu_amdgpu_detach(ctx, res->id);
 	}
 	vduse_guest_gpu_res_unmap(gpu, res);
+	kvfree(res->backing);
+	if (res->buf)
+		vduse_guest_gpu_buffer_fini(res);
 	if (!res->leaked) {
 		if (res->obj) {
 			drm_gem_object_put(res->obj);
@@ -690,6 +703,105 @@ static u32 vduse_guest_gpu_unmap_blob(struct vduse_guest_gpu *gpu,
 	return VIRTIO_GPU_RESP_OK_NODATA;
 }
 
+/*
+ * Create a 2D resource, which the guest's KMS can show, on a device that
+ * serves scanouts.
+ */
+static u32 vduse_guest_gpu_create_2d(struct vduse_guest_gpu *gpu,
+				     const struct virtio_gpu_resource_create_2d *cmd)
+{
+	u32 id = le32_to_cpu(cmd->resource_id);
+	struct vduse_guest_gpu_res *res;
+	int err;
+
+	if (!gpu->display)
+		return VIRTIO_GPU_RESP_ERR_UNSPEC;
+	if (!id || xa_load(&gpu->resources, id))
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+	res = kzalloc_obj(*res);
+	if (!res)
+		return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+	res->gpu = gpu;
+	res->id = id;
+	res->width = le32_to_cpu(cmd->width);
+	res->height = le32_to_cpu(cmd->height);
+	res->format = le32_to_cpu(cmd->format);
+	atomic_inc(&gpu->stats.resources);
+
+	err = vduse_guest_gpu_buffer_init(gpu, res);
+	if (!err)
+		err = xa_insert(&gpu->resources, id, res, GFP_KERNEL);
+	if (err) {
+		vduse_guest_gpu_res_free(gpu, res);
+		return err == -ENOMEM ? VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY :
+					VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+	}
+	return VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+/*
+ * Attach the backing of a 2D resource, whose ranges follow the command in the
+ * chain. Each range starts where the previous one ends in the backing.
+ */
+static u32 vduse_guest_gpu_attach_backing(struct vduse_guest_gpu *gpu,
+					  const struct virtio_gpu_resource_attach_backing *cmd,
+					  struct vringh_kiov *riov,
+					  size_t in_len)
+{
+	u32 nr = le32_to_cpu(cmd->nr_entries);
+	struct vduse_guest_gpu_backing *backing;
+	struct virtio_gpu_mem_entry entry;
+	struct vduse_guest_gpu_res *res;
+	struct iov_iter it;
+	u64 offset = 0;
+	u32 i;
+
+	res = xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id));
+	if (!res || !res->buf)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+	if (res->backing || !nr || nr > VDUSE_GUEST_GPU_BACKING_MAX ||
+	    (in_len - sizeof(*cmd)) / sizeof(entry) < nr)
+		return VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	backing = kvmalloc_array(nr, sizeof(*backing), GFP_KERNEL);
+	if (!backing)
+		return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+	iov_iter_kvec(&it, ITER_SOURCE, riov->iov, riov->used, in_len);
+	iov_iter_advance(&it, sizeof(*cmd));
+	for (i = 0; i < nr; i++) {
+		if (copy_from_iter(&entry, sizeof(entry), &it) !=
+		    sizeof(entry)) {
+			kvfree(backing);
+			return VIRTIO_GPU_RESP_ERR_UNSPEC;
+		}
+		backing[i].addr = le64_to_cpu(entry.addr);
+		backing[i].offset = offset;
+		backing[i].len = le32_to_cpu(entry.length);
+		offset += backing[i].len;
+	}
+
+	res->backing = backing;
+	res->nr_backing = nr;
+	res->backing_size = offset;
+	return VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static u32 vduse_guest_gpu_detach_backing(struct vduse_guest_gpu *gpu,
+					  const struct virtio_gpu_resource_detach_backing *cmd)
+{
+	struct vduse_guest_gpu_res *res;
+
+	res = xa_load(&gpu->resources, le32_to_cpu(cmd->resource_id));
+	if (!res || !res->buf)
+		return VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+	kvfree(res->backing);
+	res->backing = NULL;
+	res->nr_backing = 0;
+	res->backing_size = 0;
+	return VIRTIO_GPU_RESP_OK_NODATA;
+}
+
 static u32 vduse_guest_gpu_unref(struct vduse_guest_gpu *gpu,
 				 const struct virtio_gpu_resource_unref *cmd)
 {
@@ -834,6 +946,23 @@ static u32 vduse_guest_gpu_dispatch(struct vduse_guest_gpu *gpu,
 		if (in_len < sizeof(req->unref))
 			break;
 		return vduse_guest_gpu_unref(gpu, &req->unref);
+	case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
+		if (in_len < sizeof(req->create_2d))
+			break;
+		return vduse_guest_gpu_create_2d(gpu, &req->create_2d);
+	case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
+		if (in_len < sizeof(req->attach_backing))
+			break;
+		return vduse_guest_gpu_attach_backing(gpu, &req->attach_backing,
+						      riov, in_len);
+	case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
+		if (in_len < sizeof(req->detach_backing))
+			break;
+		return vduse_guest_gpu_detach_backing(gpu, &req->detach_backing);
+	case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
+		if (in_len < sizeof(req->transfer_2d))
+			break;
+		return vduse_guest_gpu_transfer_2d(gpu, &req->transfer_2d);
 	case VIRTIO_GPU_CMD_SUBMIT_3D:
 		if (in_len < sizeof(req->submit))
 			break;
@@ -862,8 +991,7 @@ static u32 vduse_guest_gpu_dispatch(struct vduse_guest_gpu *gpu,
 		/* A fenced flush waits for the flip of the resource. */
 		if (in_len < sizeof(req->flush))
 			break;
-		return gpu->display ? VIRTIO_GPU_RESP_OK_NODATA :
-				      VIRTIO_GPU_RESP_ERR_UNSPEC;
+		return vduse_guest_gpu_flush(gpu, &req->flush);
 	}
 
 	return VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -1450,6 +1578,8 @@ static void vduse_guest_gpu_show(void *priv, struct seq_file *m)
 		   atomic64_read(&s->cursor_moves));
 	seq_printf(m, "  %-18s %lld\n", "cursor_errors",
 		   atomic64_read(&s->cursor_errors));
+	seq_printf(m, "  %-18s %lld\n", "transfers",
+		   atomic64_read(&s->transfers));
 	seq_printf(m, "  %-18s %lld\n", "flips_timed",
 		   atomic64_read(&s->flips_timed));
 	seq_printf(m, "  %-18s %lld\n", "flip_commit_us",

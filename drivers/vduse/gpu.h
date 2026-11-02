@@ -13,6 +13,7 @@
 #include <uapi/linux/virtio_gpu.h>
 
 struct dma_fence;
+struct drm_client_buffer;
 struct drm_gem_object;
 struct file;
 struct mm_struct;
@@ -108,6 +109,11 @@ static_assert(sizeof(struct vduse_guest_gpu_shmem) == 88);
  * fails, the host may still map the pages, so leaked keeps them, and the
  * BO's reference, for the device's lifetime. A leaked BO is pinned, unless
  * the unmap failed in a move, which frees or replaces its pages anyway.
+ *
+ * A 2D resource is a dumb buffer, buf, of the guest's KMS, of width by height
+ * pixels, whose virtio-gpu format is in format, and obj holds a reference to
+ * its BO. Its backing, which the host attaches, is a list of nr_backing
+ * ranges of device addresses that make up backing_size bytes.
  */
 struct vduse_guest_gpu_res {
 	struct vduse_guest_gpu *gpu;
@@ -124,6 +130,20 @@ struct vduse_guest_gpu_res {
 	bool present;
 	bool leaked;
 	u64 map_offset;
+	struct drm_client_buffer *buf;
+	u32 width;
+	u32 height;
+	u32 format;
+	struct vduse_guest_gpu_backing *backing;
+	unsigned int nr_backing;
+	u64 backing_size;
+};
+
+/* A range of a 2D resource's backing, which starts at offset in it. */
+struct vduse_guest_gpu_backing {
+	u64 addr;
+	u64 offset;
+	u32 len;
 };
 
 /* A ring's timeline, with the fence of its last command submission. */
@@ -158,10 +178,11 @@ struct vduse_guest_gpu_ctx {
  * in moves, and the numbers of fault requests answered with a mapping and
  * refused are in faults and faults_refused. The number of fenced flushes
  * that wait for a flip is in flips. Of flips_timed flips, flip_commit_us is
- * the total time of their commits, and flip_wait_us the total time from
- * SET_SCANOUT_BLOB to the flip. UPDATE_CURSOR and MOVE_CURSOR commands
- * committed on a scanout that is on are counted in cursor_updates and
- * cursor_moves, and failed ones in cursor_errors.
+ * the total time of their commits, and flip_wait_us the total time from the
+ * command that showed a resource to the flip. UPDATE_CURSOR and MOVE_CURSOR
+ * commands committed on a scanout that is on are counted in cursor_updates
+ * and cursor_moves, and failed ones in cursor_errors. TRANSFER_TO_HOST_2D
+ * commands that copied a 2D resource's backing are counted in transfers.
  */
 struct vduse_guest_gpu_stats {
 	atomic64_t commands;
@@ -178,6 +199,7 @@ struct vduse_guest_gpu_stats {
 	atomic64_t cursor_updates;
 	atomic64_t cursor_moves;
 	atomic64_t cursor_errors;
+	atomic64_t transfers;
 };
 
 struct vduse_guest_gpu {
@@ -309,6 +331,13 @@ u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
 				     const struct virtio_gpu_set_scanout_blob *cmd);
 struct dma_fence *vduse_guest_gpu_flush_fence(struct vduse_guest_gpu *gpu,
 					      u32 res_id);
+int vduse_guest_gpu_buffer_init(struct vduse_guest_gpu *gpu,
+				struct vduse_guest_gpu_res *res);
+void vduse_guest_gpu_buffer_fini(struct vduse_guest_gpu_res *res);
+u32 vduse_guest_gpu_transfer_2d(struct vduse_guest_gpu *gpu,
+				const struct virtio_gpu_transfer_to_host_2d *cmd);
+u32 vduse_guest_gpu_flush(struct vduse_guest_gpu *gpu,
+			  const struct virtio_gpu_resource_flush *cmd);
 void vduse_guest_gpu_cursor(struct vduse_guest_gpu *gpu,
 			    const struct virtio_gpu_update_cursor *cmd);
 u32 vduse_guest_gpu_get_edid(struct vduse_guest_gpu *gpu,
