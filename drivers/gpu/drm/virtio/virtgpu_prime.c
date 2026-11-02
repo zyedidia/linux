@@ -154,11 +154,19 @@ int virtgpu_dma_buf_import_sgt(struct virtio_gpu_mem_entry **ents,
 			       struct virtio_gpu_object *bo,
 			       struct dma_buf_attachment *attach)
 {
+	struct virtio_gpu_device *vgdev = bo->base.base.dev->dev_private;
 	struct scatterlist *sl;
 	struct sg_table *sgt;
 	long i, ret;
 
 	dma_resv_assert_held(attach->dmabuf->resv);
+
+	/*
+	 * The device would get the physical addresses of an imported buffer,
+	 * which virtio map operations cannot map.
+	 */
+	if (vgdev->vdev->map)
+		return -EOPNOTSUPP;
 
 	ret = dma_resv_wait_timeout(attach->dmabuf->resv,
 				    DMA_RESV_USAGE_KERNEL,

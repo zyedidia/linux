@@ -144,6 +144,8 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	spin_lock_init(&vgdev->display_info_lock);
 	spin_lock_init(&vgdev->resource_export_lock);
 	spin_lock_init(&vgdev->host_visible_lock);
+	spin_lock_init(&vgdev->backing_lock);
+	INIT_LIST_HEAD(&vgdev->mapped_backing);
 	init_rwsem(&vgdev->host_visible_fault_sem);
 	ida_init(&vgdev->ctx_id_ida);
 	ida_init(&vgdev->resource_ida);
@@ -336,6 +338,8 @@ void virtio_gpu_deinit(struct drm_device *dev)
 	flush_work(&vgdev->cursorq.dequeue_work);
 	virtio_gpu_fail_pending(vgdev);
 	flush_work(&vgdev->obj_free_work);
+	/* Backing still mapped is unmapped while the control queue exists. */
+	virtio_gpu_object_unmap_all(vgdev);
 	vgdev->vdev->config->del_vqs(vgdev->vdev);
 }
 

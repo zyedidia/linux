@@ -103,8 +103,16 @@ struct virtio_gpu_object {
 #define gem_to_virtio_gpu_obj(gobj) \
 	container_of((gobj), struct virtio_gpu_object, base.base)
 
+/*
+ * On a device with virtio map operations, maps holds the device addresses of
+ * the entries of the object's sg table, and the object is on the device's
+ * mapped_backing list, until its backing is unmapped.
+ */
 struct virtio_gpu_object_shmem {
 	struct virtio_gpu_object base;
+	dma_addr_t *maps;
+	unsigned int nr_maps;
+	struct list_head mapped;
 };
 
 struct virtio_gpu_object_vram {
@@ -286,6 +294,13 @@ struct virtio_gpu_device {
 	/* protects map state and host_visible_mm */
 	spinlock_t host_visible_lock;
 	/*
+	 * This lock protects mapped_backing, the maps of the objects on it
+	 * and backing_bytes, the bytes of their backing.
+	 */
+	spinlock_t backing_lock;
+	struct list_head mapped_backing;
+	size_t backing_bytes;
+	/*
 	 * Faults on a region without a physical address hold this for
 	 * reading while they reach the transport, and deinit sets
 	 * host_visible_closed under it for writing.
@@ -354,12 +369,12 @@ void virtio_gpu_cmd_create_resource(struct virtio_gpu_device *vgdev,
 void virtio_gpu_cmd_unref_resource(struct virtio_gpu_device *vgdev,
 				   struct virtio_gpu_object *bo);
 int virtio_gpu_panic_cmd_transfer_to_host_2d(struct virtio_gpu_device *vgdev,
-					     uint64_t offset,
+					     uint64_t offset, uint32_t size,
 					     uint32_t width, uint32_t height,
 					     uint32_t x, uint32_t y,
 					     struct virtio_gpu_object_array *objs);
 void virtio_gpu_cmd_transfer_to_host_2d(struct virtio_gpu_device *vgdev,
-					uint64_t offset,
+					uint64_t offset, uint32_t size,
 					uint32_t width, uint32_t height,
 					uint32_t x, uint32_t y,
 					struct virtio_gpu_object_array *objs,
@@ -489,6 +504,13 @@ void virtio_gpu_fence_event_process(struct virtio_gpu_device *vdev,
 
 /* virtgpu_object.c */
 void virtio_gpu_cleanup_object(struct virtio_gpu_object *bo);
+void virtio_gpu_object_sync(struct virtio_gpu_device *vgdev,
+			    struct virtio_gpu_object *bo, uint64_t offset,
+			    uint64_t size);
+void virtio_gpu_panic_object_sync(struct virtio_gpu_device *vgdev,
+				  struct virtio_gpu_object *bo,
+				  uint64_t offset, uint64_t size);
+void virtio_gpu_object_unmap_all(struct virtio_gpu_device *vgdev);
 struct drm_gem_object *virtio_gpu_create_object(struct drm_device *dev,
 						size_t size);
 int virtio_gpu_object_create(struct virtio_gpu_device *vgdev,

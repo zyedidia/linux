@@ -144,14 +144,16 @@ static int virtio_gpu_panic_update_dumb_bo(struct virtio_gpu_device *vgdev,
 	uint32_t y = rect->y1;
 	uint32_t off = x * state->fb->format->cpp[0] +
 		y * state->fb->pitches[0];
+	uint32_t size = h ? (h - 1) * state->fb->pitches[0] +
+		w * state->fb->format->cpp[0] : 0;
 
 	objs = virtio_gpu_panic_array_alloc();
 	if (!objs)
 		return -ENOMEM;
 	virtio_gpu_array_add_obj(objs, &bo->base.base);
 
-	return virtio_gpu_panic_cmd_transfer_to_host_2d(vgdev, off, w, h, x, y,
-							objs);
+	return virtio_gpu_panic_cmd_transfer_to_host_2d(vgdev, off, size, w, h,
+							x, y, objs);
 }
 
 static void virtio_gpu_update_dumb_bo(struct virtio_gpu_device *vgdev,
@@ -167,13 +169,15 @@ static void virtio_gpu_update_dumb_bo(struct virtio_gpu_device *vgdev,
 	uint32_t y = rect->y1;
 	uint32_t off = x * state->fb->format->cpp[0] +
 		y * state->fb->pitches[0];
+	uint32_t size = h ? (h - 1) * state->fb->pitches[0] +
+		w * state->fb->format->cpp[0] : 0;
 
 	objs = virtio_gpu_array_alloc(1);
 	if (!objs)
 		return;
 	virtio_gpu_array_add_obj(objs, &bo->base.base);
 
-	virtio_gpu_cmd_transfer_to_host_2d(vgdev, off, w, h, x, y,
+	virtio_gpu_cmd_transfer_to_host_2d(vgdev, off, size, w, h, x, y,
 					   objs, NULL);
 }
 
@@ -482,7 +486,7 @@ static void virtio_gpu_cursor_plane_update(struct drm_plane *plane,
 			return;
 		}
 		virtio_gpu_cmd_transfer_to_host_2d
-			(vgdev, 0,
+			(vgdev, 0, vgfb->base.obj[0]->size,
 			 plane->state->crtc_w,
 			 plane->state->crtc_h,
 			 0, 0, objs, vgplane_st->fence);
