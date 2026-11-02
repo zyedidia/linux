@@ -13,7 +13,10 @@
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_mode_config.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_syncobj.h>
 #include <linux/dma-fence.h>
@@ -824,18 +827,51 @@ int vduse_guest_gpu_amdgpu_reg_bar(struct vduse_guest_gpu_res *res, u32 *file)
 				       to_pci_dev(res->obj->dev->dev), 0, file);
 }
 
-/* Pin the reserved BO where it is placed, for its lifetime. */
-int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res)
-{
-	return amdgpu_gem_pin_placed(res->obj);
-}
-
 /* Return a resource's GEM handle in the context, or 0. */
 static u32 vduse_guest_gpu_handle(struct vduse_guest_gpu_ctx *ctx, u32 res_id)
 {
 	void *entry = xa_load(&ctx->handles, res_id);
 
 	return entry ? xa_to_value(entry) : 0;
+}
+
+/*
+ * Make a framebuffer of a resource's BO, through a context that holds a
+ * handle to it, as an ADDFB2 of that context would.
+ */
+struct drm_framebuffer *
+vduse_guest_gpu_amdgpu_fb(struct vduse_guest_gpu *gpu,
+			  struct vduse_guest_gpu_res *res,
+			  const struct drm_mode_fb_cmd2 *cmd)
+{
+	struct drm_mode_fb_cmd2 c = *cmd;
+	const struct drm_format_info *info;
+	struct vduse_guest_gpu_ctx *ctx;
+	struct drm_file *file_priv;
+	struct drm_device *dev;
+	unsigned long id;
+	u32 handle;
+
+	xa_for_each(&gpu->contexts, id, ctx) {
+		handle = ctx->file ? vduse_guest_gpu_handle(ctx, res->id) : 0;
+		if (!handle)
+			continue;
+		file_priv = vduse_guest_gpu_drm_file(ctx->file);
+		dev = file_priv->minor->dev;
+		info = drm_get_format_info(dev, c.pixel_format, 0);
+		if (!info || !dev->mode_config.funcs->fb_create)
+			return ERR_PTR(-EINVAL);
+		c.handles[0] = handle;
+		return dev->mode_config.funcs->fb_create(dev, file_priv, info,
+							 &c);
+	}
+	return ERR_PTR(-ENOENT);
+}
+
+/* Pin the reserved BO where it is placed, for its lifetime. */
+int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res)
+{
+	return amdgpu_gem_pin_placed(res->obj);
 }
 
 /*

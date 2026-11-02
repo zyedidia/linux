@@ -156,7 +156,10 @@ struct vduse_guest_gpu_ctx {
  * the numbers of contexts and resources that exist are in contexts and
  * resources. The number of times that a mapped BO moved and was unmapped is
  * in moves, and the numbers of fault requests answered with a mapping and
- * refused are in faults and faults_refused.
+ * refused are in faults and faults_refused. The number of fenced flushes
+ * that wait for a flip is in flips. Of flips_timed flips, flip_commit_us is
+ * the total time of their commits, and flip_wait_us the total time from
+ * SET_SCANOUT_BLOB to the flip.
  */
 struct vduse_guest_gpu_stats {
 	atomic64_t commands;
@@ -166,6 +169,10 @@ struct vduse_guest_gpu_stats {
 	atomic64_t moves;
 	atomic64_t faults;
 	atomic64_t faults_refused;
+	atomic64_t flips;
+	atomic64_t flip_commit_us;
+	atomic64_t flip_wait_us;
+	atomic64_t flips_timed;
 };
 
 struct vduse_guest_gpu {
@@ -174,13 +181,20 @@ struct vduse_guest_gpu {
 	struct vduse_guest_shm region;
 	char *render_path;
 	/*
-	 * With vram, which the vram option sets, a mappable BO for which Mesa
-	 * asks VRAM is placed in CPU-visible VRAM. The host maps such BOs
-	 * through BAR0, which the command worker registers as bar_file before
-	 * it maps the first of them.
+	 * With vram, which the vram and display options set, a mappable BO
+	 * for which Mesa asks VRAM is placed in CPU-visible VRAM. The host
+	 * maps such BOs through BAR0, which the command worker registers as
+	 * bar_file before it maps the first of them.
 	 */
 	bool vram;
 	u32 bar_file;
+	/*
+	 * The scanouts on the guest's KMS, with the display option, or NULL,
+	 * and the responses of GET_DISPLAY_INFO and GET_EDID.
+	 */
+	struct vduse_guest_gpu_display *display;
+	struct virtio_gpu_resp_display_info display_info;
+	struct virtio_gpu_resp_edid edid;
 
 	/*
 	 * Commands run in queue order on one worker. The running flag, under
@@ -270,5 +284,26 @@ int vduse_guest_gpu_amdgpu_vram(struct vduse_guest_gpu_res *res,
 				void *arg);
 int vduse_guest_gpu_amdgpu_reg_bar(struct vduse_guest_gpu_res *res, u32 *file);
 int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res);
+struct drm_framebuffer *
+vduse_guest_gpu_amdgpu_fb(struct vduse_guest_gpu *gpu,
+			  struct vduse_guest_gpu_res *res,
+			  const struct drm_mode_fb_cmd2 *cmd);
+
+bool vduse_guest_gpu_running(struct vduse_guest_gpu *gpu);
+int vduse_guest_gpu_display_init(struct vduse_guest_gpu *gpu);
+void vduse_guest_gpu_display_fini(struct vduse_guest_gpu *gpu);
+void vduse_guest_gpu_display_reset(struct vduse_guest_gpu *gpu);
+void vduse_guest_gpu_display_clear(struct vduse_guest_gpu *gpu, u32 events);
+u32 vduse_guest_gpu_display_info(struct vduse_guest_gpu *gpu,
+				 struct virtio_gpu_resp_display_info *info);
+u32 vduse_guest_gpu_set_scanout(struct vduse_guest_gpu *gpu,
+				const struct virtio_gpu_set_scanout *cmd);
+u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
+				     const struct virtio_gpu_set_scanout_blob *cmd);
+struct dma_fence *vduse_guest_gpu_flush_fence(struct vduse_guest_gpu *gpu,
+					      u32 res_id);
+u32 vduse_guest_gpu_get_edid(struct vduse_guest_gpu *gpu,
+			     const struct virtio_gpu_cmd_get_edid *cmd,
+			     struct virtio_gpu_resp_edid *resp);
 
 #endif

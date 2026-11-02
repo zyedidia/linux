@@ -4,5 +4,5 @@ vduse_guest-y := core.o
 vduse_guest-$(CONFIG_VDUSE_GUEST_BLK) += blk.o
 vduse_guest-$(CONFIG_VDUSE_GUEST_WLAN) += wlan.o
 vduse_guest-$(CONFIG_VDUSE_GUEST_NET) += net.o
-vduse_guest-$(CONFIG_VDUSE_GUEST_GPU) += gpu.o amdgpu.o
+vduse_guest-$(CONFIG_VDUSE_GUEST_GPU) += gpu.o amdgpu.o gpu_display.o
 vduse_guest-$(CONFIG_VDUSE_GUEST_PCI) += pci.o

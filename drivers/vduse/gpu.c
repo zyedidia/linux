@@ -84,6 +84,10 @@ union vduse_guest_gpu_req {
 	struct virtio_gpu_resource_unmap_blob unmap_blob;
 	struct virtio_gpu_resource_unref unref;
 	struct virtio_gpu_cmd_submit submit;
+	struct virtio_gpu_set_scanout set_scanout;
+	struct virtio_gpu_set_scanout_blob set_scanout_blob;
+	struct virtio_gpu_resource_flush flush;
+	struct virtio_gpu_cmd_get_edid get_edid;
 };
 
 /* Take size bytes, 8-aligned, of the worker's memory. */
@@ -834,6 +838,32 @@ static u32 vduse_guest_gpu_dispatch(struct vduse_guest_gpu *gpu,
 		if (in_len < sizeof(req->submit))
 			break;
 		return vduse_guest_gpu_submit_3d(gpu, &req->submit, riov, in_len);
+	case VIRTIO_GPU_CMD_GET_DISPLAY_INFO:
+		*out = (void *)&gpu->display_info + sizeof(gpu->display_info.hdr);
+		*out_len = sizeof(gpu->display_info) -
+			   sizeof(gpu->display_info.hdr);
+		return vduse_guest_gpu_display_info(gpu, &gpu->display_info);
+	case VIRTIO_GPU_CMD_GET_EDID:
+		if (in_len < sizeof(req->get_edid))
+			break;
+		*out = (void *)&gpu->edid + sizeof(gpu->edid.hdr);
+		*out_len = sizeof(gpu->edid) - sizeof(gpu->edid.hdr);
+		return vduse_guest_gpu_get_edid(gpu, &req->get_edid, &gpu->edid);
+	case VIRTIO_GPU_CMD_SET_SCANOUT:
+		if (in_len < sizeof(req->set_scanout))
+			break;
+		return vduse_guest_gpu_set_scanout(gpu, &req->set_scanout);
+	case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+		if (in_len < sizeof(req->set_scanout_blob))
+			break;
+		return vduse_guest_gpu_set_scanout_blob(gpu,
+							&req->set_scanout_blob);
+	case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+		/* A fenced flush waits for the flip of the resource. */
+		if (in_len < sizeof(req->flush))
+			break;
+		return gpu->display ? VIRTIO_GPU_RESP_OK_NODATA :
+				      VIRTIO_GPU_RESP_ERR_UNSPEC;
 	}
 
 	return VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -844,7 +874,9 @@ static u32 vduse_guest_gpu_dispatch(struct vduse_guest_gpu *gpu,
  * The response to a fenced command carries its fence, also when it is an
  * error, since the host's driver completes fences from the response. A
  * fenced command on a ring of a context completes once the last command
- * submission on that ring's timeline has finished, which *fence gives.
+ * submission on that ring's timeline has finished, which *fence gives. A
+ * fenced RESOURCE_FLUSH without a ring completes at the latest flip of a
+ * scanout that shows the resource, whose fence *fence gives.
  */
 static u32 vduse_guest_gpu_handle(struct vduse_guest_gpu *gpu,
 				  struct vringh_kiov *riov,
@@ -877,6 +909,12 @@ static u32 vduse_guest_gpu_handle(struct vduse_guest_gpu *gpu,
 			resp.ctx_id = req.hdr.ctx_id;
 		}
 		if ((flags & VIRTIO_GPU_FLAG_FENCE) &&
+		    !(flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) &&
+		    type == VIRTIO_GPU_RESP_OK_NODATA &&
+		    le32_to_cpu(req.hdr.type) == VIRTIO_GPU_CMD_RESOURCE_FLUSH)
+			*fence = vduse_guest_gpu_flush_fence(gpu,
+				le32_to_cpu(req.flush.resource_id));
+		if ((flags & VIRTIO_GPU_FLAG_FENCE) &&
 		    (flags & VIRTIO_GPU_FLAG_INFO_RING_IDX)) {
 			resp.flags |= cpu_to_le32(VIRTIO_GPU_FLAG_INFO_RING_IDX);
 			resp.ring_idx = req.hdr.ring_idx;
@@ -908,7 +946,7 @@ static u32 vduse_guest_gpu_handle(struct vduse_guest_gpu *gpu,
 	return sizeof(resp) + out_len;
 }
 
-static bool vduse_guest_gpu_running(struct vduse_guest_gpu *gpu)
+bool vduse_guest_gpu_running(struct vduse_guest_gpu *gpu)
 {
 	bool running;
 
@@ -1224,6 +1262,7 @@ static void vduse_guest_gpu_stop(void *priv)
 	kthread_flush_worker(gpu->worker);
 	kthread_flush_worker(gpu->fault_worker);
 	vduse_guest_gpu_drop_fences(gpu);
+	vduse_guest_gpu_display_reset(gpu);
 
 	xa_for_each(&gpu->resources, id, res) {
 		xa_erase(&gpu->resources, id);
@@ -1243,7 +1282,7 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	const char *render = VDUSE_GUEST_GPU_RENDER;
 	u64 region = VDUSE_GUEST_GPU_REGION_SIZE;
 	struct vduse_guest_gpu *gpu;
-	bool vram = false;
+	bool vram = false, display = false;
 	char *opt, *end;
 	int err;
 
@@ -1252,6 +1291,8 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 			render = opt + strlen("render=");
 		} else if (!strcmp(opt, "vram")) {
 			vram = true;
+		} else if (!strcmp(opt, "display")) {
+			display = true;
 		} else if (strstarts(opt, "region=")) {
 			region = memparse(opt + strlen("region="), &end);
 			if (*end || !region || !PAGE_ALIGNED(region))
@@ -1265,7 +1306,11 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	if (!gpu)
 		return ERR_PTR(-ENOMEM);
 	gpu->dev = dev;
-	gpu->vram = vram;
+	/*
+	 * The display places mappable BOs in VRAM, since amdgpu scans out
+	 * from VRAM on the iGPU.
+	 */
+	gpu->vram = vram || display;
 	spin_lock_init(&gpu->lock);
 	spin_lock_init(&gpu->fence_lock);
 	INIT_LIST_HEAD(&gpu->waiting);
@@ -1300,10 +1345,15 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	}
 
 	/*
-	 * The device has no scanouts, which the host's driver accepts as a
-	 * device without KMS.
+	 * Without the display option, the device has no scanouts, which the
+	 * host's driver accepts as a device without KMS.
 	 */
 	gpu->config.num_capsets = cpu_to_le32(1);
+	if (display) {
+		err = vduse_guest_gpu_display_init(gpu);
+		if (err)
+			pr_warn("%s: serves no scanouts: %d\n", name, err);
+	}
 
 	/*
 	 * The host's driver accepts execbuffers, HOST3D blobs and context
@@ -1314,6 +1364,13 @@ static void *__init vduse_guest_gpu_setup(struct vduse_guest_dev *dev,
 	cfg->features = BIT_ULL(VIRTIO_GPU_F_VIRGL) |
 			BIT_ULL(VIRTIO_GPU_F_RESOURCE_BLOB) |
 			BIT_ULL(VIRTIO_GPU_F_CONTEXT_INIT);
+	/*
+	 * The host takes the modes of a scanout from its EDID, and paces its
+	 * flips by the fences of its flushes.
+	 */
+	if (gpu->display)
+		cfg->features |= BIT_ULL(VIRTIO_GPU_F_EDID) |
+				 BIT_ULL(VIRTIO_GPU_F_FLIP_FENCE);
 	cfg->num_queues = ARRAY_SIZE(vduse_guest_gpu_queue_sizes);
 	cfg->queue_sizes = vduse_guest_gpu_queue_sizes;
 	/* A new guest has none of the contexts of the one before it. */
@@ -1342,6 +1399,7 @@ static void vduse_guest_gpu_release(void *priv)
 {
 	struct vduse_guest_gpu *gpu = priv;
 
+	vduse_guest_gpu_display_fini(gpu);
 	kthread_destroy_worker(gpu->fault_worker);
 	kthread_destroy_worker(gpu->worker);
 	if (gpu->mm)
@@ -1365,6 +1423,26 @@ static void vduse_guest_gpu_show(void *priv, struct seq_file *m)
 	seq_printf(m, "  %-18s %lld\n", "faults", atomic64_read(&s->faults));
 	seq_printf(m, "  %-18s %lld\n", "faults_refused",
 		   atomic64_read(&s->faults_refused));
+	seq_printf(m, "  %-18s %lld\n", "flips", atomic64_read(&s->flips));
+	seq_printf(m, "  %-18s %lld\n", "flips_timed",
+		   atomic64_read(&s->flips_timed));
+	seq_printf(m, "  %-18s %lld\n", "flip_commit_us",
+		   atomic64_read(&s->flip_commit_us));
+	seq_printf(m, "  %-18s %lld\n", "flip_wait_us",
+		   atomic64_read(&s->flip_wait_us));
+}
+
+/* The host's driver acknowledges display events by writing events_clear. */
+static void vduse_guest_gpu_config_write(void *priv, u32 offset,
+					 const void *buf, u32 len)
+{
+	__le32 events;
+
+	if (offset != offsetof(struct virtio_gpu_config, events_clear) ||
+	    len != sizeof(events))
+		return;
+	memcpy(&events, buf, sizeof(events));
+	vduse_guest_gpu_display_clear(priv, le32_to_cpu(events));
 }
 
 const struct vduse_guest_backend_ops vduse_guest_gpu_ops = {
@@ -1376,4 +1454,5 @@ const struct vduse_guest_backend_ops vduse_guest_gpu_ops = {
 	.kick = vduse_guest_gpu_kick,
 	.show = vduse_guest_gpu_show,
 	.shm_fault = vduse_guest_gpu_shm_fault,
+	.config_write = vduse_guest_gpu_config_write,
 };
