@@ -868,6 +868,17 @@ vduse_guest_gpu_amdgpu_fb(struct vduse_guest_gpu *gpu,
 	return ERR_PTR(-ENOENT);
 }
 
+/* Pin a BO of the device in VRAM, until it is unpinned. */
+int vduse_guest_gpu_amdgpu_pin_vram(struct drm_gem_object *obj)
+{
+	return amdgpu_gem_pin_vram(obj);
+}
+
+void vduse_guest_gpu_amdgpu_unpin(struct drm_gem_object *obj)
+{
+	amdgpu_gem_unpin(obj);
+}
+
 /* Pin the reserved BO where it is placed, for its lifetime. */
 int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res)
 {

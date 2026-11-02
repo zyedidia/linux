@@ -1035,6 +1035,25 @@ now:
 	vduse_guest_complete(gpu->dev, VDUSE_GUEST_GPU_CTRLQ, head, len);
 }
 
+/* A command of the cursor queue has no response. */
+static void vduse_guest_gpu_cursor_cmd(struct vduse_guest_gpu *gpu,
+				       struct vringh_kiov *riov)
+{
+	size_t len = vringh_kiov_length(riov);
+	struct virtio_gpu_update_cursor cmd;
+	struct iov_iter it;
+
+	if (!gpu->display)
+		return;
+	iov_iter_kvec(&it, ITER_SOURCE, riov->iov, riov->used, len);
+	if (len < sizeof(cmd) || copy_from_iter(&cmd, sizeof(cmd), &it) !=
+				 sizeof(cmd)) {
+		atomic64_inc(&gpu->stats.cursor_errors);
+		return;
+	}
+	vduse_guest_gpu_cursor(gpu, &cmd);
+}
+
 /*
  * Serve one queue until it is empty. Each command is answered with the
  * length that handle returns, and the cursor queue's commands, which have no
@@ -1070,6 +1089,7 @@ static void vduse_guest_gpu_serve(struct vduse_guest_gpu *gpu,
 			len = vduse_guest_gpu_handle(gpu, &riov, &wiov, &fence);
 			vduse_guest_gpu_complete(gpu, head, len, fence);
 		} else {
+			vduse_guest_gpu_cursor_cmd(gpu, &riov);
 			vduse_guest_complete(gpu->dev, index, head, 0);
 		}
 		cond_resched();
@@ -1424,6 +1444,12 @@ static void vduse_guest_gpu_show(void *priv, struct seq_file *m)
 	seq_printf(m, "  %-18s %lld\n", "faults_refused",
 		   atomic64_read(&s->faults_refused));
 	seq_printf(m, "  %-18s %lld\n", "flips", atomic64_read(&s->flips));
+	seq_printf(m, "  %-18s %lld\n", "cursor_updates",
+		   atomic64_read(&s->cursor_updates));
+	seq_printf(m, "  %-18s %lld\n", "cursor_moves",
+		   atomic64_read(&s->cursor_moves));
+	seq_printf(m, "  %-18s %lld\n", "cursor_errors",
+		   atomic64_read(&s->cursor_errors));
 	seq_printf(m, "  %-18s %lld\n", "flips_timed",
 		   atomic64_read(&s->flips_timed));
 	seq_printf(m, "  %-18s %lld\n", "flip_commit_us",

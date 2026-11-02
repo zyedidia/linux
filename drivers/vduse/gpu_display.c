@@ -22,12 +22,17 @@
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem.h>
+#include <drm/drm_gem_ttm_helper.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_vblank.h>
+#include <drm/ttm/ttm_bo.h>
 #include <linux/dma-fence.h>
+#include <linux/dma-resv.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/iosys-map.h>
 #include <linux/mount.h>
 #include <linux/slab.h>
 #include <linux/vduse_guest.h>
@@ -35,17 +40,29 @@
 
 #include "gpu.h"
 
+/* The size of a virtio-gpu cursor, an ARGB8888 image without padding. */
+#define VDUSE_GUEST_GPU_CURSOR 64
+
 /*
  * A scanout shows res_id on crtc, which it takes when it is enabled and keeps
  * until a disable of it succeeds, in mode.
  * Flip is the fence of its latest commit, which signals at the flip, on the
- * scanout's own fence context, and flip_start when its command arrived.
+ * scanout's own fence context, and flip_start when its command arrived. The
+ * host shows a cursor while cursor_on is set, with its top left corner at
+ * cursor_x and cursor_y, from the guest's own cursor buffer that cursor_cur
+ * indexes. An update writes the other buffer, which is on the display only
+ * if the commit after the previous update failed. The buffers are pinned in
+ * VRAM, so that they never move.
  */
 struct vduse_guest_gpu_scanout {
 	struct drm_connector *connector;
 	struct drm_crtc *crtc;
 	struct drm_display_mode mode;
 	u32 res_id;
+	struct drm_client_buffer *cursors[2];
+	unsigned int cursor_cur;
+	bool cursor_on;
+	s32 cursor_x, cursor_y;
 	struct dma_fence *flip;
 	ktime_t flip_start;
 	u64 fence_context;
@@ -229,12 +246,28 @@ free:
 void vduse_guest_gpu_display_fini(struct vduse_guest_gpu *gpu)
 {
 	struct vduse_guest_gpu_display *d = gpu->display;
+	struct drm_client_buffer *buf;
+	unsigned int i, j;
 
 	if (!d)
 		return;
 	mutex_lock(&d->events_lock);
 	d->gpu = NULL;
 	mutex_unlock(&d->events_lock);
+	/*
+	 * The scanouts are off, unless a disable failed, and deleting a buffer
+	 * takes it off any plane.
+	 */
+	for (i = 0; i < d->nr_scanouts; i++) {
+		for (j = 0; j < ARRAY_SIZE(d->scanouts[i].cursors); j++) {
+			buf = d->scanouts[i].cursors[j];
+			if (!buf)
+				continue;
+			vduse_guest_gpu_amdgpu_unpin(buf->fb->obj[0]);
+			drm_client_buffer_delete(buf);
+			d->scanouts[i].cursors[j] = NULL;
+		}
+	}
 	gpu->display = NULL;
 }
 
@@ -391,6 +424,7 @@ static int vduse_guest_gpu_build(struct drm_atomic_commit *state,
 				 struct vduse_guest_gpu_commit *c)
 {
 	struct vduse_guest_gpu_scanout *so = c->so;
+	struct drm_plane_state *cursor_state;
 	struct drm_connector_state *conn_state;
 	struct drm_plane_state *plane_state;
 	struct drm_crtc_state *crtc_state;
@@ -415,6 +449,17 @@ static int vduse_guest_gpu_build(struct drm_atomic_commit *state,
 	}
 
 	if (!c->fb) {
+		/* A cursor on the CRTC goes off with it. */
+		if (so->crtc->cursor) {
+			cursor_state = drm_atomic_get_plane_state(state,
+								  so->crtc->cursor);
+			if (IS_ERR(cursor_state))
+				return PTR_ERR(cursor_state);
+			err = drm_atomic_set_crtc_for_plane(cursor_state, NULL);
+			if (err)
+				return err;
+			drm_atomic_set_fb_for_plane(cursor_state, NULL);
+		}
 		crtc_state->active = false;
 		err = drm_atomic_set_mode_for_crtc(crtc_state, NULL);
 		if (err)
@@ -546,6 +591,188 @@ static void vduse_guest_gpu_disable(struct vduse_guest_gpu_display *d,
 	memset(&so->mode, 0, sizeof(so->mode));
 }
 
+/*
+ * Commit a scanout's cursor plane: the guest's current cursor buffer at the
+ * host's position, or no cursor. A legacy cursor update takes amdgpu's
+ * asynchronous path when it only moves the cursor or changes its buffer,
+ * which waits for no flip. Showing or hiding the cursor is a commit of the
+ * CRTC, which waits for a pending flip.
+ */
+static int vduse_guest_gpu_cursor_commit(struct vduse_guest_gpu_display *d,
+					 struct vduse_guest_gpu_scanout *so)
+{
+	struct drm_plane *plane = so->crtc ? so->crtc->cursor : NULL;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_plane_state *ps;
+	struct drm_atomic_commit *state;
+	bool on = so->cursor_on && so->res_id;
+	int err;
+
+	if (!plane)
+		return -ENODEV;
+	state = drm_atomic_commit_alloc(d->drm);
+	if (!state)
+		return -ENOMEM;
+	drm_modeset_acquire_init(&ctx, 0);
+	state->acquire_ctx = &ctx;
+	state->legacy_cursor_update = true;
+retry:
+	state->allow_modeset = false;
+	ps = drm_atomic_get_plane_state(state, plane);
+	err = PTR_ERR_OR_ZERO(ps);
+	if (!err)
+		err = drm_atomic_set_crtc_for_plane(ps, on ? so->crtc : NULL);
+	if (!err) {
+		drm_atomic_set_fb_for_plane(ps, on ?
+			so->cursors[so->cursor_cur]->fb : NULL);
+		ps->crtc_x = so->cursor_x;
+		ps->crtc_y = so->cursor_y;
+		ps->crtc_w = on ? VDUSE_GUEST_GPU_CURSOR : 0;
+		ps->crtc_h = on ? VDUSE_GUEST_GPU_CURSOR : 0;
+		ps->src_x = 0;
+		ps->src_y = 0;
+		ps->src_w = on ? VDUSE_GUEST_GPU_CURSOR << 16 : 0;
+		ps->src_h = on ? VDUSE_GUEST_GPU_CURSOR << 16 : 0;
+		err = drm_atomic_commit(state);
+	}
+	if (err == -EDEADLK) {
+		drm_atomic_commit_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+	drm_atomic_commit_put(state);
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return err;
+}
+
+/*
+ * Copy a resource's cursor image into the guest's cursor buffer that is not
+ * current, which becomes the current one. The image is a blob of 64x64
+ * ARGB8888 pixels, read through TTM's access to the BO, which reaches VRAM
+ * that the CPU cannot map. A BO whose writes take over 100 ms is refused, and
+ * the read is repeated once if a move of the BO was pending. The image goes
+ * through a bounce buffer, so that no two reservations are held at once, and
+ * the cursor buffer is written once its clear has finished.
+ */
+static int vduse_guest_gpu_cursor_image(struct vduse_guest_gpu_display *d,
+					struct vduse_guest_gpu_scanout *so,
+					struct vduse_guest_gpu_res *res)
+{
+	const size_t row = VDUSE_GUEST_GPU_CURSOR * 4;
+	unsigned int next = !so->cursor_cur, y, tries;
+	struct drm_client_buffer *buf;
+	struct iosys_map dst;
+	u8 *image;
+	int err;
+
+	if (!res->obj || res->size < row * VDUSE_GUEST_GPU_CURSOR)
+		return -EINVAL;
+	image = kmalloc(row * VDUSE_GUEST_GPU_CURSOR, GFP_KERNEL);
+	if (!image)
+		return -ENOMEM;
+	for (tries = 0; tries < 2; tries++) {
+		err = -EBUSY;
+		if (!dma_resv_wait_timeout(res->obj->resv, DMA_RESV_USAGE_WRITE,
+					   false, msecs_to_jiffies(100)))
+			goto out;
+		err = ttm_bo_access(drm_gem_ttm_of_gem(res->obj), 0, image,
+				    row * VDUSE_GUEST_GPU_CURSOR, 0);
+		if (err < 0)
+			goto out;
+		if (dma_resv_test_signaled(res->obj->resv,
+					   DMA_RESV_USAGE_KERNEL))
+			break;
+		err = -EBUSY;
+	}
+	if (err < 0)
+		goto out;
+
+	if (!so->cursors[next]) {
+		buf = drm_client_buffer_create_dumb(&d->client,
+						    VDUSE_GUEST_GPU_CURSOR,
+						    VDUSE_GUEST_GPU_CURSOR,
+						    DRM_FORMAT_ARGB8888);
+		err = PTR_ERR_OR_ZERO(buf);
+		if (err)
+			goto out;
+		err = vduse_guest_gpu_amdgpu_pin_vram(buf->fb->obj[0]);
+		if (err) {
+			drm_client_buffer_delete(buf);
+			goto out;
+		}
+		so->cursors[next] = buf;
+	}
+	buf = so->cursors[next];
+	err = drm_client_buffer_vmap_local(buf, &dst);
+	if (err)
+		goto out;
+	dma_resv_wait_timeout(buf->fb->obj[0]->resv, DMA_RESV_USAGE_KERNEL,
+			      false, MAX_SCHEDULE_TIMEOUT);
+	for (y = 0; y < VDUSE_GUEST_GPU_CURSOR; y++)
+		iosys_map_memcpy_to(&dst, y * buf->fb->pitches[0],
+				    image + y * row, row);
+	drm_client_buffer_vunmap_local(buf);
+	so->cursor_cur = next;
+	err = 0;
+out:
+	kfree(image);
+	return err;
+}
+
+/*
+ * Serve a command of the cursor queue. UPDATE_CURSOR changes the image, or
+ * hides the cursor with resource 0, and moves it, and MOVE_CURSOR only moves
+ * it. An image that cannot be copied hides the cursor. A scanout that is off
+ * keeps the cursor for when it is on.
+ */
+void vduse_guest_gpu_cursor(struct vduse_guest_gpu *gpu,
+			    const struct virtio_gpu_update_cursor *cmd)
+{
+	struct vduse_guest_gpu_display *d = gpu->display;
+	u32 id = le32_to_cpu(cmd->pos.scanout_id);
+	u32 type = le32_to_cpu(cmd->hdr.type);
+	struct vduse_guest_gpu_scanout *so;
+	struct vduse_guest_gpu_res *res;
+	int err = 0, image = 0;
+	u32 res_id;
+
+	if (!d || id >= d->nr_scanouts ||
+	    (type != VIRTIO_GPU_CMD_UPDATE_CURSOR &&
+	     type != VIRTIO_GPU_CMD_MOVE_CURSOR)) {
+		atomic64_inc(&gpu->stats.cursor_errors);
+		return;
+	}
+	so = &d->scanouts[id];
+	if (type == VIRTIO_GPU_CMD_MOVE_CURSOR && !so->cursor_on)
+		return;
+	so->cursor_x = le32_to_cpu(cmd->pos.x);
+	so->cursor_y = le32_to_cpu(cmd->pos.y);
+
+	if (type == VIRTIO_GPU_CMD_UPDATE_CURSOR) {
+		res_id = le32_to_cpu(cmd->resource_id);
+		if (res_id) {
+			res = xa_load(&gpu->resources, res_id);
+			image = res ? vduse_guest_gpu_cursor_image(d, so, res) :
+				      -ENOENT;
+		}
+		so->cursor_on = res_id && !image;
+	}
+
+	if (so->res_id)
+		err = vduse_guest_gpu_cursor_commit(d, so);
+	if (image || err) {
+		atomic64_inc(&gpu->stats.cursor_errors);
+		pr_warn_ratelimited("%s: cannot update the cursor of scanout %u: %d\n",
+				    vduse_guest_name(gpu->dev), id,
+				    image ? image : err);
+	} else if (so->res_id) {
+		atomic64_inc(type == VIRTIO_GPU_CMD_UPDATE_CURSOR ?
+			     &gpu->stats.cursor_updates :
+			     &gpu->stats.cursor_moves);
+	}
+}
+
 /* The DRM format of each virtio-gpu format, which names bytes in memory. */
 static u32 vduse_guest_gpu_fourcc(u32 format)
 {
@@ -667,6 +894,10 @@ u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
 		atomic64_add(ktime_to_us(commit), &gpu->stats.flip_commit_us);
 	so->res_id = res_id;
 	drm_mode_copy(&so->mode, c.mode);
+	/* A CRTC that a modeset lit shows the host's cursor again. */
+	if (c.modeset && so->cursor_on &&
+	    vduse_guest_gpu_cursor_commit(d, so))
+		atomic64_inc(&gpu->stats.cursor_errors);
 	return VIRTIO_GPU_RESP_OK_NODATA;
 
 fail:
@@ -716,7 +947,7 @@ struct dma_fence *vduse_guest_gpu_flush_fence(struct vduse_guest_gpu *gpu,
 	return NULL;
 }
 
-/* A reset turns every scanout off. */
+/* A reset turns every scanout off and forgets the host's cursor. */
 void vduse_guest_gpu_display_reset(struct vduse_guest_gpu *gpu)
 {
 	struct vduse_guest_gpu_display *d = gpu->display;
@@ -728,6 +959,8 @@ void vduse_guest_gpu_display_reset(struct vduse_guest_gpu *gpu)
 		vduse_guest_gpu_disable(d, &d->scanouts[i]);
 		dma_fence_put(d->scanouts[i].flip);
 		d->scanouts[i].flip = NULL;
+		/* The host's next driver sets a cursor of its own. */
+		d->scanouts[i].cursor_on = false;
 	}
 }
 

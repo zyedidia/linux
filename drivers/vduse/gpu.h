@@ -159,7 +159,9 @@ struct vduse_guest_gpu_ctx {
  * refused are in faults and faults_refused. The number of fenced flushes
  * that wait for a flip is in flips. Of flips_timed flips, flip_commit_us is
  * the total time of their commits, and flip_wait_us the total time from
- * SET_SCANOUT_BLOB to the flip.
+ * SET_SCANOUT_BLOB to the flip. UPDATE_CURSOR and MOVE_CURSOR commands
+ * committed on a scanout that is on are counted in cursor_updates and
+ * cursor_moves, and failed ones in cursor_errors.
  */
 struct vduse_guest_gpu_stats {
 	atomic64_t commands;
@@ -173,6 +175,9 @@ struct vduse_guest_gpu_stats {
 	atomic64_t flip_commit_us;
 	atomic64_t flip_wait_us;
 	atomic64_t flips_timed;
+	atomic64_t cursor_updates;
+	atomic64_t cursor_moves;
+	atomic64_t cursor_errors;
 };
 
 struct vduse_guest_gpu {
@@ -284,6 +289,8 @@ int vduse_guest_gpu_amdgpu_vram(struct vduse_guest_gpu_res *res,
 				void *arg);
 int vduse_guest_gpu_amdgpu_reg_bar(struct vduse_guest_gpu_res *res, u32 *file);
 int vduse_guest_gpu_amdgpu_pin(struct vduse_guest_gpu_res *res);
+int vduse_guest_gpu_amdgpu_pin_vram(struct drm_gem_object *obj);
+void vduse_guest_gpu_amdgpu_unpin(struct drm_gem_object *obj);
 struct drm_framebuffer *
 vduse_guest_gpu_amdgpu_fb(struct vduse_guest_gpu *gpu,
 			  struct vduse_guest_gpu_res *res,
@@ -302,6 +309,8 @@ u32 vduse_guest_gpu_set_scanout_blob(struct vduse_guest_gpu *gpu,
 				     const struct virtio_gpu_set_scanout_blob *cmd);
 struct dma_fence *vduse_guest_gpu_flush_fence(struct vduse_guest_gpu *gpu,
 					      u32 res_id);
+void vduse_guest_gpu_cursor(struct vduse_guest_gpu *gpu,
+			    const struct virtio_gpu_update_cursor *cmd);
 u32 vduse_guest_gpu_get_edid(struct vduse_guest_gpu *gpu,
 			     const struct virtio_gpu_cmd_get_edid *cmd,
 			     struct virtio_gpu_resp_edid *resp);
