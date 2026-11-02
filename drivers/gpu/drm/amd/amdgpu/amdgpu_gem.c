@@ -556,6 +556,43 @@ int amdgpu_gem_pin_placed(struct drm_gem_object *gobj)
 			     amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type));
 }
 
+/**
+ * amdgpu_gem_pin_vram - pin a BO in VRAM
+ * @gobj: GEM object of a BO that may be placed in VRAM
+ *
+ * The BO is reserved and unreserved here, and stays pinned until
+ * amdgpu_gem_unpin().
+ *
+ * Return: 0 or a negative error.
+ */
+int amdgpu_gem_pin_vram(struct drm_gem_object *gobj)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(gobj);
+	int r;
+
+	if (gobj->funcs != &amdgpu_gem_object_funcs || drm_gem_is_imported(gobj))
+		return -EINVAL;
+	r = amdgpu_bo_reserve(bo, true);
+	if (r)
+		return r;
+	r = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_VRAM);
+	amdgpu_bo_unreserve(bo);
+	return r;
+}
+
+/**
+ * amdgpu_gem_unpin - unpin a BO that amdgpu_gem_pin_vram() pinned
+ * @gobj: GEM object of the BO
+ */
+void amdgpu_gem_unpin(struct drm_gem_object *gobj)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(gobj);
+
+	amdgpu_bo_reserve(bo, true);
+	amdgpu_bo_unpin(bo);
+	amdgpu_bo_unreserve(bo);
+}
+
 /*
  * GEM ioctls.
  */
