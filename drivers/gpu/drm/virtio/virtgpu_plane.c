@@ -114,9 +114,11 @@ static int virtio_gpu_plane_atomic_check(struct drm_plane *plane,
 	 * Ignore damage clips if the framebuffer attached to the plane's state
 	 * has changed since the last plane update (page-flip). In this case, a
 	 * full plane update should happen because uploads are done per-buffer.
+	 * A duplicated state keeps the flag of the state it copies, so the flag
+	 * is set on every check.
 	 */
-	if (old_plane_state->fb != new_plane_state->fb)
-		new_plane_state->ignore_damage_clips = true;
+	new_plane_state->ignore_damage_clips =
+		old_plane_state->fb != new_plane_state->fb;
 
 	crtc_state = drm_atomic_get_crtc_state(state,
 					       new_plane_state->crtc);
