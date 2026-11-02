@@ -74,19 +74,6 @@ int vfio_pci_eventfd_replace_locked(struct vfio_pci_core_device *vdev,
 	return 0;
 }
 
-/*
- * Map the prefetchable memory BARs of a device write-combined when it is
- * enabled, and map them write-combined for userspace. On x86, PAT gives every
- * mapping of such a BAR, including those of userspace and of dma-buf
- * importers, the memory type of this reservation, which stays UC- if another
- * reservation overlapping the BAR is UC-. The setting applies to every device
- * that vfio-pci opens while it is set.
- */
-static bool prefetchable_wc;
-module_param(prefetchable_wc, bool, 0644);
-MODULE_PARM_DESC(prefetchable_wc,
-		 "Map prefetchable memory BARs write-combined, for the kernel and userspace, in devices opened while this is set (default: false)");
-
 /* List of PF's that vfio_pci_core_sriov_configure() has been called on */
 static DEFINE_MUTEX(vfio_pci_sriov_pfs_mutex);
 static LIST_HEAD(vfio_pci_sriov_pfs);
@@ -577,7 +564,14 @@ static void vfio_pci_core_map_bars(struct vfio_pci_core_device *vdev)
 			continue;
 		}
 
-		vdev->bar_wc[bar] = prefetchable_wc &&
+		/*
+		 * A BAR in wc_bars is mapped write-combined when the device is
+		 * enabled, and for userspace. On x86, PAT gives every mapping of
+		 * such a BAR, including those of userspace and of dma-buf
+		 * importers, the memory type of this reservation, which stays
+		 * UC- if another reservation overlapping the BAR is UC-.
+		 */
+		vdev->bar_wc[bar] = (vdev->wc_bars & BIT(bar)) &&
 				    (pci_resource_flags(pdev, i) &
 				     IORESOURCE_PREFETCH);
 		if (vdev->bar_wc[bar])

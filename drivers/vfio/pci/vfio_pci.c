@@ -223,6 +223,59 @@ static const struct pci_device_id vfio_pci_table[] = {
 
 MODULE_DEVICE_TABLE(pci, vfio_pci_table);
 
+static ssize_t wc_bars_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "0x%x\n", vdev->wc_bars);
+}
+
+/*
+ * Set the prefetchable memory BARs of a device to map write-combined, as a
+ * mask of BAR numbers, while the device is not open. Write-combining merges
+ * and delays stores, so it suits memory such as a GPU's VRAM aperture but
+ * not registers, which some devices place in prefetchable BARs as well.
+ */
+static ssize_t wc_bars_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(dev);
+	struct pci_dev *pdev = to_pci_dev(dev);
+	unsigned int mask;
+	int bar, ret;
+
+	ret = kstrtouint(buf, 0, &mask);
+	if (ret)
+		return ret;
+	if (mask & ~GENMASK(PCI_STD_NUM_BARS - 1, 0))
+		return -EINVAL;
+	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+		if ((mask & BIT(bar)) &&
+		    (!pci_resource_len(pdev, bar) ||
+		     !(pci_resource_flags(pdev, bar) & IORESOURCE_MEM) ||
+		     !(pci_resource_flags(pdev, bar) & IORESOURCE_PREFETCH)))
+			return -EINVAL;
+	}
+
+	mutex_lock(&vdev->vdev.dev_set->lock);
+	if (vdev->vdev.open_count) {
+		ret = -EBUSY;
+	} else {
+		vdev->wc_bars = mask;
+		ret = count;
+	}
+	mutex_unlock(&vdev->vdev.dev_set->lock);
+	return ret;
+}
+static DEVICE_ATTR_RW(wc_bars);
+
+static struct attribute *vfio_pci_attrs[] = {
+	&dev_attr_wc_bars.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(vfio_pci);
+
 static struct pci_driver vfio_pci_driver = {
 	.name			= "vfio-pci",
 	.id_table		= vfio_pci_table,
@@ -231,6 +284,7 @@ static struct pci_driver vfio_pci_driver = {
 	.sriov_configure	= vfio_pci_sriov_configure,
 	.err_handler		= &vfio_pci_core_err_handlers,
 	.driver_managed_dma	= true,
+	.dev_groups		= vfio_pci_groups,
 };
 
 static void __init vfio_pci_fill_ids(void)
