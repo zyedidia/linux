@@ -9,9 +9,15 @@
 #include <stddef.h>
 #include <asm/ptrace.h>
 #include <generated/asm-offsets.h>
+#include <linux/stringify.h>
 
 #define STUB_MMAP_NR __NR_mmap2
 #define MMAP_OFFSET(o) ((o) >> UM_KERN_PAGE_SHIFT)
+
+/* This basic asm issues rt_sigreturn without touching the stack. */
+#define STUB_RT_SIGRETURN \
+	"mov $" __stringify(__NR_rt_sigreturn) ", %eax\n\t" \
+	"int $0x80\n\t"
 
 static __always_inline long stub_syscall0(long syscall)
 {

@@ -10,10 +10,16 @@
 #include <sysdep/ptrace_user.h>
 #include <generated/asm-offsets.h>
 #include <linux/stddef.h>
+#include <linux/stringify.h>
 #include <asm/prctl.h>
 
 #define STUB_MMAP_NR __NR_mmap
 #define MMAP_OFFSET(o) (o)
+
+/* This basic asm issues rt_sigreturn without touching the stack. */
+#define STUB_RT_SIGRETURN \
+	"mov $" __stringify(__NR_rt_sigreturn) ", %eax\n\t" \
+	"syscall\n\t"
 
 #define __syscall_clobber "r11","rcx","memory"
 #define __syscall "syscall"

@@ -173,9 +173,13 @@ restart_wait:
 	/* Return so that the host modified mcontext is restored. */
 }
 
-void __section(".__syscall_stub")
+/*
+ * The host reads the signal frame at the stack pointer, so this must not
+ * touch the stack. A naked function keeps the compiler from adding a
+ * prologue, such as one that saves the frame pointer.
+ */
+void __naked __section(".__syscall_stub")
 stub_signal_restorer(void)
 {
-	/* We must not have anything on the stack when doing rt_sigreturn */
-	stub_syscall0(__NR_rt_sigreturn);
+	__asm__(STUB_RT_SIGRETURN);
 }
