@@ -56,6 +56,16 @@ else
 
 START := 0x60000000
 
+# The kernel image uses the small code model, which requires it to end below
+# 2 GB, unless CONFIG_UML_LARGE_CODE_MODEL is set. Modules are loaded into the
+# vmalloc area, which can lie above 2 GB, so they always use the large code
+# model.
+ifdef CONFIG_UML_LARGE_CODE_MODEL
+KBUILD_CFLAGS += -mcmodel=large
+else
+KBUILD_CFLAGS_MODULE += -mcmodel=large
+endif
+
 KBUILD_CFLAGS += -fno-builtin -m64 
 
 CHECKFLAGS  += -m64 -D__x86_64__

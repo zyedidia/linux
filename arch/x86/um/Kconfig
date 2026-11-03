@@ -33,6 +33,18 @@ config X86_64
 	def_bool 64BIT
 	select MODULES_USE_ELF_RELA
 
+config UML_LARGE_CODE_MODEL
+	bool "Build the kernel with the large code model"
+	depends on 64BIT
+	help
+	  The kernel is linked at 0x60000000 and normally built with the
+	  small code model, which needs the whole image, including its bss,
+	  to end below 2 GB. That leaves room for about 512 MB. Say Y if
+	  linking the kernel fails with "relocation truncated to fit" errors,
+	  as it can with allyesconfig.
+
+	  If unsure, say N.
+
 config ARCH_HAS_SC_SIGNALS
 	def_bool !64BIT
 

@@ -30,10 +30,6 @@ ifneq ($(filter $(SUBARCH),x86 x86_64 i386),)
 	HEADER_ARCH := x86
 endif
 
-ifdef CONFIG_64BIT
-	KBUILD_CFLAGS += -mcmodel=large
-endif
-
 HOST_DIR := arch/$(HEADER_ARCH)
 
 include $(srctree)/$(ARCH_DIR)/Makefile-skas
