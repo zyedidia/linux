@@ -44,7 +44,7 @@ static void sig_handler_common(int sig, struct siginfo *si, mcontext_t *mc)
 	unsigned long fixup;
 
 	r.is_user = 0;
-	if (sig == SIGSEGV || sig == SIGBUS) {
+	if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL) {
 		/* For faults, we want the data from the sigcontext. */
 		get_regs_from_mc(&r, mc);
 		if (sig == SIGSEGV)
@@ -63,6 +63,13 @@ static void sig_handler_common(int sig, struct siginfo *si, mcontext_t *mc)
 			return;
 		}
 	}
+
+	/*
+	 * A kCFI failure is handled before signals are enabled, since the
+	 * check may fail with interrupts disabled.
+	 */
+	if (IS_ENABLED(CONFIG_CFI) && sig == SIGILL && uml_cfi_trap(&r, mc))
+		return;
 
 	/* enable signals if sig isn't IRQ signal */
 	if ((sig != SIGIO) && (sig != SIGWINCH) && (sig != SIGCHLD))
@@ -314,7 +321,11 @@ void set_handler(int sig)
 	if (using_seccomp)
 		sigaddset(&action.sa_mask, SIGCHLD);
 
-	if (sig == SIGSEGV)
+	/*
+	 * A fault or a kCFI failure can happen inside the handler of an earlier
+	 * one, such as in a pending IPI that the handler runs before it returns.
+	 */
+	if (sig == SIGSEGV || sig == SIGILL)
 		flags |= SA_NODEFER;
 
 	if (sigismember(&action.sa_mask, sig))

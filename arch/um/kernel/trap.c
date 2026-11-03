@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/uaccess.h>
 #include <linux/sched/debug.h>
+#include <linux/cfi.h>
 #include <asm/current.h>
 #include <asm/tlbflush.h>
 #include <arch.h>
@@ -402,6 +403,43 @@ out:
 		current->thread.segv_regs = NULL;
 
 	return 0;
+}
+
+/* This is set while a CPU reports a kCFI failure. */
+static DEFINE_PER_CPU(bool, cfi_reporting);
+
+/*
+ * Handles a kernel-mode SIGILL from a failed kCFI check. It returns 1 if
+ * execution continues after the trapping ud2, and 0 if the SIGILL has another
+ * cause. In enforcing mode it does not return for a failed check.
+ */
+int uml_cfi_trap(struct uml_pt_regs *regs, void *mc)
+{
+	struct pt_regs *pt = container_of(regs, struct pt_regs, regs);
+	enum bug_trap_type type;
+
+	/*
+	 * A failure inside the report would otherwise nest until the signal
+	 * stack overflows.
+	 */
+	if (__this_cpu_read(cfi_reporting))
+		panic("Control flow integrity check failed while reporting another");
+
+	__this_cpu_write(cfi_reporting, true);
+	type = handle_cfi_failure(pt);
+	__this_cpu_write(cfi_reporting, false);
+
+	switch (type) {
+	case BUG_TRAP_TYPE_WARN:
+		mc_set_rip(mc, (void *)(UPT_IP(regs) + 2));
+		return 1;
+	case BUG_TRAP_TYPE_BUG:
+		current->thread.segv_regs = pt;
+		show_regs(pt);
+		panic("Control flow integrity check failed");
+	default:
+		return 0;
+	}
 }
 
 void relay_signal(int sig, struct siginfo *si, struct uml_pt_regs *regs,

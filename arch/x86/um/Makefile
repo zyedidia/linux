@@ -27,6 +27,7 @@ subarch-y += ../kernel/sys_ia32.o
 else
 
 obj-y += mem_64.o syscalls_64.o vdso/
+obj-$(CONFIG_CFI) += cfi.o
 
 subarch-y = ../lib/csum-partial_64.o ../lib/memcpy_64.o \
 	../lib/memmove_64.o ../lib/memset_64.o

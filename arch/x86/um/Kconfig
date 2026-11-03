@@ -32,7 +32,15 @@ config X86_32
 config X86_64
 	def_bool 64BIT
 	select ARCH_HAS_SYSCALL_WRAPPER
+	select ARCH_SUPPORTS_CFI
+	select ARCH_USES_CFI_TRAPS if CFI
 	select MODULES_USE_ELF_RELA
+
+# The x86 assembly macros for kCFI type hashes put this much padding before the
+# hash. UML adds none, so the hash is right before each typed assembly function.
+config FUNCTION_PADDING_BYTES
+	int
+	default 0
 
 config UML_LARGE_CODE_MODEL
 	bool "Build the kernel with the large code model"

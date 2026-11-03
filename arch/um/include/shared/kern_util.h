@@ -22,6 +22,7 @@ struct pt_regs;
 extern void do_signal(struct pt_regs *regs);
 extern void interrupt_end(void);
 extern unsigned long uml_iomem_fixup(unsigned long ip);
+extern int uml_cfi_trap(struct uml_pt_regs *regs, void *mc);
 extern void relay_signal(int sig, struct siginfo *si, struct uml_pt_regs *regs,
 			 void *mc);
 

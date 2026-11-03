@@ -112,6 +112,8 @@ void __init os_init_smp(void)
 	};
 
 	sigfillset(&action.sa_mask);
+	/* SIGILL stays unblocked, since an IPI function can fail a kCFI check. */
+	sigdelset(&action.sa_mask, SIGILL);
 
 	if (sigaction(IPI_SIGNAL, &action, NULL) < 0)
 		panic("%s: sigaction failed, errno = %d", __func__, errno);
