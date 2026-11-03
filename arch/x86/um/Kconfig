@@ -31,6 +31,7 @@ config X86_32
 
 config X86_64
 	def_bool 64BIT
+	select ARCH_HAS_SYSCALL_WRAPPER
 	select MODULES_USE_ELF_RELA
 
 config UML_LARGE_CODE_MODEL

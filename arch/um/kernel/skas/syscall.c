@@ -45,12 +45,7 @@ void handle_syscall(struct uml_pt_regs *r)
 	if (syscall >= 0 && syscall < __NR_syscalls) {
 		unsigned long ret;
 
-		ret = (*sys_call_table[syscall])(UPT_SYSCALL_ARG1(&regs->regs),
-						 UPT_SYSCALL_ARG2(&regs->regs),
-						 UPT_SYSCALL_ARG3(&regs->regs),
-						 UPT_SYSCALL_ARG4(&regs->regs),
-						 UPT_SYSCALL_ARG5(&regs->regs),
-						 UPT_SYSCALL_ARG6(&regs->regs));
+		ret = um_sys_call(regs, syscall);
 
 		PT_REGS_SET_SYSCALL_RETURN(regs, ret);
 
