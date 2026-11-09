@@ -32,13 +32,33 @@
 #define VIRTIO_WLAN_EAPOL_TXQ_LEN	64
 
 /*
- * An rx buffer holds the virtio header and the largest frame, which can have
- * a VLAN tag. The MTU keeps it within one page.
+ * Without mergeable buffers, an rx buffer holds the virtio header and the
+ * largest frame, which can have a VLAN tag. The MTU keeps it within one
+ * page.
  */
 #define VIRTIO_WLAN_RX_BUF_SIZE(mtu) \
 	(sizeof(struct virtio_net_hdr_v1) + VLAN_ETH_HLEN + (mtu))
 #define VIRTIO_WLAN_MAX_MTU \
 	(PAGE_SIZE - VIRTIO_WLAN_RX_BUF_SIZE(0))
+
+/*
+ * With mergeable buffers, each rx buffer is a page, and a coalesced frame
+ * takes at most VIRTIO_WLAN_MAX_FRAME_BUFS of them. A frame that spans
+ * several buffers gets a linear part of VIRTIO_WLAN_RX_LINEAR bytes, and
+ * the rest in page fragments.
+ */
+#define VIRTIO_WLAN_MRG_BUF_SIZE	PAGE_SIZE
+#define VIRTIO_WLAN_MAX_COALESCED	(VLAN_ETH_HLEN + GSO_LEGACY_MAX_SIZE)
+#define VIRTIO_WLAN_MAX_FRAME_BUFS					\
+	DIV_ROUND_UP(sizeof(struct virtio_net_hdr_v1) +			\
+		     VIRTIO_WLAN_MAX_COALESCED, VIRTIO_WLAN_MRG_BUF_SIZE)
+#define VIRTIO_WLAN_RX_LINEAR		256
+
+/*
+ * The guest splits a GSO frame into segments that each count against its
+ * limit of frames in flight, so a frame carries a bounded number of them.
+ */
+#define VIRTIO_WLAN_TSO_MAX_SEGS	64
 
 static_assert(VIRTIO_WLAN_MAX_AKM_SUITES <= CFG80211_MAX_NUM_AKM_SUITES);
 static_assert(NL80211_MAX_NR_CIPHER_SUITES <= VIRTIO_WLAN_MAX_PAIRWISE);
@@ -187,6 +207,13 @@ struct virtio_wlan {
 	struct virtqueue *event_vq;
 	struct napi_struct rx_napi;
 	struct napi_struct tx_napi;
+	/*
+	 * Rx_buf_size is the size of each rx buffer. A frame takes up to
+	 * tx_descs descriptors, which tx_sg maps under the tx lock.
+	 */
+	unsigned int rx_buf_size;
+	unsigned int tx_descs;
+	struct scatterlist tx_sg[MAX_SKB_FRAGS + 2];
 	void **rx_bufs;
 	unsigned int n_rx_bufs;
 	/* The rx buffers that could not be posted again, for the rx poll. */
@@ -1870,37 +1897,150 @@ static int virtio_wlan_post_rx(struct virtio_wlan *vw, void *buf, gfp_t gfp)
 {
 	struct scatterlist sg;
 
-	sg_init_one(&sg, buf, VIRTIO_WLAN_RX_BUF_SIZE(vw->mtu));
+	sg_init_one(&sg, buf, vw->rx_buf_size);
 	return virtqueue_add_inbuf(vw->rx_vq, &sg, 1, buf, gfp);
 }
 
 /*
- * No offload is negotiated, so the header is zero apart from num_buffers,
- * which is ignored.
+ * A buffer that cannot be posted, since mapping it can fail, is kept as a
+ * spare for the rx poll to retry.
+ */
+static void virtio_wlan_repost_rx(struct virtio_wlan *vw, void **bufs,
+				  unsigned int n, bool *posted)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		if (virtio_wlan_post_rx(vw, bufs[i], GFP_ATOMIC)) {
+			vw->stats.rx_post_errors++;
+			vw->rx_spare[vw->n_rx_spare++] = bufs[i];
+		} else {
+			*posted = true;
+		}
+	}
+}
+
+/*
+ * Check a received frame's header and length against the offloads that the
+ * driver accepted. A coalesced frame must be TCP with a partial checksum.
+ */
+static bool virtio_wlan_rx_hdr_ok(struct virtio_wlan *vw,
+				  const struct virtio_net_hdr_v1 *hdr,
+				  unsigned int frame_len)
+{
+	u8 type = hdr->gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
+	unsigned int max_len = VLAN_ETH_HLEN + vw->mtu;
+	u8 flags = hdr->flags;
+
+	if (flags & ~(VIRTIO_NET_HDR_F_NEEDS_CSUM | VIRTIO_NET_HDR_F_DATA_VALID) ||
+	    flags == (VIRTIO_NET_HDR_F_NEEDS_CSUM | VIRTIO_NET_HDR_F_DATA_VALID) ||
+	    (flags && !virtio_has_feature(vw->vdev, VIRTIO_WLAN_F_RX_CSUM)))
+		return false;
+	if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
+		if (!virtio_has_feature(vw->vdev, VIRTIO_WLAN_F_RX_GSO) ||
+		    !(flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) ||
+		    (type != VIRTIO_NET_HDR_GSO_TCPV4 &&
+		     type != VIRTIO_NET_HDR_GSO_TCPV6))
+			return false;
+		max_len = VIRTIO_WLAN_MAX_COALESCED;
+	}
+	return frame_len >= ETH_HLEN && frame_len <= max_len;
+}
+
+/*
+ * Receive a frame from its first buffer and, with mergeable buffers, as
+ * many more as its header names. The header is read once, and the frame is
+ * copied out of its buffers, which are posted again at once. A frame that
+ * names more buffers than the device has returned, or more than a frame may
+ * take, is dropped.
  */
 static void virtio_wlan_receive(struct virtio_wlan *vw, void *buf,
-				unsigned int len)
+				unsigned int len, bool *posted)
 {
-	const struct virtio_net_hdr_v1 *hdr = buf;
+	unsigned int lens[VIRTIO_WLAN_MAX_FRAME_BUFS];
+	void *bufs[VIRTIO_WLAN_MAX_FRAME_BUFS];
 	struct net_device *dev = vw->netdev;
-	unsigned int frame_len;
+	unsigned int i, n = 1, off, frame_len, linear, skip;
+	struct virtio_net_hdr_v1 hdr;
 	struct sk_buff *skb;
+	int err;
 
-	if (len < sizeof(*hdr) + ETH_HLEN ||
-	    len > VIRTIO_WLAN_RX_BUF_SIZE(vw->mtu) || hdr->flags ||
-	    hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
-		vw->stats.bad_rx_frames++;
-		return;
+	bufs[0] = buf;
+	lens[0] = len;
+	if (len < sizeof(hdr) || len > vw->rx_buf_size)
+		goto bad;
+	memcpy(&hdr, buf, sizeof(hdr));
+	if (virtio_has_feature(vw->vdev, VIRTIO_WLAN_F_MRG_RXBUF)) {
+		n = __virtio16_to_cpu(true, hdr.num_buffers);
+		if (!n || n > VIRTIO_WLAN_MAX_FRAME_BUFS) {
+			n = 1;
+			goto bad;
+		}
 	}
-	frame_len = len - sizeof(*hdr);
+	frame_len = len - sizeof(hdr);
+	for (i = 1; i < n; i++) {
+		bufs[i] = virtqueue_get_buf(vw->rx_vq, &lens[i]);
+		if (!bufs[i]) {
+			n = i;
+			goto bad;
+		}
+		if (lens[i] > vw->rx_buf_size) {
+			n = i + 1;
+			goto bad;
+		}
+		frame_len += lens[i];
+	}
+	if (!virtio_wlan_rx_hdr_ok(vw, &hdr, frame_len))
+		goto bad;
 
-	skb = napi_alloc_skb(&vw->rx_napi, frame_len);
+	if (n == 1) {
+		skb = napi_alloc_skb(&vw->rx_napi, frame_len);
+		if (skb)
+			skb_put(skb, frame_len);
+	} else {
+		linear = min_t(unsigned int, frame_len, VIRTIO_WLAN_RX_LINEAR);
+		skb = alloc_skb_with_frags(NET_SKB_PAD + NET_IP_ALIGN + linear,
+					   frame_len - linear,
+					   PAGE_ALLOC_COSTLY_ORDER, &err,
+					   GFP_ATOMIC);
+		if (skb) {
+			skb_reserve(skb, NET_SKB_PAD + NET_IP_ALIGN);
+			skb_put(skb, linear);
+			skb->data_len = frame_len - linear;
+			skb->len += frame_len - linear;
+		}
+	}
 	if (!skb) {
 		dev_core_stats_rx_dropped_inc(dev);
+		virtio_wlan_repost_rx(vw, bufs, n, posted);
 		return;
 	}
-	skb_put_data(skb, hdr + 1, frame_len);
+	for (i = 0, off = 0; i < n; i++) {
+		skip = i ? 0 : sizeof(hdr);
+		skb_store_bits(skb, off, bufs[i] + skip, lens[i] - skip);
+		off += lens[i] - skip;
+	}
+	virtio_wlan_repost_rx(vw, bufs, n, posted);
+
+	/*
+	 * The offsets of a partial checksum count from the MAC header. A frame
+	 * whose payload fits one segment is not GSO, and must fit the MTU.
+	 */
+	if (virtio_net_hdr_to_skb(skb, (struct virtio_net_hdr *)&hdr, true) ||
+	    (!skb_is_gso(skb) && frame_len > VLAN_ETH_HLEN + vw->mtu)) {
+		vw->stats.bad_rx_frames++;
+		kfree_skb(skb);
+		return;
+	}
+	if (hdr.flags & VIRTIO_NET_HDR_F_DATA_VALID)
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb->protocol = eth_type_trans(skb, dev);
+	if (skb_is_gso(skb) &&
+	    !virtio_net_hdr_match_proto(skb->protocol, hdr.gso_type)) {
+		vw->stats.bad_rx_frames++;
+		kfree_skb(skb);
+		return;
+	}
 	dev_sw_netstats_rx_add(dev, frame_len);
 
 	/*
@@ -1919,13 +2059,18 @@ static void virtio_wlan_receive(struct virtio_wlan *vw, void *buf,
 		return;
 	}
 	napi_gro_receive(&vw->rx_napi, skb);
+	return;
+
+bad:
+	vw->stats.bad_rx_frames++;
+	virtio_wlan_repost_rx(vw, bufs, n, posted);
 }
 
 /*
- * Each frame is copied out of its buffer, which is posted again at once, so
- * the ring needs no refill. A buffer that cannot be posted, since mapping it
- * can fail, is kept as a spare, and the poll returns its full budget so that
- * it runs again and retries, as virtio_net does.
+ * Each frame is copied out of its buffers, which are posted again at once,
+ * so the ring needs no refill. While a buffer is kept as a spare, the poll
+ * returns its full budget so that it runs again and retries, as virtio_net
+ * does.
  */
 static int virtio_wlan_rx_poll(struct napi_struct *napi, int budget)
 {
@@ -1942,13 +2087,7 @@ static int virtio_wlan_rx_poll(struct napi_struct *napi, int budget)
 		posted = true;
 	}
 	while (done < budget && (buf = virtqueue_get_buf(vw->rx_vq, &len))) {
-		virtio_wlan_receive(vw, buf, len);
-		if (virtio_wlan_post_rx(vw, buf, GFP_ATOMIC)) {
-			vw->stats.rx_post_errors++;
-			vw->rx_spare[vw->n_rx_spare++] = buf;
-		} else {
-			posted = true;
-		}
+		virtio_wlan_receive(vw, buf, len, &posted);
 		done++;
 	}
 	if (posted)
@@ -2035,7 +2174,7 @@ static int virtio_wlan_tx_poll(struct napi_struct *napi, int budget)
 	virtqueue_disable_cb(vw->tx_vq);
 	virtio_wlan_free_tx(vw, budget);
 	virtio_wlan_flush_eapol(vw);
-	if (netif_tx_queue_stopped(txq) && vw->tx_vq->num_free)
+	if (netif_tx_queue_stopped(txq) && vw->tx_vq->num_free >= vw->tx_descs)
 		netif_tx_wake_queue(txq);
 
 	opaque = virtqueue_enable_cb_prepare(vw->tx_vq);
@@ -2059,10 +2198,11 @@ static int virtio_wlan_tx_poll(struct napi_struct *napi, int budget)
 }
 
 /*
- * Each frame takes one descriptor, and the queue stops when the ring is full.
- * A frame that the device sends after that schedules the tx poll, which wakes
- * the queue. The ring can also still be full when the interface comes up, so
- * a frame that finds no descriptor stops the queue and waits.
+ * A frame takes up to tx_descs descriptors, and the queue stops when the
+ * ring has fewer free. A frame that the device sends after that schedules
+ * the tx poll, which wakes the queue. The ring can also still be full when
+ * the interface comes up, so a frame that finds too few descriptors stops
+ * the queue and waits. Without the checksum offload the frame is linear.
  */
 static netdev_tx_t virtio_wlan_start_xmit(struct sk_buff *skb,
 					  struct net_device *dev)
@@ -2070,11 +2210,12 @@ static netdev_tx_t virtio_wlan_start_xmit(struct sk_buff *skb,
 	struct virtio_wlan *vw = wiphy_priv(dev->ieee80211_ptr->wiphy);
 	bool kick = !netdev_xmit_more();
 	struct virtio_net_hdr_v1 *hdr;
-	struct scatterlist sg;
+	__be16 proto_buf, *proto;
+	int n;
 
 	virtio_wlan_free_tx(vw, 0);
 	virtio_wlan_flush_eapol(vw);
-	if (unlikely(!vw->tx_vq->num_free)) {
+	if (unlikely(vw->tx_vq->num_free < vw->tx_descs)) {
 		netif_stop_queue(dev);
 		return NETDEV_TX_BUSY;
 	}
@@ -2084,22 +2225,30 @@ static netdev_tx_t virtio_wlan_start_xmit(struct sk_buff *skb,
 	 * header that the push writes into.
 	 */
 	skb_tx_timestamp(skb);
-	if (skb_cow_head(skb, sizeof(*hdr)) || skb_linearize(skb))
+	if (skb_cow_head(skb, sizeof(*hdr)) ||
+	    (vw->tx_descs == 1 && skb_linearize(skb)))
 		goto drop;
 	/* The MAC header is not set on every path to the driver. */
+	proto = skb_header_pointer(skb, offsetof(struct ethhdr, h_proto),
+				   sizeof(proto_buf), &proto_buf);
 	virtio_wlan_tx_cb(skb)->eapol =
-		skb->len >= ETH_HLEN &&
-		((struct ethhdr *)skb->data)->h_proto ==
-		READ_ONCE(vw->control_port);
-	hdr = skb_push(skb, sizeof(*hdr));
+		proto && *proto == READ_ONCE(vw->control_port);
+	/* The header's offsets count from the frame, before the push. */
+	hdr = (struct virtio_net_hdr_v1 *)(skb->data - sizeof(*hdr));
 	memset(hdr, 0, sizeof(*hdr));
-	sg_init_one(&sg, skb->data, skb->len);
-	if (virtqueue_add_outbuf(vw->tx_vq, &sg, 1, skb, GFP_ATOMIC))
+	if (virtio_net_hdr_from_skb(skb, (struct virtio_net_hdr *)hdr, true,
+				    false, 0))
+		goto drop;
+	__skb_push(skb, sizeof(*hdr));
+	sg_init_table(vw->tx_sg, skb_shinfo(skb)->nr_frags + 1);
+	n = skb_to_sgvec(skb, vw->tx_sg, 0, skb->len);
+	if (n < 0 ||
+	    virtqueue_add_outbuf(vw->tx_vq, vw->tx_sg, n, skb, GFP_ATOMIC))
 		goto drop;
 	if (virtio_wlan_tx_cb(skb)->eapol)
 		atomic_inc(&vw->eapol_pending);
 
-	if (!vw->tx_vq->num_free)
+	if (vw->tx_vq->num_free < vw->tx_descs)
 		netif_stop_queue(dev);
 	if (kick || netif_queue_stopped(dev))
 		virtqueue_kick(vw->tx_vq);
@@ -2387,8 +2536,7 @@ static int virtio_wlan_add_rx_bufs(struct virtio_wlan *vw)
 		return -ENOMEM;
 	vw->n_rx_bufs = n;
 	for (i = 0; i < vw->n_rx_bufs; i++) {
-		vw->rx_bufs[i] = kmalloc(VIRTIO_WLAN_RX_BUF_SIZE(vw->mtu),
-					 GFP_KERNEL);
+		vw->rx_bufs[i] = kmalloc(vw->rx_buf_size, GFP_KERNEL);
 		if (!vw->rx_bufs[i])
 			return -ENOMEM;
 		err = virtio_wlan_post_rx(vw, vw->rx_bufs[i], GFP_KERNEL);
@@ -2472,6 +2620,8 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	vw->vdev = vdev;
 	ether_addr_copy(vw->mac, mac);
 	vw->mtu = mtu;
+	vw->rx_buf_size = virtio_has_feature(vdev, VIRTIO_WLAN_F_MRG_RXBUF) ?
+			  VIRTIO_WLAN_MRG_BUF_SIZE : VIRTIO_WLAN_RX_BUF_SIZE(mtu);
 	vw->max_event_size = max_event_size;
 	vw->resp_size = max_wiphy_size;
 	init_completion(&vw->cmd_done);
@@ -2560,6 +2710,20 @@ static int virtio_wlan_probe(struct virtio_device *vdev)
 	eth_hw_addr_set(netdev, mac);
 	netdev->mtu = mtu;
 	netdev->max_mtu = mtu;
+	/* A frame with fragments needs a ring that holds all of them. */
+	vw->tx_descs = 1;
+	if (virtio_has_feature(vdev, VIRTIO_WLAN_F_TX_CSUM) &&
+	    virtqueue_get_vring_size(vw->tx_vq) >= MAX_SKB_FRAGS + 2) {
+		netdev->hw_features |= NETIF_F_HW_CSUM | NETIF_F_SG;
+		if (virtio_has_feature(vdev, VIRTIO_WLAN_F_TX_GSO))
+			netdev->hw_features |= NETIF_F_TSO | NETIF_F_TSO6 |
+					       NETIF_F_TSO_ECN;
+		netdev->features |= netdev->hw_features;
+		netif_set_tso_max_segs(netdev, VIRTIO_WLAN_TSO_MAX_SEGS);
+		vw->tx_descs = MAX_SKB_FRAGS + 2;
+	}
+	if (virtio_has_feature(vdev, VIRTIO_WLAN_F_RX_CSUM))
+		netdev->features |= NETIF_F_RXCSUM;
 	netif_napi_add(netdev, &vw->rx_napi, virtio_wlan_rx_poll);
 	netif_napi_add_tx(netdev, &vw->tx_napi, virtio_wlan_tx_poll);
 	netif_carrier_off(netdev);
@@ -2628,7 +2792,23 @@ static const struct virtio_device_id virtio_wlan_id_table[] = {
 	{ 0 },
 };
 
+/* An offload without the ones that it needs is not used. */
+static int virtio_wlan_validate(struct virtio_device *vdev)
+{
+	if (!virtio_has_feature(vdev, VIRTIO_WLAN_F_TX_CSUM))
+		__virtio_clear_bit(vdev, VIRTIO_WLAN_F_TX_GSO);
+	if (!virtio_has_feature(vdev, VIRTIO_WLAN_F_RX_CSUM) ||
+	    !virtio_has_feature(vdev, VIRTIO_WLAN_F_MRG_RXBUF))
+		__virtio_clear_bit(vdev, VIRTIO_WLAN_F_RX_GSO);
+	return 0;
+}
+
 static unsigned int virtio_wlan_features[] = {
+	VIRTIO_WLAN_F_TX_CSUM,
+	VIRTIO_WLAN_F_TX_GSO,
+	VIRTIO_WLAN_F_RX_CSUM,
+	VIRTIO_WLAN_F_RX_GSO,
+	VIRTIO_WLAN_F_MRG_RXBUF,
 	VIRTIO_WLAN_F_SET_MAC,
 };
 
@@ -2637,6 +2817,7 @@ static struct virtio_driver virtio_wlan_driver = {
 	.feature_table = virtio_wlan_features,
 	.feature_table_size = ARRAY_SIZE(virtio_wlan_features),
 	.id_table = virtio_wlan_id_table,
+	.validate = virtio_wlan_validate,
 	.probe = virtio_wlan_probe,
 	.remove = virtio_wlan_remove,
 };
