@@ -20,9 +20,12 @@
 #include <linux/string.h>
 #include <linux/uio.h>
 #include <linux/vduse_guest.h>
+#include <linux/virtio_byteorder.h>
+#include <linux/virtio_net.h>
 #include <linux/virtio_wlan.h>
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
+#include <net/gso.h>
 #include <net/netdev_lock.h>
 #include <uapi/linux/virtio_ids.h>
 #include <uapi/linux/virtio_net.h>
@@ -34,6 +37,26 @@
 #define VDUSE_GUEST_WLAN_TIMEOUT 30
 #define VDUSE_GUEST_WLAN_TX_LIMIT 256
 #define VDUSE_GUEST_WLAN_RETRY_DELAY msecs_to_jiffies(10)
+#define VDUSE_GUEST_WLAN_GOODCOPY 128
+#define VDUSE_GUEST_WLAN_MAX_BUFS 64
+
+#define VDUSE_GUEST_WLAN_FEATURES					\
+	(BIT_ULL(VIRTIO_WLAN_F_TX_CSUM) | BIT_ULL(VIRTIO_WLAN_F_TX_GSO) |	\
+	 BIT_ULL(VIRTIO_WLAN_F_RX_CSUM) | BIT_ULL(VIRTIO_WLAN_F_RX_GSO) |	\
+	 BIT_ULL(VIRTIO_WLAN_F_MRG_RXBUF) | BIT_ULL(VIRTIO_WLAN_F_SET_MAC))
+
+/* The receive offloads that GRO in the guest needs from the host. */
+#define VDUSE_GUEST_WLAN_GRO_FEATURES					\
+	(BIT_ULL(VIRTIO_WLAN_F_RX_CSUM) | BIT_ULL(VIRTIO_WLAN_F_RX_GSO) |	\
+	 BIT_ULL(VIRTIO_WLAN_F_MRG_RXBUF))
+
+/*
+ * The GSO types that a received skb can carry to the host. Others are split
+ * into their segments first.
+ */
+#define VDUSE_GUEST_WLAN_RX_GSO						\
+	(SKB_GSO_TCPV4 | SKB_GSO_TCPV6 | SKB_GSO_TCP_ECN |		\
+	 SKB_GSO_TCP_FIXEDID | SKB_GSO_DODGY)
 
 static const u16 vduse_guest_wlan_queue_sizes[VIRTIO_WLAN_VQ_MAX] = {
 	[VIRTIO_WLAN_VQ_RX] = 1024,
@@ -50,11 +73,16 @@ static const u16 vduse_guest_wlan_queue_sizes[VIRTIO_WLAN_VQ_MAX] = {
  *
  * Tx_invalid counts the host's frames with a bad length or header, and
  * tx_spoofed those with another source address. Tx_dropped counts the frames
- * that found no memory or no interface. Rx_no_buffer counts the received
- * frames that found no buffer from the host, and rx_oversized those larger
- * than the MTU allows. Rx_bad_buffers counts the host's buffers that are too
- * small for a frame or cannot be written. Tx_chained counts the control port
- * frames whose destructor completed their chain.
+ * that found no memory or no interface. Tx_gso counts the host's GSO frames,
+ * which go out as their segments. Rx_no_buffer counts the received frames
+ * that found too few buffers from the host, and rx_oversized those larger
+ * than the MTU allows or than the most buffers that a frame may take.
+ * Rx_bad_buffers counts the host's buffers that are too small or cannot be
+ * written. Rx_dropped counts the received frames that found no memory, or
+ * whose checksum or segmentation could not be finished. Rx_gso counts the
+ * coalesced frames sent to the host, and rx_buffers the host's buffers that
+ * the received frames filled. Tx_chained counts the control port frames
+ * whose destructor completed their chain.
  */
 struct vduse_guest_wlan_stats {
 	atomic64_t commands;
@@ -66,11 +94,15 @@ struct vduse_guest_wlan_stats {
 	atomic64_t tx_invalid;
 	atomic64_t tx_spoofed;
 	atomic64_t tx_dropped;
+	atomic64_t tx_gso;
 	atomic64_t tx_chained;
 	atomic64_t rx_frames;
+	atomic64_t rx_gso;
+	atomic64_t rx_buffers;
 	atomic64_t rx_no_buffer;
 	atomic64_t rx_oversized;
 	atomic64_t rx_bad_buffers;
+	atomic64_t rx_dropped;
 };
 
 /* A control port frame's chain on the tx queue, completed by its destructor. */
@@ -163,22 +195,25 @@ struct vduse_guest_wlan {
 
 	/*
 	 * Kicks queue the data works on the CPU that handles them. Data_lock
-	 * protects data_running, tx_drain and the rx buffers. Once the
-	 * interface is gone, tx_drain makes the tx work complete the host's
-	 * frames unsent until the device stops. The core kicks only a queue
-	 * that the driver made ready, so tx_kicked, set by the first kick of
-	 * the tx queue, tells that the drain can start before the next kick.
-	 * Tx_pending counts the frames that the guest's stack still holds. At
-	 * the limit the tx work sets tx_wake and stops, and the destructor
-	 * that next runs clears it and queues the work again. Control_port is
-	 * the connection's control port ethertype, and tx_gen, under
-	 * data_lock, changes when the device stops, so that a control port
-	 * frame of an earlier start does not complete its chain.
+	 * protects data_running, features, tx_drain and the rx buffers.
+	 * Features holds the ones that the host accepted, while the data path
+	 * runs. Once the interface is gone, tx_drain makes the tx work
+	 * complete the host's frames unsent until the device stops. The core
+	 * kicks only a queue that the driver made ready, so tx_kicked, set by
+	 * the first kick of the tx queue, tells that the drain can start
+	 * before the next kick. Tx_pending counts the frames, and the segments
+	 * of GSO frames, that the guest's stack still holds. At the limit the
+	 * tx work sets tx_wake and stops, and the destructor that next runs
+	 * clears it and queues the work again. Control_port is the
+	 * connection's control port ethertype, and tx_gen, under data_lock,
+	 * changes when the device stops, so that a control port frame of an
+	 * earlier start does not complete its chain.
 	 */
 	struct delayed_work rx_work;
 	struct work_struct tx_work;
 	spinlock_t data_lock;
 	bool data_running;
+	u64 features;
 	bool tx_drain;
 	struct list_head rx_bufs;
 	atomic_t tx_pending;
@@ -811,12 +846,14 @@ static void vduse_guest_wlan_note_mic_failure(void *priv, const u8 *addr,
 	vduse_guest_wlan_add_note(wlan, note);
 }
 
-static bool vduse_guest_wlan_data_running(struct vduse_guest_wlan *wlan)
+static bool vduse_guest_wlan_data_running(struct vduse_guest_wlan *wlan,
+					  u64 *features)
 {
 	bool running;
 
 	spin_lock_bh(&wlan->data_lock);
 	running = wlan->data_running;
+	*features = wlan->features;
 	spin_unlock_bh(&wlan->data_lock);
 	return running;
 }
@@ -881,48 +918,121 @@ static size_t vduse_guest_wlan_max_frame(struct vduse_guest_wlan *wlan)
 }
 
 /*
- * Send a frame from the host. No offload is offered, so its header is zero,
- * and its source must be the interface's own address. Return whether the
- * frame's destructor owns the chain's completion, as a control port frame's
- * does while the data path runs and its chain could be allocated.
+ * Check a frame's header against the offloads that the host accepted. A GSO
+ * frame must be TCP and carry a partial checksum.
+ */
+static bool vduse_guest_wlan_tx_hdr_ok(const struct virtio_net_hdr_v1 *hdr,
+				       u64 features)
+{
+	u8 type = hdr->gso_type & ~VIRTIO_NET_HDR_GSO_ECN;
+	bool csum = hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM;
+
+	if (hdr->flags & ~VIRTIO_NET_HDR_F_NEEDS_CSUM)
+		return false;
+	if (csum && !(features & BIT_ULL(VIRTIO_WLAN_F_TX_CSUM)))
+		return false;
+	if (hdr->gso_type == VIRTIO_NET_HDR_GSO_NONE)
+		return true;
+	return csum && (features & BIT_ULL(VIRTIO_WLAN_F_TX_GSO)) &&
+	       (type == VIRTIO_NET_HDR_GSO_TCPV4 ||
+		type == VIRTIO_NET_HDR_GSO_TCPV6);
+}
+
+static void vduse_guest_wlan_xmit(struct vduse_guest_wlan *wlan,
+				  struct sk_buff *skb)
+{
+	skb->dev = wlan->netdev;
+	skb_shinfo(skb)->destructor_arg = wlan;
+	skb->destructor = vduse_guest_wlan_tx_destructor;
+	atomic_inc(&wlan->tx_pending);
+	atomic64_inc(&wlan->stats.tx_frames);
+	dev_queue_xmit(skb);
+}
+
+/*
+ * A GSO frame is split here rather than in the interface, so that each
+ * segment counts against the limit of frames in mac80211 until it is freed.
+ * Without features, the segments are linear and checksummed, which mac80211
+ * would otherwise do to each of them.
+ */
+static void vduse_guest_wlan_tx_gso(struct vduse_guest_wlan *wlan,
+				    struct sk_buff *skb)
+{
+	struct sk_buff *segs, *next;
+
+	segs = skb_gso_segment(skb, 0);
+	if (IS_ERR_OR_NULL(segs)) {
+		atomic64_inc(PTR_ERR_OR_ZERO(segs) == -ENOMEM ?
+			     &wlan->stats.tx_dropped :
+			     &wlan->stats.tx_invalid);
+		kfree_skb(skb);
+		return;
+	}
+	consume_skb(skb);
+	atomic64_inc(&wlan->stats.tx_gso);
+	skb_list_walk_safe(segs, skb, next) {
+		skb_mark_not_on_list(skb);
+		vduse_guest_wlan_xmit(wlan, skb);
+	}
+}
+
+/*
+ * Send a frame from the host, whose source must be the interface's own
+ * address. A frame up to the MTU is linear, and a GSO frame keeps its
+ * headers in the linear part and the rest in page fragments, so that it
+ * needs no high-order allocation. Return whether the frame's destructor
+ * owns the chain's completion, as a control port frame's does while the
+ * data path runs and its chain could be allocated.
  */
 static bool vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
-				    struct vringh_kiov *riov, u16 head)
+				    struct vringh_kiov *riov, u16 head,
+				    u64 features)
 {
 	struct net_device *netdev = wlan->netdev;
+	unsigned int reserve = LL_RESERVED_SPACE(netdev);
 	size_t len = vringh_kiov_length(riov);
 	struct vduse_guest_wlan_tx_chain *chain = NULL;
+	size_t frame_len, max_len, linear;
 	struct virtio_net_hdr_v1 hdr;
-	bool chained;
 	struct sk_buff *skb;
 	struct iov_iter it;
-	size_t frame_len;
+	int err;
 
-	if (len < sizeof(hdr) + ETH_HLEN ||
-	    len > sizeof(hdr) + vduse_guest_wlan_max_frame(wlan)) {
-		atomic64_inc(&wlan->stats.tx_invalid);
-		return false;
-	}
+	if (len < sizeof(hdr) + ETH_HLEN)
+		goto invalid;
 	frame_len = len - sizeof(hdr);
 	iov_iter_kvec(&it, ITER_SOURCE, riov->iov, riov->used, len);
 	if (copy_from_iter(&hdr, sizeof(hdr), &it) != sizeof(hdr) ||
-	    hdr.flags || hdr.gso_type != VIRTIO_NET_HDR_GSO_NONE) {
-		atomic64_inc(&wlan->stats.tx_invalid);
-		return false;
+	    !vduse_guest_wlan_tx_hdr_ok(&hdr, features))
+		goto invalid;
+	if (hdr.gso_type != VIRTIO_NET_HDR_GSO_NONE) {
+		max_len = ETH_HLEN + GSO_LEGACY_MAX_SIZE;
+		linear = max_t(size_t, __virtio16_to_cpu(true, hdr.hdr_len),
+			       VDUSE_GUEST_WLAN_GOODCOPY);
+	} else {
+		max_len = vduse_guest_wlan_max_frame(wlan);
+		linear = frame_len;
 	}
+	if (frame_len > max_len)
+		goto invalid;
+	linear = clamp_t(size_t, linear, ETH_HLEN, SKB_MAX_HEAD(reserve));
+	linear = min(linear, frame_len);
 
-	skb = alloc_skb(LL_RESERVED_SPACE(netdev) + frame_len +
-			netdev->needed_tailroom, GFP_KERNEL);
+	skb = alloc_skb_with_frags(reserve + linear + netdev->needed_tailroom,
+				   frame_len - linear, PAGE_ALLOC_COSTLY_ORDER,
+				   &err, GFP_KERNEL);
 	if (!skb) {
 		atomic64_inc(&wlan->stats.tx_dropped);
 		return false;
 	}
-	skb_reserve(skb, LL_RESERVED_SPACE(netdev));
-	if (copy_from_iter(skb_put(skb, frame_len), frame_len, &it) !=
-	    frame_len) {
+	skb->dev = netdev;
+	skb_reserve(skb, reserve);
+	skb_put(skb, linear);
+	skb->data_len = frame_len - linear;
+	skb->len += frame_len - linear;
+	if (skb_copy_datagram_from_iter(skb, 0, &it, frame_len)) {
 		kfree_skb(skb);
-		atomic64_inc(&wlan->stats.tx_invalid);
-		return false;
+		goto invalid;
 	}
 
 	skb_reset_mac_header(skb);
@@ -934,19 +1044,31 @@ static bool vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
 
 	/*
 	 * Classification reads the IP header through the network header and
-	 * the protocol, so an IP frame must hold one.
+	 * the protocol, so an IP frame must hold one, and the linear part does.
 	 */
 	skb_set_network_header(skb, ETH_HLEN);
+	skb_reset_mac_len(skb);
 	skb->protocol = eth_hdr(skb)->h_proto;
 	if ((skb->protocol == htons(ETH_P_IP) &&
 	     frame_len < ETH_HLEN + sizeof(struct iphdr)) ||
 	    (skb->protocol == htons(ETH_P_IPV6) &&
-	     frame_len < ETH_HLEN + sizeof(struct ipv6hdr))) {
+	     frame_len < ETH_HLEN + sizeof(struct ipv6hdr)) ||
+	    virtio_net_hdr_to_skb(skb, (struct virtio_net_hdr *)&hdr, true)) {
 		kfree_skb(skb);
-		atomic64_inc(&wlan->stats.tx_invalid);
+		goto invalid;
+	}
+	/* The frame, or each of its segments, must fit the MTU. */
+	max_len = vduse_guest_wlan_max_frame(wlan);
+	if (skb_is_gso(skb) ? !skb_gso_validate_mac_len(skb, max_len) :
+			      skb->len > max_len) {
+		kfree_skb(skb);
+		goto invalid;
+	}
+
+	if (skb_is_gso(skb)) {
+		vduse_guest_wlan_tx_gso(wlan, skb);
 		return false;
 	}
-	skb->dev = netdev;
 
 	if (skb->protocol == READ_ONCE(wlan->control_port))
 		chain = kmalloc_obj(*chain);
@@ -961,19 +1083,20 @@ static bool vduse_guest_wlan_tx_one(struct vduse_guest_wlan *wlan,
 		}
 		spin_unlock_bh(&wlan->data_lock);
 	}
-	/* The destructor can free the chain before dev_queue_xmit() returns. */
-	chained = chain;
-	if (chain) {
-		skb_shinfo(skb)->destructor_arg = chain;
-		skb->destructor = vduse_guest_wlan_tx_chain_destructor;
-	} else {
-		skb_shinfo(skb)->destructor_arg = wlan;
-		skb->destructor = vduse_guest_wlan_tx_destructor;
+	if (!chain) {
+		vduse_guest_wlan_xmit(wlan, skb);
+		return false;
 	}
+	skb_shinfo(skb)->destructor_arg = chain;
+	skb->destructor = vduse_guest_wlan_tx_chain_destructor;
 	atomic_inc(&wlan->tx_pending);
 	atomic64_inc(&wlan->stats.tx_frames);
 	dev_queue_xmit(skb);
-	return chained;
+	return true;
+
+invalid:
+	atomic64_inc(&wlan->stats.tx_invalid);
+	return false;
 }
 
 /*
@@ -996,15 +1119,19 @@ static bool vduse_guest_wlan_tx_full(struct vduse_guest_wlan *wlan)
 	return true;
 }
 
-/* Return whether the tx work may use the queue, and whether it only drains. */
+/*
+ * Return whether the tx work may use the queue, whether it only drains, and
+ * the features that the host accepted.
+ */
 static bool vduse_guest_wlan_tx_usable(struct vduse_guest_wlan *wlan,
-				       bool *drain)
+				       bool *drain, u64 *features)
 {
 	bool usable;
 
 	spin_lock_bh(&wlan->data_lock);
 	usable = wlan->data_running || wlan->tx_drain;
 	*drain = !wlan->data_running;
+	*features = wlan->features;
 	spin_unlock_bh(&wlan->data_lock);
 	return usable;
 }
@@ -1020,11 +1147,12 @@ static void vduse_guest_wlan_tx_work(struct work_struct *work)
 	struct kvec rkvec[VDUSE_GUEST_WLAN_INLINE_IOVS];
 	struct kvec wkvec[VDUSE_GUEST_WLAN_INLINE_IOVS];
 	struct vringh_kiov riov, wiov;
+	u64 features;
 	bool drain;
 	u16 head;
 	int r;
 
-	if (!vduse_guest_wlan_tx_usable(wlan, &drain))
+	if (!vduse_guest_wlan_tx_usable(wlan, &drain, &features))
 		return;
 
 	vringh_kiov_init(&riov, rkvec, ARRAY_SIZE(rkvec));
@@ -1032,7 +1160,7 @@ static void vduse_guest_wlan_tx_work(struct work_struct *work)
 
 	vduse_guest_notify_disable(wlan->dev, VIRTIO_WLAN_VQ_TX);
 	for (;;) {
-		if (!vduse_guest_wlan_tx_usable(wlan, &drain) ||
+		if (!vduse_guest_wlan_tx_usable(wlan, &drain, &features) ||
 		    (!drain && vduse_guest_wlan_tx_full(wlan)))
 			break;
 
@@ -1052,7 +1180,7 @@ static void vduse_guest_wlan_tx_work(struct work_struct *work)
 
 		if (drain)
 			atomic64_inc(&wlan->stats.tx_dropped);
-		else if (vduse_guest_wlan_tx_one(wlan, &riov, head))
+		else if (vduse_guest_wlan_tx_one(wlan, &riov, head, features))
 			continue;
 		vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_TX, head, 0);
 	}
@@ -1069,9 +1197,10 @@ static void vduse_guest_wlan_free_rx_buf(struct vduse_guest_wlan_rx_buf *buf)
 
 /*
  * Take the buffers that the host posts, which can sleep, so that the rx
- * handler only copies into them. A buffer too small for the largest frame
- * is returned unused. An allocation that fails is retried later, with
- * notifications still disabled.
+ * handler only copies into them. A buffer too small for the largest frame,
+ * or with mergeable buffers for the header, is returned unused. An
+ * allocation that fails is retried later, with notifications still
+ * disabled.
  */
 static void vduse_guest_wlan_rx_work(struct work_struct *work)
 {
@@ -1081,17 +1210,22 @@ static void vduse_guest_wlan_rx_work(struct work_struct *work)
 	struct kvec rkvec[VDUSE_GUEST_WLAN_INLINE_IOVS];
 	struct vduse_guest_wlan_rx_buf *buf;
 	struct vringh_kiov riov;
+	size_t min_len;
+	u64 features;
 	bool running;
 	int r;
 
-	if (!vduse_guest_wlan_data_running(wlan))
+	if (!vduse_guest_wlan_data_running(wlan, &features))
 		return;
+	min_len = sizeof(struct virtio_net_hdr_v1);
+	if (!(features & BIT_ULL(VIRTIO_WLAN_F_MRG_RXBUF)))
+		min_len += vduse_guest_wlan_max_frame(wlan);
 
 	vringh_kiov_init(&riov, rkvec, ARRAY_SIZE(rkvec));
 
 	vduse_guest_notify_disable(wlan->dev, VIRTIO_WLAN_VQ_RX);
 	for (;;) {
-		if (!vduse_guest_wlan_data_running(wlan))
+		if (!vduse_guest_wlan_data_running(wlan, &features))
 			break;
 
 		buf = kzalloc_obj(*buf);
@@ -1115,9 +1249,7 @@ static void vduse_guest_wlan_rx_work(struct work_struct *work)
 			continue;
 		}
 
-		if (vringh_kiov_length(&buf->wiov) <
-		    sizeof(struct virtio_net_hdr_v1) +
-		    vduse_guest_wlan_max_frame(wlan)) {
+		if (vringh_kiov_length(&buf->wiov) < min_len) {
 			atomic64_inc(&wlan->stats.rx_bad_buffers);
 			vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_RX,
 					     buf->head, 0);
@@ -1141,82 +1273,164 @@ static void vduse_guest_wlan_rx_work(struct work_struct *work)
 }
 
 /*
- * Copy a frame from its MAC header. The stack has already moved a VLAN tag
- * out of the frame, so the tag goes back after the addresses.
+ * The host takes a coalesced TCP frame without a VLAN tag, up to the
+ * largest that GRO makes by default.
  */
-static int vduse_guest_wlan_copy_frame(struct sk_buff *skb,
-				       struct iov_iter *it, size_t frame_len)
+static bool vduse_guest_wlan_rx_gso_ok(const struct sk_buff *skb, u64 features)
 {
-	int offset = skb_mac_offset(skb);
-	__be16 tag[2];
-
-	if (!skb_vlan_tag_present(skb))
-		return skb_copy_datagram_iter(skb, offset, it, frame_len);
-
-	tag[0] = skb->vlan_proto;
-	tag[1] = htons(skb_vlan_tag_get(skb));
-	if (skb_copy_datagram_iter(skb, offset, it, 2 * ETH_ALEN) ||
-	    copy_to_iter(tag, sizeof(tag), it) != sizeof(tag))
-		return -EFAULT;
-	return skb_copy_datagram_iter(skb, offset + 2 * ETH_ALEN, it,
-				      frame_len - VLAN_HLEN - 2 * ETH_ALEN);
+	return !(skb_shinfo(skb)->gso_type & ~VDUSE_GUEST_WLAN_RX_GSO) &&
+	       !eth_type_vlan(skb->protocol) &&
+	       skb->len <= VLAN_ETH_HLEN + GSO_LEGACY_MAX_SIZE &&
+	       (features & VDUSE_GUEST_WLAN_GRO_FEATURES) ==
+	       VDUSE_GUEST_WLAN_GRO_FEATURES;
 }
 
 /*
- * Every frame received on the interface is consumed, and the guest's own
- * stack sees none. A frame is copied into the next buffer, which holds the
- * largest frame, and completed at once. A stopping device waits for this
- * handler to return.
+ * Copy a frame, from its MAC header, into as many of the host's buffers as
+ * it needs, and complete them together. A frame that cannot be written
+ * completes its buffers empty. The skb is consumed.
  */
-static rx_handler_result_t vduse_guest_wlan_rx(struct sk_buff **pskb)
+static void vduse_guest_wlan_rx_one(struct vduse_guest_wlan *wlan,
+				    struct sk_buff *skb, u64 features)
 {
-	struct sk_buff *skb = *pskb;
-	struct vduse_guest_wlan *wlan =
-		rcu_dereference(skb->dev->rx_handler_data);
-	struct virtio_net_hdr_v1 hdr = {
-		.num_buffers = cpu_to_le16(1),
-	};
-	struct vduse_guest_wlan_rx_buf *buf;
-	size_t frame_len = skb->len - skb_mac_offset(skb);
+	struct vring_used_elem used[VDUSE_GUEST_WLAN_MAX_BUFS];
+	bool csum = features & BIT_ULL(VIRTIO_WLAN_F_RX_CSUM);
+	size_t need, room = 0, off = 0, chunk, written;
+	struct vduse_guest_wlan_rx_buf *buf, *tmp;
+	unsigned int n = 0, max_bufs;
+	struct virtio_net_hdr_v1 hdr;
+	bool running, bad = false;
 	struct iov_iter it;
+	LIST_HEAD(bufs);
 
-	if (skb_vlan_tag_present(skb))
-		frame_len += VLAN_HLEN;
-	if (frame_len > vduse_guest_wlan_max_frame(wlan)) {
+	if (!skb_is_gso(skb) && skb->len > vduse_guest_wlan_max_frame(wlan)) {
 		atomic64_inc(&wlan->stats.rx_oversized);
 		goto drop;
 	}
-
-	spin_lock(&wlan->data_lock);
-	buf = wlan->data_running ?
-		list_first_entry_or_null(&wlan->rx_bufs,
-					 struct vduse_guest_wlan_rx_buf, list) :
-		NULL;
-	if (buf)
-		list_del(&buf->list);
-	spin_unlock(&wlan->data_lock);
-	if (!buf) {
-		atomic64_inc(&wlan->stats.rx_no_buffer);
+	if ((skb->ip_summed == CHECKSUM_PARTIAL && !csum &&
+	     skb_checksum_help(skb)) ||
+	    virtio_net_hdr_from_skb(skb, (struct virtio_net_hdr *)&hdr, true,
+				    csum, 0)) {
+		atomic64_inc(&wlan->stats.rx_dropped);
 		goto drop;
 	}
 
-	iov_iter_kvec(&it, ITER_DEST, buf->wiov.iov, buf->wiov.used,
-		      vringh_kiov_length(&buf->wiov));
-	if (copy_to_iter(&hdr, sizeof(hdr), &it) != sizeof(hdr) ||
-	    vduse_guest_wlan_copy_frame(skb, &it, frame_len)) {
-		atomic64_inc(&wlan->stats.rx_bad_buffers);
-		vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_RX, buf->head, 0);
+	need = sizeof(hdr) + skb->len;
+	max_bufs = features & BIT_ULL(VIRTIO_WLAN_F_MRG_RXBUF) ?
+		   VDUSE_GUEST_WLAN_MAX_BUFS : 1;
+
+	spin_lock(&wlan->data_lock);
+	while (room < need && n < max_bufs && wlan->data_running) {
+		buf = list_first_entry_or_null(&wlan->rx_bufs,
+					       struct vduse_guest_wlan_rx_buf,
+					       list);
+		if (!buf)
+			break;
+		list_move_tail(&buf->list, &bufs);
+		room += vringh_kiov_length(&buf->wiov);
+		n++;
+	}
+	if (room < need) {
+		list_splice(&bufs, &wlan->rx_bufs);
+		running = wlan->data_running;
+		spin_unlock(&wlan->data_lock);
+		if (running)
+			atomic64_inc(n == max_bufs ? &wlan->stats.rx_oversized :
+				     &wlan->stats.rx_no_buffer);
+		goto drop;
+	}
+	spin_unlock(&wlan->data_lock);
+
+	hdr.num_buffers = __cpu_to_virtio16(true, n);
+	n = 0;
+	list_for_each_entry(buf, &bufs, list) {
+		iov_iter_kvec(&it, ITER_DEST, buf->wiov.iov, buf->wiov.used,
+			      vringh_kiov_length(&buf->wiov));
+		written = 0;
+		if (!n) {
+			written = copy_to_iter(&hdr, sizeof(hdr), &it);
+			bad = written != sizeof(hdr);
+		}
+		chunk = min(iov_iter_count(&it), skb->len - off);
+		if (!bad && skb_copy_datagram_iter(skb, off, &it, chunk))
+			bad = true;
+		off += chunk;
+		written += chunk;
+		vduse_guest_used_elem(wlan->dev, VIRTIO_WLAN_VQ_RX, &used[n++],
+				      buf->head, written);
+	}
+	if (bad) {
+		n = 0;
+		list_for_each_entry(buf, &bufs, list)
+			vduse_guest_used_elem(wlan->dev, VIRTIO_WLAN_VQ_RX,
+					      &used[n++], buf->head, 0);
+	}
+	vduse_guest_complete_n(wlan->dev, VIRTIO_WLAN_VQ_RX, used, n);
+	list_for_each_entry_safe(buf, tmp, &bufs, list)
 		vduse_guest_wlan_free_rx_buf(buf);
+	if (bad) {
+		atomic64_inc(&wlan->stats.rx_bad_buffers);
 		goto drop;
 	}
 	atomic64_inc(&wlan->stats.rx_frames);
-	vduse_guest_complete(wlan->dev, VIRTIO_WLAN_VQ_RX, buf->head,
-			     sizeof(hdr) + frame_len);
-	vduse_guest_wlan_free_rx_buf(buf);
+	atomic64_add(n, &wlan->stats.rx_buffers);
+	if (skb_is_gso(skb))
+		atomic64_inc(&wlan->stats.rx_gso);
 	consume_skb(skb);
-	return RX_HANDLER_CONSUMED;
+	return;
+
 drop:
 	kfree_skb(skb);
+}
+
+/*
+ * Every frame received on the interface goes to the host, and the guest's
+ * own stack sees none. A coalesced frame that the host cannot take goes as
+ * its segments. A stopping device waits for this handler to return.
+ */
+static rx_handler_result_t vduse_guest_wlan_rx(struct sk_buff **pskb)
+{
+	struct vduse_guest_wlan *wlan =
+		rcu_dereference((*pskb)->dev->rx_handler_data);
+	struct sk_buff *skb, *segs, *next;
+	u64 features;
+
+	skb = skb_share_check(*pskb, GFP_ATOMIC);
+	if (!skb) {
+		atomic64_inc(&wlan->stats.rx_dropped);
+		return RX_HANDLER_CONSUMED;
+	}
+	if (!vduse_guest_wlan_data_running(wlan, &features)) {
+		kfree_skb(skb);
+		return RX_HANDLER_CONSUMED;
+	}
+
+	/* The stack moves a VLAN tag out of the frame before the handler runs. */
+	skb_push(skb, skb->data - skb_mac_header(skb));
+	if (skb_vlan_tag_present(skb)) {
+		skb = __vlan_hwaccel_push_inside(skb);
+		if (!skb) {
+			atomic64_inc(&wlan->stats.rx_dropped);
+			return RX_HANDLER_CONSUMED;
+		}
+	}
+
+	if (!skb_is_gso(skb) || vduse_guest_wlan_rx_gso_ok(skb, features)) {
+		vduse_guest_wlan_rx_one(wlan, skb, features);
+		return RX_HANDLER_CONSUMED;
+	}
+
+	segs = __skb_gso_segment(skb, 0, false);
+	if (IS_ERR_OR_NULL(segs)) {
+		atomic64_inc(&wlan->stats.rx_dropped);
+		kfree_skb(skb);
+		return RX_HANDLER_CONSUMED;
+	}
+	consume_skb(skb);
+	skb_list_walk_safe(segs, skb, next) {
+		skb_mark_not_on_list(skb);
+		vduse_guest_wlan_rx_one(wlan, skb, features);
+	}
 	return RX_HANDLER_CONSUMED;
 }
 
@@ -2080,10 +2294,15 @@ static void vduse_guest_wlan_kick(void *priv, unsigned int index)
 	}
 }
 
+/*
+ * GRO in the guest is on only when the host takes what it coalesces, and
+ * the rx handler otherwise splits what mac80211 coalesces anyway.
+ */
 static int vduse_guest_wlan_start(void *priv)
 {
 	struct vduse_guest_wlan *wlan = priv;
 	struct net_device *netdev = wlan->netdev;
+	u64 features = vduse_guest_driver_features(wlan->dev);
 	int err = 0;
 
 	rtnl_lock();
@@ -2095,7 +2314,12 @@ static int vduse_guest_wlan_start(void *priv)
 		if (!err) {
 			wlan->rx_registered = true;
 			netdev_lock_ops(netdev);
-			netdev->wanted_features &= ~(NETIF_F_GRO | NETIF_F_LRO);
+			if ((features & VDUSE_GUEST_WLAN_GRO_FEATURES) ==
+			    VDUSE_GUEST_WLAN_GRO_FEATURES)
+				netdev->wanted_features |= NETIF_F_GRO;
+			else
+				netdev->wanted_features &= ~NETIF_F_GRO;
+			netdev->wanted_features &= ~NETIF_F_LRO;
 			netdev_update_features(netdev);
 			netdev_unlock_ops(netdev);
 		}
@@ -2106,6 +2330,7 @@ static int vduse_guest_wlan_start(void *priv)
 		wlan->running = true;
 		spin_unlock_irq(&wlan->lock);
 		spin_lock_bh(&wlan->data_lock);
+		wlan->features = features;
 		wlan->data_running = true;
 		spin_unlock_bh(&wlan->data_lock);
 	}
@@ -2554,7 +2779,7 @@ static void *__init vduse_guest_wlan_setup(struct vduse_guest_dev *dev,
 	wlan->config.max_wiphy_size = cpu_to_le32(VDUSE_GUEST_WLAN_WIPHY_SIZE);
 
 	cfg->device_id = VIRTIO_ID_MAC80211_WLAN;
-	cfg->features = BIT_ULL(VIRTIO_WLAN_F_SET_MAC);
+	cfg->features = VDUSE_GUEST_WLAN_FEATURES;
 	cfg->num_queues = VIRTIO_WLAN_VQ_MAX;
 	cfg->queue_sizes = vduse_guest_wlan_queue_sizes;
 	/*
@@ -2615,18 +2840,24 @@ static void vduse_guest_wlan_show(void *priv, struct seq_file *m)
 		   atomic64_read(&s->tx_spoofed));
 	seq_printf(m, "  %-18s %lld\n", "tx_dropped",
 		   atomic64_read(&s->tx_dropped));
+	seq_printf(m, "  %-18s %lld\n", "tx_gso", atomic64_read(&s->tx_gso));
 	seq_printf(m, "  %-18s %lld\n", "tx_chained",
 		   atomic64_read(&s->tx_chained));
 	seq_printf(m, "  %-18s %d\n", "tx_pending",
 		   atomic_read(&wlan->tx_pending));
 	seq_printf(m, "  %-18s %lld\n", "rx_frames",
 		   atomic64_read(&s->rx_frames));
+	seq_printf(m, "  %-18s %lld\n", "rx_gso", atomic64_read(&s->rx_gso));
+	seq_printf(m, "  %-18s %lld\n", "rx_buffers",
+		   atomic64_read(&s->rx_buffers));
 	seq_printf(m, "  %-18s %lld\n", "rx_no_buffer",
 		   atomic64_read(&s->rx_no_buffer));
 	seq_printf(m, "  %-18s %lld\n", "rx_oversized",
 		   atomic64_read(&s->rx_oversized));
 	seq_printf(m, "  %-18s %lld\n", "rx_bad_buffers",
 		   atomic64_read(&s->rx_bad_buffers));
+	seq_printf(m, "  %-18s %lld\n", "rx_dropped",
+		   atomic64_read(&s->rx_dropped));
 }
 
 const struct vduse_guest_backend_ops vduse_guest_wlan_ops = {
