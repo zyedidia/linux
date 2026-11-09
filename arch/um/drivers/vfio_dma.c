@@ -2,7 +2,10 @@
 /*
  * DMA mapping for VFIO devices. Each buffer is mapped into the host IOMMU
  * when the driver maps it and unmapped when the driver unmaps it, so the
- * device can only reach live DMA buffers and only those are pinned.
+ * device can only reach live DMA buffers and only those are pinned. With
+ * vfio_uml.eager_dma=1, the guest's RAM is instead mapped once, when the
+ * container is set up, and a buffer in it needs no map of its own. All of
+ * RAM is then pinned and reachable by the device.
  */
 
 #define pr_fmt(fmt) "vfio-uml: " fmt
@@ -10,26 +13,42 @@
 #include <linux/dma-map-ops.h>
 #include <linux/iova.h>
 #include <linux/mm.h>
+#include <linux/moduleparam.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <as-layout.h>
+#include <kern_util.h>
 
 #include "vfio_dma.h"
 #include "vfio_user.h"
 
+static bool uml_vfio_eager_dma;
+module_param_named(eager_dma, uml_vfio_eager_dma, bool, 0400);
+
+/*
+ * With eager DMA, the RAM from ram_start to ram_end is mapped at ram_iova
+ * while eager is set, which is published after the range.
+ */
 static struct {
 	int container;
 	struct iova_domain iovad;
 	unsigned long start_pfn;
 	unsigned long limit_pfn;
 	bool ready;
+	bool eager;
+	unsigned long ram_start;
+	unsigned long ram_end;
+	dma_addr_t ram_iova;
 } uml_vfio_dma;
 
 /*
  * Counters for the container. Byte counts are of whole pages, which is what
- * the host pins.
+ * the host pins. Premapped counts the maps that the eagerly mapped RAM
+ * served.
  */
 static struct {
+	atomic64_t premapped;
 	atomic64_t maps;
 	atomic64_t unmaps;
 	atomic64_t map_errors;
@@ -79,16 +98,49 @@ static unsigned long uml_vfio_dma_alloc_iova(unsigned long npages, u64 mask)
 	return iova ? iova->pfn_lo : 0;
 }
 
+/*
+ * Return the IOVA of a buffer in the eagerly mapped RAM, if the device's mask
+ * reaches it, or 0, which is never an IOVA.
+ */
+static dma_addr_t uml_vfio_dma_ram_addr(unsigned long vaddr, size_t size,
+					u64 mask)
+{
+	dma_addr_t addr;
+
+	if (!smp_load_acquire(&uml_vfio_dma.eager) ||
+	    vaddr < uml_vfio_dma.ram_start ||
+	    vaddr >= uml_vfio_dma.ram_end ||
+	    size > uml_vfio_dma.ram_end - vaddr)
+		return 0;
+	addr = uml_vfio_dma.ram_iova + (vaddr - uml_vfio_dma.ram_start);
+	return addr + size - 1 <= mask ? addr : 0;
+}
+
+static bool uml_vfio_dma_in_ram(dma_addr_t addr)
+{
+	return smp_load_acquire(&uml_vfio_dma.eager) &&
+	       addr >= uml_vfio_dma.ram_iova &&
+	       addr - uml_vfio_dma.ram_iova <
+	       uml_vfio_dma.ram_end - uml_vfio_dma.ram_start;
+}
+
 static dma_addr_t uml_vfio_dma_map(unsigned long vaddr, size_t size, u64 mask,
 				   bool read, bool write)
 {
 	unsigned long offset = offset_in_page(vaddr);
 	unsigned long npages = PAGE_ALIGN(offset + size) >> PAGE_SHIFT;
 	unsigned long pfn;
+	dma_addr_t addr;
 	int err;
 
 	if (!size)
 		return DMA_MAPPING_ERROR;
+
+	addr = uml_vfio_dma_ram_addr(vaddr, size, mask);
+	if (addr) {
+		atomic64_inc(&uml_vfio_dma_stats.premapped);
+		return addr;
+	}
 
 	pfn = uml_vfio_dma_alloc_iova(npages, mask);
 	if (!pfn) {
@@ -117,6 +169,9 @@ static void uml_vfio_dma_unmap(dma_addr_t addr, size_t size)
 	unsigned long npages = PAGE_ALIGN(offset + size) >> PAGE_SHIFT;
 	u64 iova = addr - offset;
 	int64_t r;
+
+	if (uml_vfio_dma_in_ram(addr))
+		return;
 
 	r = uml_vfio_user_dma_unmap(uml_vfio_dma.container, iova,
 				    (u64)npages << PAGE_SHIFT);
@@ -292,6 +347,48 @@ static int uml_vfio_dma_reserve_gaps(struct uml_vfio_user_iova_range *ranges,
 }
 
 /*
+ * Map the RAM that the page allocator manages, from the end of the kernel
+ * image to the end of physical memory, at one IOVA range. If that fails,
+ * each buffer is mapped on its own. Free pages stop being returned to the
+ * host before the mapping, which would keep the old pages of any that are.
+ */
+static void uml_vfio_dma_map_ram(void)
+{
+	unsigned long start = PAGE_ALIGN(uml_reserved);
+	unsigned long end = high_physmem & PAGE_MASK;
+	unsigned long npages = (end - start) >> PAGE_SHIFT;
+	unsigned long pfn;
+	int err;
+
+	uml_pin_ram();
+	if (IS_ENABLED(CONFIG_UML_PAGE_REPORTING))
+		uml_page_reporting_stop();
+
+	pfn = uml_vfio_dma_alloc_iova(npages, DMA_BIT_MASK(64));
+	if (!pfn) {
+		pr_warn("No IOVA range for %lu MiB of RAM, mapping each buffer\n",
+			(end - start) >> 20);
+		return;
+	}
+	err = uml_vfio_user_dma_map(uml_vfio_dma.container, start,
+				    (u64)pfn << PAGE_SHIFT,
+				    (u64)npages << PAGE_SHIFT, true, true);
+	if (err) {
+		free_iova(&uml_vfio_dma.iovad, pfn);
+		pr_warn("Failed to map %lu MiB of RAM, error %d, mapping each buffer\n",
+			(end - start) >> 20, err);
+		return;
+	}
+	uml_vfio_dma_count_map(npages);
+	uml_vfio_dma.ram_start = start;
+	uml_vfio_dma.ram_end = end;
+	uml_vfio_dma.ram_iova = (dma_addr_t)pfn << PAGE_SHIFT;
+	smp_store_release(&uml_vfio_dma.eager, true);
+	pr_info("Mapped %lu MiB of RAM for DMA at IOVA 0x%llx\n",
+		(end - start) >> 20, (u64)uml_vfio_dma.ram_iova);
+}
+
+/*
  * Restrict the IOVA domain to the ranges the host IOMMU can map after a group
  * joins the container, and set the domain up if this is the first group.
  * Each group that joins can only remove ranges, so the IOVAs it excludes are
@@ -328,6 +425,8 @@ int uml_vfio_dma_add_group(int container)
 	}
 
 	err = uml_vfio_dma_reserve_gaps(ranges, n);
+	if (!err && uml_vfio_eager_dma && !uml_vfio_dma.eager)
+		uml_vfio_dma_map_ram();
 out:
 	kfree(ranges);
 	return err;
@@ -336,6 +435,8 @@ out:
 void uml_vfio_dma_show(struct seq_file *m)
 {
 	seq_puts(m, "dma\n");
+	seq_printf(m, "  %-18s %lld\n", "premapped",
+		   atomic64_read(&uml_vfio_dma_stats.premapped));
 	seq_printf(m, "  %-18s %lld\n", "maps",
 		   atomic64_read(&uml_vfio_dma_stats.maps));
 	seq_printf(m, "  %-18s %lld\n", "unmaps",
@@ -358,7 +459,11 @@ void uml_vfio_dma_release(void)
 	if (!uml_vfio_dma.ready)
 		return;
 
+	if (uml_vfio_dma.eager)
+		atomic64_sub(uml_vfio_dma.ram_end - uml_vfio_dma.ram_start,
+			     &uml_vfio_dma_stats.live_bytes);
 	put_iova_domain(&uml_vfio_dma.iovad);
 	iova_cache_put();
+	WRITE_ONCE(uml_vfio_dma.eager, false);
 	uml_vfio_dma.ready = false;
 }

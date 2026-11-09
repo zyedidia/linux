@@ -14,6 +14,7 @@
 #include <linux/page_reporting.h>
 #include <linux/printk.h>
 #include <linux/scatterlist.h>
+#include <kern_util.h>
 #include <os.h>
 
 static int uml_report_free_pages(struct page_reporting_dev_info *prdev,
@@ -56,3 +57,12 @@ static int __init uml_page_reporting_init(void)
 	return 0;
 }
 device_initcall(uml_page_reporting_init);
+
+/*
+ * Stop reporting before RAM is mapped for DMA. Unregistering waits for a
+ * report that is in progress, and does nothing if reporting never started.
+ */
+void uml_page_reporting_stop(void)
+{
+	page_reporting_unregister(&uml_page_reporting);
+}

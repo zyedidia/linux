@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/memblock.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
 #include <linux/pfn.h>
 #include <asm/page.h>
 #include <asm/sections.h>
@@ -17,6 +18,29 @@
 #include <os.h>
 
 static int physmem_fd = -1;
+
+/*
+ * Once all of RAM is to be mapped for DMA, no page may be dropped from the
+ * host file, since the IOMMU would keep the old page. The lock makes a drop
+ * and the pinning exclusive.
+ */
+static DEFINE_MUTEX(ram_pin_lock);
+static bool ram_pinned;
+
+void uml_pin_ram(void)
+{
+	guard(mutex)(&ram_pin_lock);
+	ram_pinned = true;
+}
+
+/* Drop a range of RAM from the host file, unless RAM is pinned. */
+int uml_drop_ram(void *addr, unsigned long len)
+{
+	guard(mutex)(&ram_pin_lock);
+	if (ram_pinned)
+		return -EBUSY;
+	return os_drop_memory(addr, len);
+}
 
 /* Changed during early boot */
 unsigned long high_physmem;

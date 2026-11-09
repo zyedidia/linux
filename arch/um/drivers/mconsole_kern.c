@@ -360,7 +360,12 @@ static int mem_config(char *str, char **error_out)
 				unplugged = list_entry(entry,
 						       struct unplugged_pages,
 						       list);
-				err = os_drop_memory(addr, PAGE_SIZE);
+				err = uml_drop_ram(addr, PAGE_SIZE);
+				if (err == -EBUSY) {
+					free_page((unsigned long) addr);
+					*error_out = "RAM is pinned for DMA";
+					goto out_unlock;
+				}
 				if (err) {
 					printk(KERN_ERR "Failed to release "
 					       "memory - errno = %d\n", err);
