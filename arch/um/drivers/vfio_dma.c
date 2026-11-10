@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * DMA mapping for VFIO devices. Each buffer is mapped into the host IOMMU
- * when the driver maps it and unmapped when the driver unmaps it, so the
- * device can only reach live DMA buffers and only those are pinned. With
- * vfio_uml.eager_dma=1, the guest's RAM is instead mapped once, when the
- * container is set up, and a buffer in it needs no map of its own. All of
- * RAM is then pinned and reachable by the device. With
- * vfio_uml.dma_cache_mb=<n>, a small buffer's mapping instead stays mapped
- * after its unmap, up to n MiB of unused mappings, so that the next buffer
- * in the same pages needs no map of its own.
+ * DMA mapping for VFIO devices. A buffer is mapped into the host IOMMU when
+ * the driver maps it, unless a cached mapping covers it. A small streaming
+ * buffer's mapping stays in the IOMMU after the driver unmaps it, up to
+ * vfio_uml.dma_cache_mb MiB of unused mappings (4 by default), so that the
+ * next buffer in the same pages needs no map of its own. Other buffers are
+ * unmapped when the driver unmaps them, and with vfio_uml.dma_cache_mb=0 all
+ * are, so that the device can only reach live DMA buffers and only those are
+ * pinned. With vfio_uml.eager_dma=1, the guest's RAM is instead mapped once,
+ * when the container is set up, and a buffer in it needs no map of its own.
+ * All of RAM is then pinned and reachable by the device.
  */
 
 #define pr_fmt(fmt) "vfio-uml: " fmt
@@ -32,7 +33,7 @@
 static bool uml_vfio_eager_dma;
 module_param_named(eager_dma, uml_vfio_eager_dma, bool, 0400);
 
-static unsigned int uml_vfio_dma_cache_mb;
+static unsigned int uml_vfio_dma_cache_mb = 4;
 module_param_named(dma_cache_mb, uml_vfio_dma_cache_mb, uint, 0400);
 
 #define UML_VFIO_DMA_CACHE_PAGES 16
@@ -312,7 +313,7 @@ static dma_addr_t uml_vfio_dma_map_cached(unsigned long vaddr, size_t size,
 	}
 	spin_unlock_irqrestore(&uml_vfio_dma_cache.lock, flags);
 
-	e = kmalloc(sizeof(*e), GFP_ATOMIC);
+	e = kmalloc(sizeof(*e), GFP_NOWAIT | __GFP_NOWARN);
 	if (!e)
 		return uml_vfio_dma_map(vaddr, size, mask, read, write);
 	iova = uml_vfio_dma_map(vstart, npages << PAGE_SHIFT, mask, true, true);
