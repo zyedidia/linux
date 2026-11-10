@@ -637,15 +637,16 @@ void vduse_guest_used_elem(struct vduse_guest_dev *dev, unsigned int index,
 /*
  * Publish the completions in used, filled by vduse_guest_used_elem(), with
  * one update of the used index, so that the driver sees all of them or none.
+ * The driver is not notified until vduse_guest_notify_used(), which covers
+ * every completion published since the last notification.
  */
-void vduse_guest_complete_n(struct vduse_guest_dev *dev, unsigned int index,
-			    const struct vring_used_elem *used, unsigned int n)
+void vduse_guest_publish_n(struct vduse_guest_dev *dev, unsigned int index,
+			   const struct vring_used_elem *used, unsigned int n)
 {
 	struct vduse_guest_vq *vq = &dev->vqs[index];
 	unsigned long flags;
 	unsigned int i;
 	u64 bytes = 0;
-	int notify;
 	u32 head;
 
 	for (i = 0; i < n; i++)
@@ -665,14 +666,38 @@ void vduse_guest_complete_n(struct vduse_guest_dev *dev, unsigned int index,
 	smp_wmb();
 	WRITE_ONCE(vq->log->used_idx,
 		   vq->vrh.last_used_idx + vq->vrh.completed);
-	notify = vringh_need_notify_kern(&vq->vrh);
 	spin_unlock_irqrestore(&vq->lock, flags);
 
 	atomic64_add(bytes, &vq->stats.in_bytes);
+}
+
+/*
+ * Notify the driver of the completions published since the last
+ * notification, if it asked to be. Without any, nothing is sent.
+ */
+void vduse_guest_notify_used(struct vduse_guest_dev *dev, unsigned int index)
+{
+	struct vduse_guest_vq *vq = &dev->vqs[index];
+	unsigned long flags;
+	int notify = 0;
+
+	spin_lock_irqsave(&vq->lock, flags);
+	if (vq->vrh.completed)
+		notify = vringh_need_notify_kern(&vq->vrh);
+	spin_unlock_irqrestore(&vq->lock, flags);
+
 	if (notify <= 0)
 		atomic64_inc(&vq->stats.suppressed);
 	else
 		vduse_guest_inject(dev, index);
+}
+
+/* Publish completions and notify the driver of them. */
+void vduse_guest_complete_n(struct vduse_guest_dev *dev, unsigned int index,
+			    const struct vring_used_elem *used, unsigned int n)
+{
+	vduse_guest_publish_n(dev, index, used, n);
+	vduse_guest_notify_used(dev, index);
 }
 
 void vduse_guest_complete(struct vduse_guest_dev *dev, unsigned int index,

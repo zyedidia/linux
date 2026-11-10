@@ -151,9 +151,12 @@ struct vduse_guest_net {
 	 * the data path runs. Tx_pending counts the frames in the qdisc and the
 	 * NIC, apart from those segmented in software, which stop counting once
 	 * they are split. The tx work stops at the limit until the destructor
-	 * of one of them sets tx_wake.
+	 * of one of them sets tx_wake. The rx handler publishes each frame's
+	 * buffers, and rx_notify, a bottom-half work that runs before the next
+	 * poll of the interface, notifies the host of all of them.
 	 */
 	struct work_struct rx_work;
+	struct work_struct rx_notify;
 	struct work_struct tx_work;
 	spinlock_t data_lock;
 	bool data_running;
@@ -603,7 +606,8 @@ static void vduse_guest_net_rx_one(struct vduse_guest_net *net,
 	 * of.
 	 */
 	vduse_guest_net_put_rx_bufs(net, &bufs);
-	vduse_guest_complete_n(net->dev, VDUSE_GUEST_NET_RX, used, n);
+	vduse_guest_publish_n(net->dev, VDUSE_GUEST_NET_RX, used, n);
+	queue_work(system_bh_highpri_wq, &net->rx_notify);
 	atomic64_inc(&net->stats.rx_frames);
 	atomic64_add(n, &net->stats.rx_buffers);
 	if (skb_is_gso(skb))
@@ -613,6 +617,20 @@ static void vduse_guest_net_rx_one(struct vduse_guest_net *net,
 
 drop:
 	kfree_skb(skb);
+}
+
+/*
+ * Notify the host once of the frames that the rx handler published during a
+ * softirq, which usually holds a whole poll of the interface.
+ */
+static void vduse_guest_net_rx_notify(struct work_struct *work)
+{
+	struct vduse_guest_net *net =
+		container_of(work, struct vduse_guest_net, rx_notify);
+	u64 features;
+
+	if (vduse_guest_net_data_running(net, &features))
+		vduse_guest_notify_used(net->dev, VDUSE_GUEST_NET_RX);
 }
 
 /*
@@ -689,6 +707,7 @@ static void vduse_guest_net_stop_data(struct vduse_guest_net *net)
 	spin_unlock_bh(&net->data_lock);
 
 	cancel_work_sync(&net->rx_work);
+	cancel_work_sync(&net->rx_notify);
 	cancel_work_sync(&net->tx_work);
 	vduse_guest_net_put_rx_bufs(net, &bufs);
 }
@@ -757,6 +776,11 @@ static void vduse_guest_net_gone(struct vduse_guest_net *net)
 		netdev_rx_handler_unregister(net->netdev);
 		net->rx_registered = false;
 	}
+	/*
+	 * The device keeps running, so the host is told of the frames that
+	 * the last handlers published before the data path stops.
+	 */
+	flush_work(&net->rx_notify);
 	vduse_guest_net_stop_data(net);
 	pr_warn("%s: interface %s is gone\n", vduse_guest_name(net->dev),
 		net->netdev->name);
@@ -1051,6 +1075,7 @@ static void *__init vduse_guest_net_setup(struct vduse_guest_dev *dev,
 		return ERR_PTR(-ENOMEM);
 	net->dev = dev;
 	INIT_WORK(&net->rx_work, vduse_guest_net_rx_work);
+	INIT_WORK(&net->rx_notify, vduse_guest_net_rx_notify);
 	INIT_WORK(&net->tx_work, vduse_guest_net_tx_work);
 	net->tx_cpu = WORK_CPU_UNBOUND;
 	INIT_DELAYED_WORK(&net->link_work, vduse_guest_net_link_work);
@@ -1114,6 +1139,11 @@ static void vduse_guest_net_release(void *priv)
 	vduse_guest_net_detach(net);
 	unregister_netdevice_notifier(&net->nb);
 	cancel_delayed_work_sync(&net->link_work);
+	/*
+	 * A handler that ran as the device stopped can have queued the
+	 * notification work.
+	 */
+	cancel_work_sync(&net->rx_notify);
 	kvfree(net->rx_pool);
 	kfree(net);
 }

@@ -98,6 +98,9 @@ void vduse_guest_used_elem(struct vduse_guest_dev *dev, unsigned int index,
 			   struct vring_used_elem *elem, u16 head, u32 len);
 void vduse_guest_complete_n(struct vduse_guest_dev *dev, unsigned int index,
 			    const struct vring_used_elem *used, unsigned int n);
+void vduse_guest_publish_n(struct vduse_guest_dev *dev, unsigned int index,
+			   const struct vring_used_elem *used, unsigned int n);
+void vduse_guest_notify_used(struct vduse_guest_dev *dev, unsigned int index);
 void vduse_guest_notify_disable(struct vduse_guest_dev *dev,
 				unsigned int index);
 bool vduse_guest_notify_enable(struct vduse_guest_dev *dev,

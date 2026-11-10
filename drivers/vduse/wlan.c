@@ -207,9 +207,12 @@ struct vduse_guest_wlan {
 	 * clears it and queues the work again. Control_port is the
 	 * connection's control port ethertype, and tx_gen, under data_lock,
 	 * changes when the device stops, so that a control port frame of an
-	 * earlier start does not complete its chain.
+	 * earlier start does not complete its chain. The rx handler publishes
+	 * each frame's buffers, and rx_notify, a bottom-half work that runs
+	 * before the next poll of the card, notifies the host of all of them.
 	 */
 	struct delayed_work rx_work;
+	struct work_struct rx_notify;
 	struct work_struct tx_work;
 	spinlock_t data_lock;
 	bool data_running;
@@ -1273,6 +1276,20 @@ static void vduse_guest_wlan_rx_work(struct work_struct *work)
 }
 
 /*
+ * Notify the host once of the frames that the rx handler published during a
+ * softirq, which usually holds a whole poll of the card.
+ */
+static void vduse_guest_wlan_rx_notify(struct work_struct *work)
+{
+	struct vduse_guest_wlan *wlan =
+		container_of(work, struct vduse_guest_wlan, rx_notify);
+	u64 features;
+
+	if (vduse_guest_wlan_data_running(wlan, &features))
+		vduse_guest_notify_used(wlan->dev, VIRTIO_WLAN_VQ_RX);
+}
+
+/*
  * The host takes a coalesced TCP frame without a VLAN tag, up to the
  * largest that GRO makes by default.
  */
@@ -1365,7 +1382,8 @@ static void vduse_guest_wlan_rx_one(struct vduse_guest_wlan *wlan,
 			vduse_guest_used_elem(wlan->dev, VIRTIO_WLAN_VQ_RX,
 					      &used[n++], buf->head, 0);
 	}
-	vduse_guest_complete_n(wlan->dev, VIRTIO_WLAN_VQ_RX, used, n);
+	vduse_guest_publish_n(wlan->dev, VIRTIO_WLAN_VQ_RX, used, n);
+	queue_work(system_bh_highpri_wq, &wlan->rx_notify);
 	list_for_each_entry_safe(buf, tmp, &bufs, list)
 		vduse_guest_wlan_free_rx_buf(buf);
 	if (bad) {
@@ -1458,6 +1476,7 @@ static void vduse_guest_wlan_stop_data(struct vduse_guest_wlan *wlan,
 	spin_unlock_bh(&wlan->data_lock);
 
 	cancel_delayed_work_sync(&wlan->rx_work);
+	cancel_work_sync(&wlan->rx_notify);
 	cancel_work_sync(&wlan->tx_work);
 	/* A tx work that was still running can have set the flag again. */
 	clear_bit(0, &wlan->tx_wake);
@@ -1519,6 +1538,11 @@ static void vduse_guest_wlan_gone(void *priv)
 		netdev_rx_handler_unregister(wlan->netdev);
 		wlan->rx_registered = false;
 	}
+	/*
+	 * The device keeps running, so the host is told of the frames that
+	 * the last handlers published before the data path stops.
+	 */
+	flush_work(&wlan->rx_notify);
 	vduse_guest_wlan_stop_data(wlan, true);
 	pr_warn("%s: interface %s is gone\n", vduse_guest_name(wlan->dev),
 		wlan->netdev->name);
@@ -2747,6 +2771,7 @@ static void *__init vduse_guest_wlan_setup(struct vduse_guest_dev *dev,
 	INIT_WORK(&wlan->event_work, vduse_guest_wlan_event_work);
 	INIT_WORK(&wlan->country_work, vduse_guest_wlan_country_work);
 	INIT_DELAYED_WORK(&wlan->rx_work, vduse_guest_wlan_rx_work);
+	INIT_WORK(&wlan->rx_notify, vduse_guest_wlan_rx_notify);
 	INIT_WORK(&wlan->tx_work, vduse_guest_wlan_tx_work);
 	spin_lock_init(&wlan->data_lock);
 	INIT_LIST_HEAD(&wlan->rx_bufs);
@@ -2815,6 +2840,11 @@ static void vduse_guest_wlan_release(void *priv)
 	rtnl_unlock();
 	cfg80211_client_unregister(wlan->client);
 	destroy_workqueue(wlan->wq);
+	/*
+	 * A handler that ran as the device stopped can have queued the
+	 * notification work.
+	 */
+	cancel_work_sync(&wlan->rx_notify);
 	kfree(wlan->wiphy_resp);
 	kfree(wlan);
 }
