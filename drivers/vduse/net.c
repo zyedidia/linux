@@ -33,6 +33,7 @@
 
 #define VDUSE_GUEST_NET_TIMEOUT 30
 #define VDUSE_GUEST_NET_TX_LIMIT 256
+#define VDUSE_GUEST_NET_TX_EARLY_BYTES 65536
 #define VDUSE_GUEST_NET_INLINE_IOVS 4
 /* The most buffers that one received packet takes. */
 #define VDUSE_GUEST_NET_MAX_BUFS 64
@@ -73,10 +74,11 @@
 	offsetofend(struct virtio_net_config, duplex)
 
 #define VDUSE_GUEST_NET_RX_SIZE 1024
+#define VDUSE_GUEST_NET_TX_SIZE 256
 
 static const u16 vduse_guest_net_queue_sizes[VDUSE_GUEST_NET_NUM_QUEUES] = {
 	[VDUSE_GUEST_NET_RX] = VDUSE_GUEST_NET_RX_SIZE,
-	[VDUSE_GUEST_NET_TX] = 256,
+	[VDUSE_GUEST_NET_TX] = VDUSE_GUEST_NET_TX_SIZE,
 };
 
 /*
@@ -104,6 +106,27 @@ struct vduse_guest_net_stats {
 	atomic64_t rx_segmented;
 	atomic64_t rx_dropped;
 	atomic64_t link_changes;
+};
+
+/*
+ * A head of the tx queue, with the skb that holds its frame until the head's
+ * chain is completed, or NULL.
+ */
+struct vduse_guest_net_tx_buf {
+	struct vduse_guest_net *net;
+	u16 head;
+	struct sk_buff *skb;
+};
+
+/*
+ * A frame whose chain was completed when it was copied, with its length, so
+ * that its destructor can return it to the early budget. Unused ones are on
+ * a free list.
+ */
+struct vduse_guest_net_tx_early {
+	struct vduse_guest_net *net;
+	struct vduse_guest_net_tx_early *next;
+	unsigned int len;
 };
 
 /* A buffer that the host posted on the rx queue, waiting for a frame. */
@@ -151,13 +174,36 @@ struct vduse_guest_net {
 	 * the data path runs. Tx_pending counts the frames in the qdisc and the
 	 * NIC, apart from those segmented in software, which stop counting once
 	 * they are split. The tx work stops at the limit until the destructor
-	 * of one of them sets tx_wake. The rx handler publishes each frame's
-	 * buffers, and rx_notify, a bottom-half work that runs before the next
-	 * poll of the interface, notifies the host of all of them.
+	 * of one of them sets tx_wake. A frame's chain is completed by its
+	 * destructor, once the interface has sent or dropped the frame, so that
+	 * the host's byte queue limits see how much the interface holds. Up to
+	 * VDUSE_GUEST_NET_TX_EARLY_BYTES of frames in the interface are instead
+	 * completed when they are copied, so that a lone frame's completion does
+	 * not wait for the interface, and the host sends a stream of small
+	 * frames in large batches. Tx_early_bytes counts them, and
+	 * tx_early_free holds the unused entries of tx_early, one for each frame
+	 * that the stack can hold. The destructors publish the completions, and
+	 * tx_notify, a bottom-half work, notifies the host of all of them.
+	 * Tx_lock, which destructors take with interrupts disabled, protects
+	 * tx_live, tx_unnotified, the early budget and the skbs of the heads.
+	 * Tx_live is set while the rings may be completed into, and
+	 * tx_unnotified while a completion waits for tx_notify. A stop completes
+	 * every chain still in flight, so that a destructor that runs later, or
+	 * one of an earlier start, completes none. The rx handler publishes each
+	 * frame's buffers, and rx_notify, a bottom-half work that runs before
+	 * the next poll of the interface, notifies the host of all of them.
 	 */
 	struct work_struct rx_work;
 	struct work_struct rx_notify;
 	struct work_struct tx_work;
+	struct work_struct tx_notify;
+	spinlock_t tx_lock;
+	bool tx_live;
+	bool tx_unnotified;
+	struct vduse_guest_net_tx_buf tx_bufs[VDUSE_GUEST_NET_TX_SIZE];
+	unsigned int tx_early_bytes;
+	struct vduse_guest_net_tx_early *tx_early_free;
+	struct vduse_guest_net_tx_early tx_early[VDUSE_GUEST_NET_TX_LIMIT];
 	spinlock_t data_lock;
 	bool data_running;
 	u64 features;
@@ -198,15 +244,55 @@ static void vduse_guest_net_queue_tx(struct vduse_guest_net *net)
 		queue_work(system_percpu_wq, &net->tx_work);
 }
 
-static void vduse_guest_net_tx_destructor(struct sk_buff *skb)
+static void vduse_guest_net_tx_release(struct vduse_guest_net *net)
 {
-	struct vduse_guest_net *net = skb_shinfo(skb)->destructor_arg;
-
 	atomic_dec(&net->tx_pending);
 	/* This pairs with the barrier in vduse_guest_net_tx_full(). */
 	smp_mb__after_atomic();
 	if (test_and_clear_bit(0, &net->tx_wake))
 		vduse_guest_net_queue_tx(net);
+}
+
+/* Return a frame that was completed when it was copied to the early budget. */
+static void vduse_guest_net_tx_early_destructor(struct sk_buff *skb)
+{
+	struct vduse_guest_net_tx_early *e = skb_shinfo(skb)->destructor_arg;
+	struct vduse_guest_net *net = e->net;
+	unsigned long flags;
+
+	spin_lock_irqsave(&net->tx_lock, flags);
+	net->tx_early_bytes -= e->len;
+	e->next = net->tx_early_free;
+	net->tx_early_free = e;
+	spin_unlock_irqrestore(&net->tx_lock, flags);
+	vduse_guest_net_tx_release(net);
+}
+
+/*
+ * Complete a frame's chain once the interface has sent or dropped it, unless
+ * the chain was completed when the data path stopped.
+ */
+static void vduse_guest_net_tx_destructor(struct sk_buff *skb)
+{
+	struct vduse_guest_net_tx_buf *buf = skb_shinfo(skb)->destructor_arg;
+	struct vduse_guest_net *net = buf->net;
+	struct vring_used_elem used;
+	unsigned long flags;
+	bool live;
+
+	spin_lock_irqsave(&net->tx_lock, flags);
+	live = net->tx_live && buf->skb == skb;
+	if (live) {
+		buf->skb = NULL;
+		vduse_guest_used_elem(net->dev, VDUSE_GUEST_NET_TX, &used,
+				      buf->head, 0);
+		vduse_guest_publish_n(net->dev, VDUSE_GUEST_NET_TX, &used, 1);
+		net->tx_unnotified = true;
+	}
+	spin_unlock_irqrestore(&net->tx_lock, flags);
+	if (live)
+		queue_work(system_bh_highpri_wq, &net->tx_notify);
+	vduse_guest_net_tx_release(net);
 }
 
 /* Check a GSO header from the host against the features it accepted. */
@@ -225,15 +311,38 @@ static bool vduse_guest_net_tx_gso_ok(const struct virtio_net_hdr_v1 *hdr,
 	return false;
 }
 
+/* Notify the host once of the chains that destructors completed. */
+static void vduse_guest_net_tx_notify(struct work_struct *work)
+{
+	struct vduse_guest_net *net =
+		container_of(work, struct vduse_guest_net, tx_notify);
+	unsigned long flags;
+	bool live;
+
+	spin_lock_irqsave(&net->tx_lock, flags);
+	live = net->tx_live;
+	if (live)
+		net->tx_unnotified = false;
+	spin_unlock_irqrestore(&net->tx_lock, flags);
+	if (live)
+		vduse_guest_notify_used(net->dev, VDUSE_GUEST_NET_TX);
+}
+
 /*
  * Send a frame from the host. The headers go in the linear part of the skb
  * and the rest in page fragments, so that a large segment needs no
  * high-order allocation. The interface segments and checksums what the
- * host offloads, or validate_xmit_skb() does it in software.
+ * host offloads, or validate_xmit_skb() does it in software. Return whether
+ * the frame's destructor completes the chain, which it does for a frame that
+ * reaches the interface beyond the early budget.
  */
-static void vduse_guest_net_tx_one(struct vduse_guest_net *net,
-				   struct vringh_kiov *riov, u64 features)
+static bool vduse_guest_net_tx_one(struct vduse_guest_net *net,
+				   struct vringh_kiov *riov, u16 head,
+				   u64 features)
 {
+	struct vduse_guest_net_tx_buf *buf = &net->tx_bufs[head];
+	struct vduse_guest_net_tx_early *e = NULL;
+	unsigned long flags;
 	struct net_device *netdev = net->netdev;
 	size_t len = vringh_kiov_length(riov);
 	unsigned int reserve = LL_RESERVED_SPACE(netdev);
@@ -276,7 +385,7 @@ static void vduse_guest_net_tx_one(struct vduse_guest_net *net,
 				   PAGE_ALLOC_COSTLY_ORDER, &err, GFP_KERNEL);
 	if (!skb) {
 		atomic64_inc(&net->stats.tx_dropped);
-		return;
+		return false;
 	}
 	/*
 	 * Probing the transport header dissects the frame, which finds the
@@ -308,17 +417,34 @@ static void vduse_guest_net_tx_one(struct vduse_guest_net *net,
 
 	if (skb_is_gso(skb))
 		atomic64_inc(&net->stats.tx_gso);
-	skb_shinfo(skb)->destructor_arg = net;
-	skb->destructor = vduse_guest_net_tx_destructor;
+	spin_lock_irqsave(&net->tx_lock, flags);
+	if (net->tx_early_free &&
+	    net->tx_early_bytes + frame_len <= VDUSE_GUEST_NET_TX_EARLY_BYTES) {
+		e = net->tx_early_free;
+		net->tx_early_free = e->next;
+		e->len = frame_len;
+		net->tx_early_bytes += frame_len;
+	} else {
+		buf->skb = skb;
+	}
+	spin_unlock_irqrestore(&net->tx_lock, flags);
+	if (e) {
+		skb_shinfo(skb)->destructor_arg = e;
+		skb->destructor = vduse_guest_net_tx_early_destructor;
+	} else {
+		skb_shinfo(skb)->destructor_arg = buf;
+		skb->destructor = vduse_guest_net_tx_destructor;
+	}
 	atomic_inc(&net->tx_pending);
 	atomic64_inc(&net->stats.tx_frames);
 	dev_queue_xmit(skb);
-	return;
+	return !e;
 
 free:
 	kfree_skb(skb);
 invalid:
 	atomic64_inc(&net->stats.tx_invalid);
+	return false;
 }
 
 /*
@@ -388,8 +514,9 @@ static void vduse_guest_net_tx_work(struct work_struct *work)
 			continue;
 		}
 
-		vduse_guest_net_tx_one(net, &riov, features);
-		vduse_guest_complete(net->dev, VDUSE_GUEST_NET_TX, head, 0);
+		if (!vduse_guest_net_tx_one(net, &riov, head, features))
+			vduse_guest_complete(net->dev, VDUSE_GUEST_NET_TX, head,
+					     0);
 	}
 
 	vringh_kiov_cleanup(&riov);
@@ -692,13 +819,47 @@ static rx_handler_result_t vduse_guest_net_rx(struct sk_buff **pskb)
 }
 
 /*
+ * Complete the chains of the frames that the interface still holds, while
+ * the rings are mapped, and stop destructors from completing any. The frames
+ * hold their own copies of the data. Set *any if one was completed, or if a
+ * destructor's completion still waits for tx_notify.
+ */
+static void vduse_guest_net_complete_tx(struct vduse_guest_net *net, bool *any)
+{
+	struct vduse_guest_net_tx_buf *buf;
+	struct vring_used_elem used;
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&net->tx_lock, flags);
+	for (i = 0; i < VDUSE_GUEST_NET_TX_SIZE; i++) {
+		buf = &net->tx_bufs[i];
+		if (!buf->skb)
+			continue;
+		buf->skb = NULL;
+		if (!net->tx_live)
+			continue;
+		vduse_guest_used_elem(net->dev, VDUSE_GUEST_NET_TX, &used,
+				      buf->head, 0);
+		vduse_guest_publish_n(net->dev, VDUSE_GUEST_NET_TX, &used, 1);
+		*any = true;
+	}
+	if (net->tx_live && net->tx_unnotified)
+		*any = true;
+	net->tx_unnotified = false;
+	net->tx_live = false;
+	spin_unlock_irqrestore(&net->tx_lock, flags);
+}
+
+/*
  * Stop the data path. Frames that the interface still holds keep their
- * count, and the buffers that the host posted are dropped. A reset returns
- * them to the host, and once the interface is gone the device passes no
- * more traffic.
+ * count and have their chains completed, and the buffers that the host
+ * posted are dropped. A reset returns them to the host, and once the
+ * interface is gone the device passes no more traffic.
  */
 static void vduse_guest_net_stop_data(struct vduse_guest_net *net)
 {
+	bool any = false;
 	LIST_HEAD(bufs);
 
 	spin_lock_bh(&net->data_lock);
@@ -706,9 +867,14 @@ static void vduse_guest_net_stop_data(struct vduse_guest_net *net)
 	list_splice_init(&net->rx_bufs, &bufs);
 	spin_unlock_bh(&net->data_lock);
 
+	cancel_work_sync(&net->tx_work);
+	vduse_guest_net_complete_tx(net, &any);
+	if (any)
+		vduse_guest_notify_used(net->dev, VDUSE_GUEST_NET_TX);
+
 	cancel_work_sync(&net->rx_work);
 	cancel_work_sync(&net->rx_notify);
-	cancel_work_sync(&net->tx_work);
+	cancel_work_sync(&net->tx_notify);
 	vduse_guest_net_put_rx_bufs(net, &bufs);
 }
 
@@ -859,6 +1025,9 @@ static int vduse_guest_net_start(void *priv)
 	netdev_unlock_ops(netdev);
 	net->running = true;
 	net->config_dirty = true;
+	spin_lock_irq(&net->tx_lock);
+	net->tx_live = true;
+	spin_unlock_irq(&net->tx_lock);
 	spin_lock_bh(&net->data_lock);
 	net->features = features;
 	net->data_running = true;
@@ -1077,6 +1246,17 @@ static void *__init vduse_guest_net_setup(struct vduse_guest_dev *dev,
 	INIT_WORK(&net->rx_work, vduse_guest_net_rx_work);
 	INIT_WORK(&net->rx_notify, vduse_guest_net_rx_notify);
 	INIT_WORK(&net->tx_work, vduse_guest_net_tx_work);
+	INIT_WORK(&net->tx_notify, vduse_guest_net_tx_notify);
+	spin_lock_init(&net->tx_lock);
+	for (i = 0; i < VDUSE_GUEST_NET_TX_SIZE; i++) {
+		net->tx_bufs[i].net = net;
+		net->tx_bufs[i].head = i;
+	}
+	for (i = 0; i < VDUSE_GUEST_NET_TX_LIMIT; i++) {
+		net->tx_early[i].net = net;
+		net->tx_early[i].next = net->tx_early_free;
+		net->tx_early_free = &net->tx_early[i];
+	}
 	net->tx_cpu = WORK_CPU_UNBOUND;
 	INIT_DELAYED_WORK(&net->link_work, vduse_guest_net_link_work);
 	spin_lock_init(&net->data_lock);
