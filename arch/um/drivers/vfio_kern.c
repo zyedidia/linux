@@ -213,10 +213,11 @@ static void uml_vfio_unset_container(int group_fd)
 {
 	guard(mutex)(&uml_vfio_container_mtx);
 
+	/* The domain goes before the container drops the host's mappings. */
+	if (uml_vfio_container.users == 1)
+		uml_vfio_dma_release();
 	uml_vfio_user_unset_container(uml_vfio_container.fd, group_fd);
 	uml_vfio_container.users--;
-	if (!uml_vfio_container.users)
-		uml_vfio_dma_release();
 }
 
 /*

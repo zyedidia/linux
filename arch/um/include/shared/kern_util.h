@@ -42,6 +42,7 @@ extern void uml_pm_wake(void);
 extern void uml_pin_ram(void);
 extern int uml_drop_ram(void *addr, unsigned long len);
 extern void uml_page_reporting_stop(void);
+extern void uml_vfio_dma_invalidate(unsigned long start, unsigned long len);
 
 extern int start_uml(void);
 

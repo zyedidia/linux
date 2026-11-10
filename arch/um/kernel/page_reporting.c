@@ -25,7 +25,7 @@ static int uml_report_free_pages(struct page_reporting_dev_info *prdev,
 	int err;
 
 	for_each_sg(sgl, sg, nents, i) {
-		err = os_drop_memory(page_address(sg_page(sg)), sg->length);
+		err = uml_drop_ram(page_address(sg_page(sg)), sg->length);
 		if (err) {
 			pr_warn_once("cannot return free memory to the host: %d\n",
 				     err);

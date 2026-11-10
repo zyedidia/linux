@@ -33,12 +33,17 @@ void uml_pin_ram(void)
 	ram_pinned = true;
 }
 
-/* Drop a range of RAM from the host file, unless RAM is pinned. */
+/*
+ * Drop a range of RAM from the host file, unless RAM is pinned. Cached DMA
+ * mappings of the range go first.
+ */
 int uml_drop_ram(void *addr, unsigned long len)
 {
 	guard(mutex)(&ram_pin_lock);
 	if (ram_pinned)
 		return -EBUSY;
+	if (IS_ENABLED(CONFIG_UML_PCI_OVER_VFIO))
+		uml_vfio_dma_invalidate((unsigned long)addr, len);
 	return os_drop_memory(addr, len);
 }
 
