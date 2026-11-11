@@ -182,16 +182,24 @@ struct vduse_guest_net {
 	 * not wait for the interface, and the host sends a stream of small
 	 * frames in large batches. Tx_early_bytes counts them, and
 	 * tx_early_free holds the unused entries of tx_early, one for each frame
-	 * that the stack can hold. The destructors publish the completions, and
-	 * tx_notify, a bottom-half work, notifies the host of all of them.
+	 * that the stack can hold. Tx_rx_frames holds the count of received
+	 * frames at the previous start of the tx work. If more arrived before
+	 * this start, the work leaves every frame to its destructor, because
+	 * the poll of the interface that frees a frame then usually also
+	 * receives. The destructors
+	 * publish the completions, and tx_notify, a bottom-half work, notifies
+	 * the host of all of them, unless rx_notify is pending.
 	 * Tx_lock, which destructors take with interrupts disabled, protects
 	 * tx_live, tx_unnotified, the early budget and the skbs of the heads.
 	 * Tx_live is set while the rings may be completed into, and
-	 * tx_unnotified while a completion waits for tx_notify. A stop completes
-	 * every chain still in flight, so that a destructor that runs later, or
-	 * one of an earlier start, completes none. The rx handler publishes each
-	 * frame's buffers, and rx_notify, a bottom-half work that runs before
-	 * the next poll of the interface, notifies the host of all of them.
+	 * tx_unnotified while a completion waits for a notification. A stop
+	 * completes every chain still in flight, so that a destructor that runs
+	 * later, or one of an earlier start, completes none. The rx handler
+	 * publishes each frame's buffers, and rx_notify, a bottom-half work that
+	 * runs before the next poll of the interface, notifies the host of all
+	 * of them, and then of the completions that wait for a notification. The
+	 * host's receive poll frees its transmitted frames, which usually
+	 * suppresses the second notification.
 	 */
 	struct work_struct rx_work;
 	struct work_struct rx_notify;
@@ -204,6 +212,7 @@ struct vduse_guest_net {
 	unsigned int tx_early_bytes;
 	struct vduse_guest_net_tx_early *tx_early_free;
 	struct vduse_guest_net_tx_early tx_early[VDUSE_GUEST_NET_TX_LIMIT];
+	s64 tx_rx_frames;
 	spinlock_t data_lock;
 	bool data_running;
 	u64 features;
@@ -312,20 +321,31 @@ static bool vduse_guest_net_tx_gso_ok(const struct virtio_net_hdr_v1 *hdr,
 }
 
 /* Notify the host once of the chains that destructors completed. */
+static void vduse_guest_net_notify_tx_used(struct vduse_guest_net *net)
+{
+	unsigned long flags;
+	bool notify;
+
+	spin_lock_irqsave(&net->tx_lock, flags);
+	notify = net->tx_live && net->tx_unnotified;
+	if (notify)
+		net->tx_unnotified = false;
+	spin_unlock_irqrestore(&net->tx_lock, flags);
+	if (notify)
+		vduse_guest_notify_used(net->dev, VDUSE_GUEST_NET_TX);
+}
+
+/*
+ * Notify the host of the destructors' completions, unless a pending
+ * rx_notify will do it after notifying its own.
+ */
 static void vduse_guest_net_tx_notify(struct work_struct *work)
 {
 	struct vduse_guest_net *net =
 		container_of(work, struct vduse_guest_net, tx_notify);
-	unsigned long flags;
-	bool live;
 
-	spin_lock_irqsave(&net->tx_lock, flags);
-	live = net->tx_live;
-	if (live)
-		net->tx_unnotified = false;
-	spin_unlock_irqrestore(&net->tx_lock, flags);
-	if (live)
-		vduse_guest_notify_used(net->dev, VDUSE_GUEST_NET_TX);
+	if (!work_pending(&net->rx_notify))
+		vduse_guest_net_notify_tx_used(net);
 }
 
 /*
@@ -334,11 +354,12 @@ static void vduse_guest_net_tx_notify(struct work_struct *work)
  * high-order allocation. The interface segments and checksums what the
  * host offloads, or validate_xmit_skb() does it in software. Return whether
  * the frame's destructor completes the chain, which it does for a frame that
- * reaches the interface beyond the early budget.
+ * reaches the interface beyond the early budget, and for every frame of a
+ * pass of the tx work that follows received frames.
  */
 static bool vduse_guest_net_tx_one(struct vduse_guest_net *net,
 				   struct vringh_kiov *riov, u16 head,
-				   u64 features)
+				   u64 features, bool receiving)
 {
 	struct vduse_guest_net_tx_buf *buf = &net->tx_bufs[head];
 	struct vduse_guest_net_tx_early *e = NULL;
@@ -418,7 +439,7 @@ static bool vduse_guest_net_tx_one(struct vduse_guest_net *net,
 	if (skb_is_gso(skb))
 		atomic64_inc(&net->stats.tx_gso);
 	spin_lock_irqsave(&net->tx_lock, flags);
-	if (net->tx_early_free &&
+	if (!receiving && net->tx_early_free &&
 	    net->tx_early_bytes + frame_len <= VDUSE_GUEST_NET_TX_EARLY_BYTES) {
 		e = net->tx_early_free;
 		net->tx_early_free = e->next;
@@ -474,6 +495,8 @@ static void vduse_guest_net_tx_work(struct work_struct *work)
 	struct kvec rkvec[VDUSE_GUEST_NET_INLINE_IOVS];
 	struct kvec wkvec[VDUSE_GUEST_NET_INLINE_IOVS];
 	struct vringh_kiov riov, wiov;
+	bool receiving;
+	s64 rx_frames;
 	u64 features;
 	u16 head;
 	int r;
@@ -484,6 +507,10 @@ static void vduse_guest_net_tx_work(struct work_struct *work)
 	 */
 	if (!vduse_guest_net_data_running(net, &features))
 		return;
+
+	rx_frames = atomic64_read(&net->stats.rx_frames);
+	receiving = rx_frames != net->tx_rx_frames;
+	net->tx_rx_frames = rx_frames;
 
 	vringh_kiov_init(&riov, rkvec, ARRAY_SIZE(rkvec));
 	vringh_kiov_init(&wiov, wkvec, ARRAY_SIZE(wkvec));
@@ -514,7 +541,8 @@ static void vduse_guest_net_tx_work(struct work_struct *work)
 			continue;
 		}
 
-		if (!vduse_guest_net_tx_one(net, &riov, head, features))
+		if (!vduse_guest_net_tx_one(net, &riov, head, features,
+					    receiving))
 			vduse_guest_complete(net->dev, VDUSE_GUEST_NET_TX, head,
 					     0);
 	}
@@ -748,7 +776,8 @@ drop:
 
 /*
  * Notify the host once of the frames that the rx handler published during a
- * softirq, which usually holds a whole poll of the interface.
+ * softirq, which usually holds a whole poll of the interface, and then of
+ * the completions that wait for a notification.
  */
 static void vduse_guest_net_rx_notify(struct work_struct *work)
 {
@@ -758,6 +787,7 @@ static void vduse_guest_net_rx_notify(struct work_struct *work)
 
 	if (vduse_guest_net_data_running(net, &features))
 		vduse_guest_notify_used(net->dev, VDUSE_GUEST_NET_RX);
+	vduse_guest_net_notify_tx_used(net);
 }
 
 /*
@@ -822,7 +852,7 @@ static rx_handler_result_t vduse_guest_net_rx(struct sk_buff **pskb)
  * Complete the chains of the frames that the interface still holds, while
  * the rings are mapped, and stop destructors from completing any. The frames
  * hold their own copies of the data. Set *any if one was completed, or if a
- * destructor's completion still waits for tx_notify.
+ * destructor's completion still waits for a notification.
  */
 static void vduse_guest_net_complete_tx(struct vduse_guest_net *net, bool *any)
 {
