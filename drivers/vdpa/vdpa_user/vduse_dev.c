@@ -254,6 +254,11 @@ static struct cdev vduse_cdev;
 static struct workqueue_struct *vduse_irq_wq;
 static struct workqueue_struct *vduse_irq_bound_wq;
 
+static bool inline_irq = true;
+module_param(inline_irq, bool, 0644);
+MODULE_PARM_DESC(inline_irq,
+	"Run a virtqueue's callback in the injecting thread when the thread runs on one of the queue's affinity CPUs (default: true)");
+
 static u32 allowed_device_id[] = {
 	VIRTIO_ID_BLOCK,
 	VIRTIO_ID_NET,
@@ -2270,6 +2275,40 @@ static void vduse_vq_update_effective_cpu(struct vduse_virtqueue *vq)
 		vq->irq_effective_cpu = cpu;
 }
 
+/*
+ * Runs the queue's callback in the injecting thread if the thread is on one
+ * of the queue's affinity CPUs when it injects, and otherwise queues the
+ * injection work. The callback runs under irq_lock with bottom halves
+ * disabled, as in the work. The softirqs it raises, such as the driver's
+ * NAPI poll, run in the thread when it enables bottom halves after releasing
+ * rwsem.
+ */
+static int vduse_vq_deliver_irq(struct vduse_dev *dev,
+				struct vduse_virtqueue *vq)
+{
+	if (!inline_irq ||
+	    !cpumask_test_cpu(raw_smp_processor_id(), &vq->irq_affinity)) {
+		vduse_vq_update_effective_cpu(vq);
+		return vduse_dev_queue_irq_work(dev, &vq->inject,
+						vq->irq_effective_cpu);
+	}
+
+	down_read(&dev->rwsem);
+	if (!(dev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+		up_read(&dev->rwsem);
+		return -EINVAL;
+	}
+	local_bh_disable();
+	spin_lock(&vq->irq_lock);
+	if (vq->ready && vq->cb.callback)
+		vq->cb.callback(vq->cb.private);
+	spin_unlock(&vq->irq_lock);
+	up_read(&dev->rwsem);
+	local_bh_enable();
+
+	return 0;
+}
+
 static int vduse_dev_iotlb_entry(struct vduse_dev *dev,
 				 struct vduse_iotlb_entry_v2 *entry,
 				 struct file **f, uint64_t *capability)
@@ -2497,12 +2536,8 @@ static long vduse_dev_ioctl(struct file *file, unsigned int cmd,
 
 		ret = 0;
 		index = array_index_nospec(index, dev->vq_num);
-		if (!vduse_vq_signal_irqfd(dev->vqs[index])) {
-			vduse_vq_update_effective_cpu(dev->vqs[index]);
-			ret = vduse_dev_queue_irq_work(dev,
-						&dev->vqs[index]->inject,
-						dev->vqs[index]->irq_effective_cpu);
-		}
+		if (!vduse_vq_signal_irqfd(dev->vqs[index]))
+			ret = vduse_vq_deliver_irq(dev, dev->vqs[index]);
 		break;
 	}
 	case VDUSE_IOTLB_REG_UMEM: {
