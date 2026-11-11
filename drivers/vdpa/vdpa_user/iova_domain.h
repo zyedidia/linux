@@ -36,6 +36,13 @@ struct vduse_iova_domain {
 	unsigned long iova_limit;
 	int bounce_map;
 	struct vhost_iotlb *iotlb;
+	/*
+	 * The DMA mapping operations can run in softirqs, such as a NAPI
+	 * refill, so the other users of iotlb_lock and the writers of
+	 * bounce_lock disable bottom halves. The first mapping after a reset
+	 * disables interrupts while it holds iotlb_lock, since it can also run
+	 * with interrupts disabled.
+	 */
 	spinlock_t iotlb_lock;
 	struct file *file;
 	bool user_bounce_pages;

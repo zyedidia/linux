@@ -617,12 +617,12 @@ static void vduse_dev_reset(struct vduse_dev *dev)
 		vq->num = 0;
 		memset(&vq->state, 0, sizeof(vq->state));
 
-		spin_lock(&vq->kick_lock);
+		spin_lock_irq(&vq->kick_lock);
 		vq->kicked = false;
 		if (vq->kickfd)
 			eventfd_ctx_put(vq->kickfd);
 		vq->kickfd = NULL;
-		spin_unlock(&vq->kick_lock);
+		spin_unlock_irq(&vq->kick_lock);
 
 		spin_lock(&vq->irq_lock);
 		vq->cb.callback = NULL;
@@ -650,9 +650,15 @@ static int vduse_vdpa_set_vq_address(struct vdpa_device *vdpa, u16 idx,
 	return 0;
 }
 
+/*
+ * Drivers kick from process context, from softirqs, and with interrupts
+ * disabled, so kick_lock is taken with interrupts disabled.
+ */
 static void vduse_vq_kick(struct vduse_virtqueue *vq)
 {
-	spin_lock(&vq->kick_lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&vq->kick_lock, flags);
 	if (!vq->ready)
 		goto unlock;
 
@@ -661,7 +667,7 @@ static void vduse_vq_kick(struct vduse_virtqueue *vq)
 	else
 		vq->kicked = true;
 unlock:
-	spin_unlock(&vq->kick_lock);
+	spin_unlock_irqrestore(&vq->kick_lock, flags);
 }
 
 static void vduse_vq_kick_work(struct work_struct *work)
@@ -781,9 +787,9 @@ DEFINE_GUARD(vq_group_as_read_lock, struct vduse_vq_group *,
 
 DEFINE_GUARD(vq_group_as_write_lock, struct vduse_vq_group *,
 	if (_T->dev->nas > 1)
-		write_lock(&_T->as_lock),
+		write_lock_bh(&_T->as_lock),
 	if (_T->dev->nas > 1)
-		write_unlock(&_T->as_lock))
+		write_unlock_bh(&_T->as_lock))
 
 static int vduse_set_group_asid(struct vdpa_device *vdpa, unsigned int group,
 				unsigned int asid)
@@ -2068,7 +2074,7 @@ static int vduse_kickfd_setup(struct vduse_dev *dev,
 	} else if (eventfd->fd != VDUSE_EVENTFD_DEASSIGN)
 		return 0;
 
-	spin_lock(&vq->kick_lock);
+	spin_lock_irq(&vq->kick_lock);
 	if (vq->kickfd)
 		eventfd_ctx_put(vq->kickfd);
 	vq->kickfd = ctx;
@@ -2076,7 +2082,7 @@ static int vduse_kickfd_setup(struct vduse_dev *dev,
 		eventfd_signal(vq->kickfd);
 		vq->kicked = false;
 	}
-	spin_unlock(&vq->kick_lock);
+	spin_unlock_irq(&vq->kick_lock);
 
 	return 0;
 }
@@ -2281,7 +2287,7 @@ static int vduse_dev_iotlb_entry(struct vduse_dev *dev,
 	if (!dev->as[asid].domain)
 		goto out;
 
-	spin_lock(&dev->as[asid].domain->iotlb_lock);
+	spin_lock_bh(&dev->as[asid].domain->iotlb_lock);
 	map = vhost_iotlb_itree_first(dev->as[asid].domain->iotlb,
 				      entry->start, entry->last);
 	if (map) {
@@ -2305,7 +2311,7 @@ static int vduse_dev_iotlb_entry(struct vduse_dev *dev,
 
 		r = 0;
 	}
-	spin_unlock(&dev->as[asid].domain->iotlb_lock);
+	spin_unlock_bh(&dev->as[asid].domain->iotlb_lock);
 
 out:
 	mutex_unlock(&dev->domain_lock);
