@@ -302,6 +302,13 @@ void segv_handler(int sig, struct siginfo *si, struct uml_pt_regs *regs,
 		panic("Shadow stack violation at 0x%lx", UPT_IP(regs));
 	}
 
+	/* D0 reached memory of the protection key that only gates hold. */
+	if (!UPT_IS_USER(regs) && si->si_code == SEGV_PKUERR) {
+		show_regs(container_of(regs, struct pt_regs, regs));
+		panic("Protection key violation at 0x%lx, ip 0x%lx",
+		      FAULT_ADDRESS(*fi), UPT_IP(regs));
+	}
+
 	if (UPT_IS_USER(regs) && !SEGV_IS_FIXABLE(fi)) {
 		show_segv_info(regs);
 		bad_segv(*fi, UPT_IP(regs));

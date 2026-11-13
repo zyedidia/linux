@@ -16,6 +16,7 @@
 #include <as-layout.h>
 #include <init.h>
 #include <kern_util.h>
+#include <mpk.h>
 #include <os.h>
 #include <um_malloc.h>
 #include "internal.h"
@@ -75,15 +76,24 @@ static int shutdown_fd = -1;
  * fatal handler is installed again first, so that a second signal exits at
  * once if the shutdown hangs.
  */
-static void shutdown_signal(int sig)
+static void shutdown_signal(int sig, siginfo_t *si, void *uc)
 {
+	unsigned long ssp = IS_ENABLED(CONFIG_UML_MPK) ? uml_mpk_rdssp() : 0;
+	int save_errno = errno;
 	uint64_t v = 1;
+
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_signal_enter(sig, uc, ssp);
 
 	install_fatal_handler(SIGINT);
 	install_fatal_handler(SIGTERM);
 
 	if (write(shutdown_fd, &v, sizeof(v)) != sizeof(v))
 		last_ditch_exit(sig);
+
+	errno = save_errno;
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_signal_exit(uc);
 }
 
 /*
@@ -96,10 +106,18 @@ void os_set_shutdown_fd(int fd)
 
 	shutdown_fd = fd;
 
+	/*
+	 * Under protection keys, the handler blocks the signals that could
+	 * otherwise write their frames over its own, as the IPI handler does.
+	 */
 	sigemptyset(&action.sa_mask);
-	action.sa_flags = SA_ONSTACK | SA_RESTART;
+	if (IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled) {
+		sigfillset(&action.sa_mask);
+		sigdelset(&action.sa_mask, SIGILL);
+	}
+	action.sa_flags = SA_ONSTACK | SA_RESTART | SA_SIGINFO;
 	action.sa_restorer = NULL;
-	action.sa_handler = shutdown_signal;
+	action.sa_sigaction = shutdown_signal;
 	if (sigaction(SIGINT, &action, NULL) < 0 ||
 	    sigaction(SIGTERM, &action, NULL) < 0)
 		os_warn("failed to install the shutdown handler - errno = %d\n",

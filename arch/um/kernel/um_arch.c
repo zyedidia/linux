@@ -32,6 +32,7 @@
 #include <kern.h>
 #include <kern_util.h>
 #include <mem_user.h>
+#include <mpk.h>
 #include <os.h>
 
 #include "um_arch.h"
@@ -403,6 +404,10 @@ int __init linux_main(int argc, char **argv, char **envp)
 	arch_task_struct_size = sizeof(struct task_struct) + host_fp_size;
 
 	os_flush_stdout();
+
+	/* Keys can only be allocated before the sandbox. */
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_init();
 
 	os_enter_sandbox();
 

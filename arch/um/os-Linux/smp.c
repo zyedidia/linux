@@ -12,6 +12,7 @@
 #include <init.h>
 #include <os.h>
 #include <smp.h>
+#include <mpk.h>
 #include "internal.h"
 
 struct cpu_thread_data {
@@ -33,6 +34,8 @@ static void *cpu_thread(void *arg)
 	struct cpu_thread_data *data = arg;
 
 	__curr_cpu = data->cpu;
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_cpu_init(data->cpu);
 	os_set_cpu_tid(data->cpu, gettid());
 	os_pin_cpu_thread(data->cpu);
 
@@ -97,11 +100,16 @@ int os_send_ipi(int cpu, int vector)
 
 static void ipi_sig_handler(int sig, siginfo_t *si, void *uc)
 {
+	unsigned long ssp = IS_ENABLED(CONFIG_UML_MPK) ? uml_mpk_rdssp() : 0;
 	int save_errno = errno;
 
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_signal_enter(sig, uc, ssp);
 	handle_ipi_signal(si->si_value.sival_int);
 
 	errno = save_errno;
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_signal_exit(uc);
 }
 
 void __init os_init_smp(void)

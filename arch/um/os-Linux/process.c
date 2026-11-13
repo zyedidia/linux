@@ -19,6 +19,7 @@
 #include <asm/unistd.h>
 #include <init.h>
 #include <longjmp.h>
+#include <mpk.h>
 #include <os.h>
 #include <skas/skas.h>
 
@@ -93,6 +94,8 @@ int os_map_memory(void *virt, int fd, unsigned long long off, unsigned long len,
 	prot = (r ? PROT_READ : 0) | (w ? PROT_WRITE : 0) |
 		(x ? PROT_EXEC : 0);
 
+	if (uml_mpk_protected((unsigned long)virt, len))
+		return -EPERM;
 	loc = mmap64((void *) virt, len, prot, MAP_SHARED | MAP_FIXED,
 		     fd, off);
 	if (loc == MAP_FAILED)
@@ -105,6 +108,8 @@ int os_protect_memory(void *addr, unsigned long len, int r, int w, int x)
 	int prot = ((r ? PROT_READ : 0) | (w ? PROT_WRITE : 0) |
 		    (x ? PROT_EXEC : 0));
 
+	if (uml_mpk_overlaps((unsigned long)addr, len))
+		return -EPERM;
 	if (mprotect(addr, len, prot) < 0)
 		return -errno;
 
@@ -115,6 +120,8 @@ int os_unmap_memory(void *addr, int len)
 {
 	int err;
 
+	if (uml_mpk_protected((unsigned long)addr, len))
+		return -EPERM;
 	err = munmap(addr, len);
 	if (err < 0)
 		return -errno;
@@ -129,6 +136,8 @@ int os_drop_memory(void *addr, int length)
 {
 	int err;
 
+	if (uml_mpk_protected((unsigned long)addr, length))
+		return -EPERM;
 	err = madvise(addr, length, MADV_REMOVE);
 	if (err < 0)
 		err = -errno;

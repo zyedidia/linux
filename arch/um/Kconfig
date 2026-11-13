@@ -273,6 +273,36 @@ config UML_SHADOW_STACK
 
 	  If unsure, say N.
 
+config UML_MPK
+	bool "Protect UML's VirtIO transport with memory protection keys"
+	depends on 64BIT && STRICT_KERNEL_RWX && !KASAN && !KCOV
+	help
+	  Use the host's x86 memory protection keys to keep the state that
+	  UML's VDUSE transport shares with the host out of reach of the
+	  rest of UML, such as the device drivers. That state lives in a
+	  window of the address space whose key ordinary code cannot
+	  access, and only gates that switch the key on can reach it. A
+	  memory corruption bug in a driver then cannot forge what the
+	  host's VirtIO drivers read without also taking over control flow.
+	  This needs a CPU with protection keys and FSGSBASE and a host
+	  kernel built with CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS. Without
+	  them, UML prints a warning and runs without the protection.
+
+	  The window's mappings are only protected from the rest of UML's
+	  own mapping calls under the sandbox option.
+
+	  If unsure, say N.
+
+config UML_MPK_TEST
+	bool "Test the memory protection keys at boot"
+	depends on UML_MPK
+	help
+	  Add the uml_mpk.test=<name> option, which runs one of the tests
+	  of the protection at the end of boot. Several of the tests stop
+	  UML with a panic when they pass.
+
+	  If unsure, say N.
+
 config PGTABLE_LEVELS
 	int
 	default 4 if 64BIT

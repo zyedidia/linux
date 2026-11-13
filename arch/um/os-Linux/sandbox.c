@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -31,6 +32,7 @@
 #include <linux/vfio.h>
 #endif
 #include <init.h>
+#include <mpk.h>
 #include <os.h>
 #include <skas.h>
 
@@ -172,7 +174,7 @@ static const unsigned int allowed_prctls[] = {
 			  CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | \
 			  CLONE_NEWNET)
 
-static struct sock_filter filter[256];
+static struct sock_filter filter[512];
 static unsigned short filter_len;
 
 static void __init emit(unsigned short code, unsigned int k, unsigned int jt,
@@ -234,6 +236,174 @@ static void __init allow_arg_pair(unsigned int nr, unsigned int a0,
 	ret(SECCOMP_RET_TRAP);
 }
 
+#if IS_ENABLED(CONFIG_UML_MPK)
+
+#define ARG_LO(i)	offsetof(struct seccomp_data, args[i])
+#define ARG_HI(i)	(offsetof(struct seccomp_data, args[i]) + 4)
+#define IP_LO		offsetof(struct seccomp_data, instruction_pointer)
+#define IP_HI		(IP_LO + 4)
+
+/* Emit a jump whose targets the caller sets once it has emitted them. */
+static unsigned short __init jump(unsigned short code, unsigned int k)
+{
+	emit(BPF_JMP | code, k, 0, 0);
+	return filter_len - 1;
+}
+
+/* Return the offset from a jump to the next instruction. */
+static unsigned int __init offset_to_next(unsigned short insn)
+{
+	unsigned int off = filter_len - insn - 1;
+
+	if (off > 255) {
+		os_warn("The sandbox filter is too large\n");
+		exit(1);
+	}
+	return off;
+}
+
+/* Point the true or the false branch of a jump at the next instruction. */
+static void __init land_jt(unsigned short insn)
+{
+	filter[insn].jt = offset_to_next(insn);
+}
+
+static void __init land_jf(unsigned short insn)
+{
+	filter[insn].jf = offset_to_next(insn);
+}
+
+static void __init stmt(unsigned short code, unsigned int k)
+{
+	emit(code, k, 0, 0);
+}
+
+/*
+ * Allow the system call if it comes from the gates' system call stub. The
+ * accumulator is clobbered.
+ */
+static void __init allow_from_gate(void)
+{
+	unsigned long ip = (unsigned long)uml_mpk_syscall_ip;
+
+	load(IP_LO);
+	emit(BPF_JMP | BPF_JEQ | BPF_K, (unsigned int)ip, 0, 3);
+	load(IP_HI);
+	emit(BPF_JMP | BPF_JEQ | BPF_K, ip >> 32, 0, 1);
+	ret(SECCOMP_RET_ALLOW);
+}
+
+/*
+ * Trap system call nr if the range in its first two arguments overlaps the
+ * window, unless it comes from the gates' stub. For mmap, only a MAP_FIXED
+ * mapping is checked, since the window has no hole for another one to land
+ * in. The window is aligned to its size, so its high word is the same at
+ * every address in it, and the end of the range is computed with a carry
+ * from the low words. The accumulator holds nr before and after.
+ */
+static void __init trap_window(unsigned int nr, int is_mmap)
+{
+	unsigned int w = uml_mpk_window >> UML_MPK_WINDOW_SHIFT;
+	unsigned short skip, fixed = 0, above, nocarry, carried, gt, eq, lo;
+
+	skip = jump(BPF_JEQ | BPF_K, nr);
+	allow_from_gate();
+	if (is_mmap) {
+		load(ARG_LO(3));
+		fixed = jump(BPF_JSET | BPF_K, MAP_FIXED);
+	}
+
+	load(ARG_HI(0));
+	above = jump(BPF_JGT | BPF_K, w);
+	load(ARG_LO(0));
+	stmt(BPF_ST, 0);
+	load(ARG_LO(1));
+	stmt(BPF_LDX | BPF_MEM, 0);
+	stmt(BPF_ALU | BPF_ADD | BPF_X, 0);
+	stmt(BPF_ST, 1);
+	nocarry = jump(BPF_JGE | BPF_X, 0);
+	stmt(BPF_LD | BPF_IMM, 1);
+	carried = filter_len;
+	emit(BPF_JMP | BPF_JA, 0, 0, 0);
+	land_jt(nocarry);
+	stmt(BPF_LD | BPF_IMM, 0);
+	filter[carried].k = filter_len - carried - 1;
+	stmt(BPF_ST, 2);
+	load(ARG_HI(1));
+	stmt(BPF_LDX | BPF_MEM, 2);
+	stmt(BPF_ALU | BPF_ADD | BPF_X, 0);
+	stmt(BPF_ST, 3);
+	load(ARG_HI(0));
+	stmt(BPF_LDX | BPF_MEM, 3);
+	stmt(BPF_ALU | BPF_ADD | BPF_X, 0);
+	gt = jump(BPF_JGT | BPF_K, w);
+	eq = jump(BPF_JEQ | BPF_K, w);
+	stmt(BPF_LD | BPF_MEM, 1);
+	lo = jump(BPF_JEQ | BPF_K, 0);
+
+	land_jt(gt);
+	land_jf(lo);
+	ret(SECCOMP_RET_TRAP);
+
+	land_jt(above);
+	land_jf(eq);
+	land_jt(lo);
+	if (is_mmap)
+		land_jf(fixed);
+	load(offsetof(struct seccomp_data, nr));
+	land_jf(skip);
+}
+
+/*
+ * The gates alone may change the window's mappings, and pkey_mprotect,
+ * mremap and VFIO DMA maps are allowed only for them, pkey_mprotect only with
+ * the window's key. Other code may still map, unmap and protect memory
+ * outside the window.
+ */
+static void __init build_mpk_rules(void)
+{
+	unsigned short skip, key;
+
+	/*
+	 * An rseq area would let the host move a thread to an abort handler
+	 * that D0's memory names, so threads cannot register one.
+	 */
+	ret_if(__NR_rseq, SECCOMP_RET_ERRNO | ENOSYS);
+
+	skip = jump(BPF_JEQ | BPF_K, __NR_pkey_mprotect);
+	load(ARG_LO(3));
+	key = jump(BPF_JEQ | BPF_K, UML_MPK_KEY);
+	ret(SECCOMP_RET_TRAP);
+	land_jt(key);
+	allow_from_gate();
+	ret(SECCOMP_RET_TRAP);
+	land_jf(skip);
+
+	skip = jump(BPF_JEQ | BPF_K, __NR_mremap);
+	allow_from_gate();
+	ret(SECCOMP_RET_TRAP);
+	land_jf(skip);
+
+#if IS_ENABLED(CONFIG_UML_PCI_OVER_VFIO)
+	/* VFIO pins pages for DMA without checking their key. */
+	skip = jump(BPF_JEQ | BPF_K, __NR_ioctl);
+	load(ARG_LO(1));
+	key = jump(BPF_JEQ | BPF_K, VFIO_IOMMU_MAP_DMA);
+	allow_from_gate();
+	ret(SECCOMP_RET_TRAP);
+	land_jf(key);
+	load(offsetof(struct seccomp_data, nr));
+	land_jf(skip);
+#endif
+
+	trap_window(__NR_munmap, 0);
+	trap_window(__NR_mprotect, 0);
+	trap_window(__NR_madvise, 0);
+	trap_window(__NR_mmap, 1);
+}
+
+#endif
+
 static void __init build_filter(void)
 {
 	unsigned int i;
@@ -242,6 +412,11 @@ static void __init build_filter(void)
 	emit(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0);
 	ret(SECCOMP_RET_TRAP);
 	load(offsetof(struct seccomp_data, nr));
+
+#if IS_ENABLED(CONFIG_UML_MPK)
+	if (uml_mpk_enabled)
+		build_mpk_rules();
+#endif
 
 	for (i = 0; i < ARRAY_SIZE(allowed_syscalls); i++)
 		ret_if(allowed_syscalls[i], SECCOMP_RET_ALLOW);

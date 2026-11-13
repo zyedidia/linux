@@ -33,6 +33,9 @@ SECTIONS
   .text      :
   {
     _stext = .;
+    __uml_mpk_text_start = .;
+    *(.text.uml_mpk)
+    __uml_mpk_text_end = .;
     TEXT_TEXT
     SCHED_TEXT
     LOCK_TEXT

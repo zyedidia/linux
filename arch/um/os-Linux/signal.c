@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <smp.h>
 #include <timetravel.h>
+#include <mpk.h>
 #include "internal.h"
 
 void (*sig_info[NSIG])(int, struct siginfo *, struct uml_pt_regs *, void *mc) = {
@@ -37,6 +38,9 @@ void (*sig_info[NSIG])(int, struct siginfo *, struct uml_pt_regs *, void *mc) = 
 	[SIGIO]		= sigio_handler,
 	[SIGCHLD]	= sigchld_handler,
 };
+
+/* This is set while a handler serves a signal that interrupted D1. */
+static __thread int fault_in_gate;
 
 static void sig_handler_common(int sig, struct siginfo *si, mcontext_t *mc)
 {
@@ -71,8 +75,14 @@ static void sig_handler_common(int sig, struct siginfo *si, mcontext_t *mc)
 	if (IS_ENABLED(CONFIG_CFI) && sig == SIGILL && uml_cfi_trap(&r, mc))
 		return;
 
-	/* enable signals if sig isn't IRQ signal */
-	if ((sig != SIGIO) && (sig != SIGWINCH) && (sig != SIGCHLD))
+	/*
+	 * Enable signals if sig isn't IRQ signal. A gate runs with signals
+	 * off and may hold a lock that an interrupt handler takes, so a fault
+	 * in one, such as on vmalloc memory that is not mapped yet, is served
+	 * with signals still off.
+	 */
+	if ((sig != SIGIO) && (sig != SIGWINCH) && (sig != SIGCHLD) &&
+	    !fault_in_gate)
 		unblock_signals_trace();
 
 	(*sig_info[sig])(sig, si, &r, mc);
@@ -294,15 +304,31 @@ static void (*handlers[_NSIG])(int sig, struct siginfo *si, mcontext_t *mc) = {
 	[SIGUSR1] = sigusr1_handler,
 };
 
+#ifdef CONFIG_UML_MPK_TEST
+extern void (*uml_mpk_test_hook)(ucontext_t *uc);
+#endif
+
 static void hard_handler(int sig, siginfo_t *si, void *p)
 {
+	unsigned long ssp = IS_ENABLED(CONFIG_UML_MPK) ? uml_mpk_rdssp() : 0;
 	ucontext_t *uc = p;
 	mcontext_t *mc = &uc->uc_mcontext;
-	int save_errno = errno;
+	int save_errno = errno, in_gate = fault_in_gate;
+
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		fault_in_gate = uml_mpk_signal_enter(sig, uc, ssp);
 
 	(*handlers[sig])(sig, (struct siginfo *)si, mc);
 
+	fault_in_gate = in_gate;
+
+#ifdef CONFIG_UML_MPK_TEST
+	if (uml_mpk_test_hook)
+		uml_mpk_test_hook(uc);
+#endif
 	errno = save_errno;
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_signal_exit(uc);
 }
 
 void set_handler(int sig)
@@ -330,6 +356,18 @@ void set_handler(int sig)
 
 	if (sigismember(&action.sa_mask, sig))
 		flags |= SA_RESTART; /* if it's an irq signal */
+
+	/*
+	 * A signal that arrives while a handler runs a protection key gate
+	 * would write its frame over the handler's, since the gate's stack is
+	 * not the signal stack.
+	 */
+	if (IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled) {
+		sigaddset(&action.sa_mask, IPI_SIGNAL);
+		sigaddset(&action.sa_mask, SIGUSR1);
+		sigaddset(&action.sa_mask, SIGINT);
+		sigaddset(&action.sa_mask, SIGTERM);
+	}
 
 	action.sa_flags = flags;
 	action.sa_restorer = NULL;

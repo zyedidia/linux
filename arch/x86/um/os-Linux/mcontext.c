@@ -14,6 +14,7 @@
 #include <sysdep/ptrace.h>
 #include <sysdep/mcontext.h>
 #include <arch.h>
+#include <mpk.h>
 
 void get_regs_from_mc(struct uml_pt_regs *regs, mcontext_t *mc)
 {
@@ -55,6 +56,8 @@ void mc_set_rip(void *_mc, void *target)
 	mc->gregs[REG_EIP] = (unsigned long)target;
 #else
 	mc->gregs[REG_RIP] = (unsigned long)target;
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		uml_mpk_set_ip(mc, (unsigned long)target);
 #endif
 }
 

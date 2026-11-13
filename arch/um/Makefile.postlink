@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0
+# ===========================================================================
+# Post-link UML pass
+# ===========================================================================
+#
+# Check that only the protection key gates can load the PKRU.
+
+PHONY := __archpost
+__archpost:
+
+-include include/config/auto.conf
+include $(srctree)/scripts/Kbuild.include
+
+quiet_cmd_mpk_gadgets = CHKMPK  $@
+      cmd_mpk_gadgets = $(CONFIG_SHELL) $(srctree)/arch/um/scripts/mpk-gadgets.sh \
+			"$(OBJDUMP)" "$(OBJCOPY)" "$(NM)" "$@"
+
+vmlinux vmlinux.unstripped: FORCE
+	@true
+ifdef CONFIG_UML_MPK
+	$(call cmd,mpk_gadgets)
+endif
+
+clean:
+	@true
+
+PHONY += FORCE clean
+
+FORCE:
+
+.PHONY: $(PHONY)

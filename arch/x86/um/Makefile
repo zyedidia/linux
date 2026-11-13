@@ -28,6 +28,7 @@ else
 
 obj-y += mem_64.o syscalls_64.o vdso/
 obj-$(CONFIG_CFI) += cfi.o
+obj-$(CONFIG_UML_MPK) += mpk_64.o
 
 subarch-y = ../lib/csum-partial_64.o ../lib/memcpy_64.o \
 	../lib/memmove_64.o ../lib/memset_64.o

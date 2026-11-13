@@ -22,6 +22,7 @@
 #include <init.h>
 #include <kern_util.h>
 #include <mem.h>
+#include <mpk.h>
 #include <os.h>
 #include <ptrace_user.h>
 #include <registers.h>
@@ -814,6 +815,11 @@ void new_thread(void *stack, jmp_buf *buf, void (*handler)(void),
 void switch_threads(jmp_buf *me, jmp_buf *you)
 {
 	unscheduled_userspace_iterations = 0;
+
+	/* Gates never sleep, so a thread is never switched out in D1. */
+	if (IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled &&
+	    uml_mpk_rdpkru() != UML_MPK_PKRU_D0)
+		panic("Switching threads with PKRU 0x%x", uml_mpk_rdpkru());
 
 	if (UML_SETJMP(me) == 0)
 		UML_LONGJMP(you, 1);

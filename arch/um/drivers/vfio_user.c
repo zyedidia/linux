@@ -13,10 +13,12 @@
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <linux/limits.h>
 #include <linux/vfio.h>
 #include <linux/pci_regs.h>
 #include <as-layout.h>
+#include <mpk.h>
 #include <um_malloc.h>
 
 #include "vfio_user.h"
@@ -160,6 +162,39 @@ out:
 	return n;
 }
 
+#if IS_ENABLED(CONFIG_UML_MPK)
+/*
+ * VFIO pins the pages without checking their protection key, and a device
+ * write to the kernel image would replace its pages with copies. The request
+ * is on the gate's stack, so that no other CPU can change it between the
+ * check and the ioctl, which the sandbox allows only from the gates' stub.
+ */
+static long __uml_mpk_entry vfio_dma_map_gate(long container,
+					      unsigned long vaddr,
+					      uint64_t iova, uint64_t size,
+					      unsigned long flags)
+{
+	struct vfio_iommu_type1_dma_map map = {
+		.argsz = sizeof(map),
+		.flags = flags,
+		.vaddr = vaddr,
+		.iova = iova,
+		.size = size,
+	};
+	long r;
+
+	if (uml_mpk_overlaps(vaddr, size) ||
+	    ((flags & VFIO_DMA_MAP_FLAG_WRITE) &&
+	     uml_mpk_protected(vaddr, size)))
+		return -EPERM;
+	do {
+		r = uml_mpk_syscall(__NR_ioctl, container, VFIO_IOMMU_MAP_DMA,
+				    (unsigned long)&map, 0, 0, 0);
+	} while (r == -EINTR);
+	return r < 0 ? r : 0;
+}
+#endif
+
 int uml_vfio_user_dma_map(int container, unsigned long vaddr, uint64_t iova,
 			  uint64_t size, int read, int write)
 {
@@ -175,6 +210,11 @@ int uml_vfio_user_dma_map(int container, unsigned long vaddr, uint64_t iova,
 		map.flags |= VFIO_DMA_MAP_FLAG_READ;
 	if (write)
 		map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
+#if IS_ENABLED(CONFIG_UML_MPK)
+	if (uml_mpk_enabled)
+		return uml_mpk_call(vfio_dma_map_gate, container, vaddr, iova,
+				    size, map.flags, 0);
+#endif
 
 	do {
 		r = ioctl(container, VFIO_IOMMU_MAP_DMA, &map);
