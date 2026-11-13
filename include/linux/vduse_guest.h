@@ -109,7 +109,8 @@ bool vduse_guest_poll(struct vduse_guest_dev *dev, unsigned int index);
 
 /*
  * Copy len bytes at a device address into buf, from the bounce region or the
- * host's coherent allocations. An address outside them fails with -EFAULT.
+ * host's coherent allocations, other than the rings where they are
+ * protected. An address outside them fails with -EFAULT.
  */
 int vduse_guest_read(struct vduse_guest_dev *dev, u64 addr, void *buf,
 		     size_t len);
@@ -164,13 +165,19 @@ struct vduse_guest_vq_info {
 	bool ready;
 };
 
-/* An inclusive range of IOVAs that the guest reaches through a pointer. */
+/*
+ * An inclusive range of IOVAs that the guest reaches through a pointer. The
+ * caller of map sets protect for a region that holds rings, which a host that
+ * can protect it maps where the rest of the guest cannot reach it. Such a
+ * host leaves protect set on the mapped region.
+ */
 struct vduse_guest_region {
 	u64 start;
 	u64 last;
 	void *addr;
 	bool readable;
 	bool writable;
+	bool protect;
 };
 
 /*
@@ -219,8 +226,9 @@ struct vduse_guest_region {
  *
  * Map_log maps the in-flight log, which outlives the guest. If its size
  * differs from the given one, it is resized when resize is set and is
- * otherwise an error, -EINVAL. Drop_log discards the log once the device
- * is destroyed.
+ * otherwise an error, -EINVAL. Unmap_log releases it, and is given no address
+ * for a log that the transport unmapped itself. Drop_log discards the log
+ * once the device is destroyed.
  */
 struct vduse_guest_host_ops {
 	int (*alloc)(struct vduse_guest_dev *dev, struct vduse_guest_host *host);

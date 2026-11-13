@@ -34,13 +34,17 @@ struct uml_vduse_user_vq_info {
 	int ready;
 };
 
-/* An inclusive range of IOVAs mapped into the UML process. */
+/*
+ * An inclusive range of IOVAs mapped into the UML process. A protected one
+ * is in the protection key window.
+ */
 struct uml_vduse_user_region {
 	uint64_t start;
 	uint64_t last;
 	void *addr;
 	int readable;
 	int writable;
+	int protect;
 };
 
 int uml_vduse_user_open_control(void);
@@ -76,7 +80,7 @@ int uml_vduse_user_vq_inject_irq(int fd, uint32_t index);
 int uml_vduse_user_create_kickfd(void);
 int uml_vduse_user_kick_pending(int kickfd);
 
-int uml_vduse_user_map(int fd, uint64_t iova,
+int uml_vduse_user_map(int fd, uint64_t iova, int protect,
 		       struct uml_vduse_user_region *region);
 void uml_vduse_user_unmap(struct uml_vduse_user_region *region);
 

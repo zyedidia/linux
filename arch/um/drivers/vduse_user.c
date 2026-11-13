@@ -11,8 +11,10 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 /* The tree's header, since the host's may lack newer VDUSE ioctls. */
 #include "../../../include/uapi/linux/vduse.h"
+#include <mpk.h>
 #include <um_malloc.h>
 
 #include "vduse_user.h"
@@ -438,8 +440,11 @@ int uml_vduse_user_create_kickfd(void)
 	return fd;
 }
 
-/* Map the whole IOTLB entry that holds an IOVA. */
-int uml_vduse_user_map(int fd, uint64_t iova,
+/*
+ * Map the whole IOTLB entry that holds an IOVA, into the protection key
+ * window if protect is set and UML runs with protection keys.
+ */
+int uml_vduse_user_map(int fd, uint64_t iova, int protect,
 		       struct uml_vduse_user_region *region)
 {
 	struct vduse_iotlb_entry entry;
@@ -461,10 +466,18 @@ int uml_vduse_user_map(int fd, uint64_t iova,
 		prot |= PROT_WRITE;
 
 	size = entry.last - entry.start + 1;
-	addr = mmap(NULL, size, prot, MAP_SHARED, mfd, entry.offset);
-	if (addr == MAP_FAILED) {
-		err = -errno;
-		goto out;
+	protect = protect && IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled;
+	if (protect) {
+		err = uml_mpk_map(mfd, entry.offset, size, prot & PROT_READ,
+				  prot & PROT_WRITE, &addr);
+		if (err)
+			goto out;
+	} else {
+		addr = mmap(NULL, size, prot, MAP_SHARED, mfd, entry.offset);
+		if (addr == MAP_FAILED) {
+			err = -errno;
+			goto out;
+		}
 	}
 
 	region->start = entry.start;
@@ -472,14 +485,19 @@ int uml_vduse_user_map(int fd, uint64_t iova,
 	region->addr = addr;
 	region->readable = !!(entry.perm & VDUSE_ACCESS_RO);
 	region->writable = !!(entry.perm & VDUSE_ACCESS_WO);
+	region->protect = protect;
 out:
-	close(mfd);
+	/* Close is a cancellation point in glibc, whose state is in TLS. */
+	syscall(__NR_close, mfd);
 	return err;
 }
 
 void uml_vduse_user_unmap(struct uml_vduse_user_region *region)
 {
-	munmap(region->addr, region->last - region->start + 1);
+	if (IS_ENABLED(CONFIG_UML_MPK) && region->protect)
+		uml_mpk_unmap(region->addr, region->last - region->start + 1);
+	else
+		munmap(region->addr, region->last - region->start + 1);
 }
 
 int uml_vduse_user_node_id(int fd, uint64_t *dev, uint64_t *ino)
@@ -638,6 +656,8 @@ int uml_vduse_user_map_window(void *addr, size_t size, int fd,
 {
 	void *p;
 
+	if (uml_mpk_protected((unsigned long)addr, size))
+		return -EPERM;
 	p = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
 		 fd, offset);
 	return p == MAP_FAILED ? -errno : 0;
@@ -645,13 +665,16 @@ int uml_vduse_user_map_window(void *addr, size_t size, int fd,
 
 void uml_vduse_user_unmap_window(void *addr, size_t size)
 {
-	munmap(addr, size);
+	if (!uml_mpk_protected((unsigned long)addr, size))
+		munmap(addr, size);
 }
 
 int uml_vduse_user_reg_umem(int fd, void *addr, uint64_t size)
 {
 	struct vduse_iova_umem umem;
 
+	if (uml_mpk_overlaps((unsigned long)addr, size))
+		return -EPERM;
 	memset(&umem, 0, sizeof(umem));
 	umem.uaddr = (unsigned long)addr;
 	umem.iova = 0;

@@ -62,6 +62,27 @@ static struct uml_vduse *uml_vduse_of(struct vduse_guest_dev *dev)
 	return vduse_guest_host_data(dev);
 }
 
+/*
+ * The fd of each device that is open, which is fixed after boot, so that the
+ * rest of the guest cannot have the transport's protected functions call
+ * into another device by changing the fd in the device's host data.
+ */
+static struct {
+	struct vduse_guest_dev *dev;
+	int fd;
+} uml_vduse_fds[8] __ro_after_init;
+
+static int uml_vduse_fd(struct vduse_guest_dev *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(uml_vduse_fds); i++) {
+		if (uml_vduse_fds[i].dev == dev)
+			return uml_vduse_fds[i].fd;
+	}
+	return -EBADF;
+}
+
 static int uml_vduse_alloc(struct vduse_guest_dev *dev,
 			   struct vduse_guest_host *host)
 {
@@ -183,6 +204,22 @@ static int uml_vduse_open(struct vduse_guest_dev *dev)
 	if (u->fd < 0)
 		return u->fd;
 
+	/*
+	 * A device that failed to set up leaves its entry, which a later
+	 * device at the same address takes over.
+	 */
+	for (i = 0; i < ARRAY_SIZE(uml_vduse_fds); i++) {
+		if (!uml_vduse_fds[i].dev || uml_vduse_fds[i].dev == dev) {
+			uml_vduse_fds[i].dev = dev;
+			uml_vduse_fds[i].fd = u->fd;
+			break;
+		}
+	}
+	if (i == ARRAY_SIZE(uml_vduse_fds)) {
+		os_close_file(u->fd);
+		return -ENOSPC;
+	}
+
 	/* Eventfds raise no SIGIO themselves, so the SIGIO helper watches them. */
 	sigio_broken();
 	return 0;
@@ -200,7 +237,7 @@ static void uml_vduse_close(struct vduse_guest_dev *dev)
 static int uml_vduse_node_id(struct vduse_guest_dev *dev, u64 *node_dev,
 			     u64 *node_ino)
 {
-	return uml_vduse_user_node_id(uml_vduse_of(dev)->fd, node_dev,
+	return uml_vduse_user_node_id(uml_vduse_fd(dev), node_dev,
 				      node_ino);
 }
 
@@ -238,7 +275,8 @@ static int uml_vduse_enable_msgs(struct vduse_guest_dev *dev)
 {
 	struct uml_vduse *u = uml_vduse_of(dev);
 
-	u->irq = uml_vduse_request_irq(u->fd, uml_vduse_msg_interrupt, dev);
+	u->irq = uml_vduse_request_irq(uml_vduse_fd(dev),
+				       uml_vduse_msg_interrupt, dev);
 	return u->irq < 0 ? u->irq : 0;
 }
 
@@ -246,7 +284,7 @@ static void uml_vduse_disable_msgs(struct vduse_guest_dev *dev)
 {
 	struct uml_vduse *u = uml_vduse_of(dev);
 
-	uml_vduse_free_irq(u->fd, u->irq, dev);
+	uml_vduse_free_irq(uml_vduse_fd(dev), u->irq, dev);
 }
 
 static int uml_vduse_read_msg(struct vduse_guest_dev *dev,
@@ -267,7 +305,7 @@ static int uml_vduse_read_msg(struct vduse_guest_dev *dev,
 	BUILD_BUG_ON(sizeof(m.data) != sizeof(msg->data));
 	BUILD_BUG_ON((int)UML_VDUSE_MSG_UNKNOWN != VDUSE_GUEST_MSG_UNKNOWN);
 
-	err = uml_vduse_user_read_msg(uml_vduse_of(dev)->fd, &m);
+	err = uml_vduse_user_read_msg(uml_vduse_fd(dev), &m);
 	if (err)
 		return err;
 
@@ -291,30 +329,30 @@ static int uml_vduse_reply(struct vduse_guest_dev *dev,
 		.index = msg->index,
 	};
 
-	return uml_vduse_user_reply(uml_vduse_of(dev)->fd, &m, ok, avail_index);
+	return uml_vduse_user_reply(uml_vduse_fd(dev), &m, ok, avail_index);
 }
 
 static int uml_vduse_get_features(struct vduse_guest_dev *dev, u64 *features)
 {
-	return uml_vduse_user_get_features(uml_vduse_of(dev)->fd, features);
+	return uml_vduse_user_get_features(uml_vduse_fd(dev), features);
 }
 
 static int uml_vduse_set_config(struct vduse_guest_dev *dev, u32 offset,
 				const void *buf, u32 len)
 {
-	return uml_vduse_user_set_config(uml_vduse_of(dev)->fd, offset, buf,
+	return uml_vduse_user_set_config(uml_vduse_fd(dev), offset, buf,
 					 len);
 }
 
 static int uml_vduse_inject_config(struct vduse_guest_dev *dev)
 {
-	return uml_vduse_user_inject_config_irq(uml_vduse_of(dev)->fd);
+	return uml_vduse_user_inject_config_irq(uml_vduse_fd(dev));
 }
 
 static int uml_vduse_vq_setup(struct vduse_guest_dev *dev, unsigned int index,
 			      u16 max_size)
 {
-	return uml_vduse_user_vq_setup(uml_vduse_of(dev)->fd, index, max_size);
+	return uml_vduse_user_vq_setup(uml_vduse_fd(dev), index, max_size);
 }
 
 static int uml_vduse_vq_get_info(struct vduse_guest_dev *dev,
@@ -324,7 +362,7 @@ static int uml_vduse_vq_get_info(struct vduse_guest_dev *dev,
 	struct uml_vduse_user_vq_info i;
 	int err;
 
-	err = uml_vduse_user_vq_get_info(uml_vduse_of(dev)->fd, index, &i);
+	err = uml_vduse_user_vq_get_info(uml_vduse_fd(dev), index, &i);
 	if (err)
 		return err;
 
@@ -393,7 +431,8 @@ static int uml_vduse_enable_kick(struct vduse_guest_dev *dev,
 {
 	struct uml_vduse *u = uml_vduse_of(dev);
 
-	return uml_vduse_user_vq_set_kickfd(u->fd, index, u->vqs[index].kickfd);
+	return uml_vduse_user_vq_set_kickfd(uml_vduse_fd(dev), index,
+					    u->vqs[index].kickfd);
 }
 
 static void uml_vduse_sync_kick(struct vduse_guest_dev *dev,
@@ -404,7 +443,7 @@ static void uml_vduse_sync_kick(struct vduse_guest_dev *dev,
 
 static int uml_vduse_inject(struct vduse_guest_dev *dev, unsigned int index)
 {
-	return uml_vduse_user_vq_inject_irq(uml_vduse_of(dev)->fd, index);
+	return uml_vduse_user_vq_inject_irq(uml_vduse_fd(dev), index);
 }
 
 static int uml_vduse_map(struct vduse_guest_dev *dev, u64 iova,
@@ -413,7 +452,8 @@ static int uml_vduse_map(struct vduse_guest_dev *dev, u64 iova,
 	struct uml_vduse_user_region r;
 	int err;
 
-	err = uml_vduse_user_map(uml_vduse_of(dev)->fd, iova, &r);
+	err = uml_vduse_user_map(uml_vduse_fd(dev), iova, region->protect,
+				 &r);
 	if (err)
 		return err;
 
@@ -422,6 +462,7 @@ static int uml_vduse_map(struct vduse_guest_dev *dev, u64 iova,
 	region->addr = r.addr;
 	region->readable = r.readable;
 	region->writable = r.writable;
+	region->protect = r.protect;
 	return 0;
 }
 
@@ -432,6 +473,7 @@ static void uml_vduse_unmap(struct vduse_guest_dev *dev,
 		.start = region->start,
 		.last = region->last,
 		.addr = region->addr,
+		.protect = region->protect,
 	};
 
 	uml_vduse_user_unmap(&r);
@@ -439,7 +481,7 @@ static void uml_vduse_unmap(struct vduse_guest_dev *dev,
 
 static int uml_vduse_bounce_size(struct vduse_guest_dev *dev, u64 *size)
 {
-	return uml_vduse_user_bounce_size(uml_vduse_of(dev)->fd, size);
+	return uml_vduse_user_bounce_size(uml_vduse_fd(dev), size);
 }
 
 static void uml_vduse_unmap_umem(struct vduse_guest_dev *dev)
@@ -486,12 +528,12 @@ static int uml_vduse_reg_umem(struct vduse_guest_dev *dev, u64 size)
 {
 	struct uml_vduse *u = uml_vduse_of(dev);
 
-	return uml_vduse_user_reg_umem(u->fd, u->umem_window, size);
+	return uml_vduse_user_reg_umem(uml_vduse_fd(dev), u->umem_window, size);
 }
 
 static int uml_vduse_dereg_umem(struct vduse_guest_dev *dev, u64 size)
 {
-	return uml_vduse_user_dereg_umem(uml_vduse_of(dev)->fd, size);
+	return uml_vduse_user_dereg_umem(uml_vduse_fd(dev), size);
 }
 
 /* The sandbox does not allow ftruncate, so the launcher resizes the log. */
@@ -540,7 +582,8 @@ static void uml_vduse_unmap_log(struct vduse_guest_dev *dev, void *addr,
 {
 	struct uml_vduse *u = uml_vduse_of(dev);
 
-	uml_vduse_user_unmap_log(addr, size);
+	if (addr)
+		uml_vduse_user_unmap_log(addr, size);
 	if (u->log_path) {
 		os_close_file(u->log_fd);
 		u->log_fd = -1;
@@ -573,11 +616,12 @@ static int uml_vduse_shm_setup(struct vduse_guest_dev *dev, u8 id, u64 size)
 	u32 index;
 	int err;
 
-	err = uml_vduse_user_shm_setup(u->fd, id, size);
+	err = uml_vduse_user_shm_setup(uml_vduse_fd(dev), id, size);
 	if (err || u->mem_file >= 0)
 		return err;
 
-	err = uml_vduse_user_shm_reg_file(u->fd, phys_mapping(0, &offset),
+	err = uml_vduse_user_shm_reg_file(uml_vduse_fd(dev),
+					  phys_mapping(0, &offset),
 					  &index);
 	if (err)
 		return err;
@@ -614,7 +658,7 @@ static int uml_vduse_shm_map(struct vduse_guest_dev *dev, u8 id,
 		r[i].file = ranges[i].file ? ranges[i].file - 1 : u->mem_file;
 	}
 
-	err = uml_vduse_user_shm_map(u->fd, id, r, nr);
+	err = uml_vduse_user_shm_map(uml_vduse_fd(dev), id, r, nr);
 	kvfree(r);
 	return err;
 }
@@ -622,7 +666,7 @@ static int uml_vduse_shm_map(struct vduse_guest_dev *dev, u8 id,
 static int uml_vduse_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
 			       u64 size)
 {
-	return uml_vduse_user_shm_unmap(uml_vduse_of(dev)->fd, id, offset,
+	return uml_vduse_user_shm_unmap(uml_vduse_fd(dev), id, offset,
 					size);
 }
 
@@ -633,7 +677,6 @@ static int uml_vduse_shm_unmap(struct vduse_guest_dev *dev, u8 id, u64 offset,
 static int uml_vduse_shm_reg_bar(struct vduse_guest_dev *dev,
 				 struct pci_dev *pdev, int bar, u32 *file)
 {
-	struct uml_vduse *u = uml_vduse_of(dev);
 	u32 index;
 	int fd, err;
 
@@ -642,7 +685,7 @@ static int uml_vduse_shm_reg_bar(struct vduse_guest_dev *dev,
 	fd = um_pci_bar_dmabuf(pdev, bar);
 	if (fd < 0)
 		return fd;
-	err = uml_vduse_user_shm_reg_file(u->fd, fd, &index);
+	err = uml_vduse_user_shm_reg_file(uml_vduse_fd(dev), fd, &index);
 	os_close_file(fd);
 	if (!err)
 		*file = index + 1;

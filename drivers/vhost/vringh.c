@@ -20,11 +20,17 @@
 #endif
 #include <uapi/linux/virtio_config.h>
 
+/*
+ * UML's VDUSE transport walks rings inside protection key gates, where
+ * printing would let the logging code write protected memory.
+ */
 static __printf(1,2) __cold void vringh_bad(const char *fmt, ...)
 {
 	static DEFINE_RATELIMIT_STATE(vringh_rs,
 				      DEFAULT_RATELIMIT_INTERVAL,
 				      DEFAULT_RATELIMIT_BURST);
+	if (IS_ENABLED(CONFIG_UML_MPK))
+		return;
 	if (__ratelimit(&vringh_rs)) {
 		va_list ap;
 		va_start(ap, fmt);
@@ -220,6 +226,9 @@ static int resize_iovec(struct vringh_kiov *iov, gfp_t gfp)
 	struct kvec *new;
 	unsigned int flag, new_num = (iov->max_num & ~VRINGH_IOV_ALLOCATED) * 2;
 
+	/* A gfp of 0 keeps the iov at its size, for callers that cannot sleep. */
+	if (!gfp)
+		return -ENOBUFS;
 	if (new_num < 8)
 		new_num = 8;
 
