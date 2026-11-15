@@ -22,6 +22,48 @@ unsigned long uml_mpk_pkru_off __ro_after_init;
 unsigned char uml_mpk_sw_bytes[48] __ro_after_init;
 unsigned int uml_mpk_magic2 __ro_after_init;
 unsigned long uml_mpk_xstate_size __ro_after_init;
+unsigned long uml_mpk_vm_start __ro_after_init;
+unsigned long uml_mpk_vm_end __ro_after_init;
+
+/*
+ * The number of module texts that D1 holds. While it is 0, the page table
+ * sync needs no gate to know that a page is not module text.
+ */
+static atomic_t uml_mpk_execs = ATOMIC_INIT(0);
+
+int uml_mpk_exec_add(void *start, size_t size)
+{
+	int err;
+
+	if (!uml_mpk_enabled)
+		return 0;
+	err = uml_mpk_gate(uml_mpk_exec_add_d1, start, size);
+	if (!err)
+		atomic_inc(&uml_mpk_execs);
+	return err;
+}
+
+int uml_mpk_exec_seal(void *start, size_t size)
+{
+	if (!uml_mpk_enabled || !start)
+		return 0;
+	return uml_mpk_gate(uml_mpk_exec_seal_d1, start, size);
+}
+
+void uml_mpk_exec_remove(void *start)
+{
+	if (!uml_mpk_enabled || !start || !atomic_read(&uml_mpk_execs))
+		return;
+	if (uml_mpk_gate(uml_mpk_exec_remove_d1, start) > 0)
+		atomic_dec(&uml_mpk_execs);
+}
+
+int uml_mpk_exec_sealed(unsigned long virt)
+{
+	if (!atomic_read(&uml_mpk_execs))
+		return 0;
+	return uml_mpk_gate(uml_mpk_exec_sealed_d1, virt);
+}
 
 void __noreturn uml_mpk_gate_failed(void)
 {
@@ -128,6 +170,9 @@ static int __init uml_mpk_run_test(void)
 	} else if (!strcmp(t, "sandbox")) {
 		pr_info("uml_mpk: unmapping the window from D0, which the sandbox should stop\n");
 		uml_mpk_test_munmap();
+	} else if (!strcmp(t, "exec")) {
+		pr_info("uml_mpk: mapping executable memory from D0, which the sandbox should stop\n");
+		uml_mpk_test_exec();
 	} else {
 		pr_info("uml_mpk: unknown test %s\n", t);
 		return 0;

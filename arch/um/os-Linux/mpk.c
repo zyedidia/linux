@@ -8,6 +8,10 @@
  * cannot access any of it, and under the sandbox it cannot change the window's
  * mappings either.
  *
+ * The only executable kernel memory outside the image is module text, which
+ * D1 maps only when the module has loaded, as a read-only copy that has no
+ * other mapping.
+ *
  * A signal frame lies on a stack that D0 can write, and sigreturn loads the
  * PKRU from it. A handler therefore records the frame's context when it
  * starts, and returns from the signal through a copy of the frame that D1
@@ -26,6 +30,7 @@
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
 #include <asm/prctl.h>
+#include <as-layout.h>
 #include <init.h>
 #include <mpk.h>
 #include <os.h>
@@ -93,10 +98,27 @@ extern unsigned char uml_mpk_sw_bytes[MPK_SW_SIZE];
 extern unsigned int uml_mpk_magic2;
 extern unsigned long uml_mpk_xstate_size;
 
+/*
+ * A module's text is registered here from when it is allocated until it is
+ * freed. The lock orders changes, an entry is in use while its size is not
+ * 0, and seq is odd while the entry changes.
+ */
+struct mpk_exec {
+	unsigned long seq;
+	unsigned long start;
+	unsigned long size;
+	int sealed;
+};
+
+#define MPK_EXECS		64
+#define MPK_EXEC_MAX_SIZE	(64UL << 20)
+
 struct mpk_ctl {
 	struct uml_mpk_lock lock;
 	unsigned long pool[MPK_GRANULES / BITS_PER_WORD];
 	unsigned long slots[MPK_SLOTS / BITS_PER_WORD];
+	struct uml_mpk_lock exec_lock;
+	struct mpk_exec exec[MPK_EXECS];
 };
 
 /*
@@ -412,6 +434,161 @@ void uml_mpk_unmap(void *addr, unsigned long size)
 		uml_mpk_fail("Unmapping memory that is not a protected mapping");
 	mpk_reserve(addr, len);
 	mpk_free_slots(off >> MPK_SLOT_SHIFT, len);
+}
+
+static void mpk_exec_set(struct mpk_exec *e, unsigned long start,
+			 unsigned long size, int sealed)
+{
+	__atomic_store_n(&e->seq, e->seq + 1, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	__atomic_store_n(&e->start, start, __ATOMIC_RELAXED);
+	__atomic_store_n(&e->size, size, __ATOMIC_RELAXED);
+	__atomic_store_n(&e->sealed, sealed, __ATOMIC_RELAXED);
+	__atomic_store_n(&e->seq, e->seq + 1, __ATOMIC_RELEASE);
+}
+
+static struct mpk_exec *mpk_find_exec(unsigned long addr)
+{
+	struct mpk_ctl *ctl = mpk_ctl();
+	struct mpk_exec *e;
+
+	for (e = ctl->exec; e < ctl->exec + MPK_EXECS; e++) {
+		if (e->size && addr >= e->start && addr - e->start < e->size)
+			return e;
+	}
+	return NULL;
+}
+
+/*
+ * Register the text of a module that is loading. It must be in UML's virtual
+ * memory range, outside the window and the kernel image, and must not
+ * overlap other text. The sandbox checks that the addresses it exempts are
+ * outside that range.
+ */
+long __uml_mpk_entry uml_mpk_exec_add_d1(unsigned long start,
+					 unsigned long size)
+{
+	struct mpk_ctl *ctl = mpk_ctl();
+	struct mpk_exec *e, *free = NULL;
+	long err = 0;
+
+	if (!size || size % MPK_PAGE_SIZE || start % MPK_PAGE_SIZE ||
+	    size > MPK_EXEC_MAX_SIZE || start < uml_mpk_vm_start ||
+	    start > uml_mpk_vm_end || size > uml_mpk_vm_end - start ||
+	    uml_mpk_protected(start, size))
+		return -EINVAL;
+
+	uml_mpk_lock(&ctl->exec_lock);
+	for (e = ctl->exec; e < ctl->exec + MPK_EXECS; e++) {
+		if (!e->size && !free)
+			free = e;
+		else if (e->size && start < e->start + e->size &&
+			 e->start < start + size)
+			err = -EBUSY;
+	}
+	if (!err && !free)
+		err = -ENOSPC;
+	if (!err)
+		mpk_exec_set(free, start, size, 0);
+	uml_mpk_unlock(&ctl->exec_lock);
+	return err;
+}
+
+/*
+ * Returns 1 if virt is in sealed module text, which D1 has mapped. It takes
+ * no lock, since a fault during a seal syncs the kernel's page table, which
+ * calls it, and reads each entry again if it changed meanwhile. No fault can
+ * happen while an entry changes.
+ */
+long __uml_mpk_entry uml_mpk_exec_sealed_d1(unsigned long virt)
+{
+	struct mpk_ctl *ctl = mpk_ctl();
+	unsigned long seq, start, size;
+	struct mpk_exec *e;
+	int sealed;
+
+	for (e = ctl->exec; e < ctl->exec + MPK_EXECS; e++) {
+		do {
+			seq = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+			start = __atomic_load_n(&e->start, __ATOMIC_RELAXED);
+			size = __atomic_load_n(&e->size, __ATOMIC_RELAXED);
+			sealed = __atomic_load_n(&e->sealed, __ATOMIC_RELAXED);
+			__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		} while (seq % 2 ||
+			 __atomic_load_n(&e->seq, __ATOMIC_RELAXED) != seq);
+		if (size && sealed && virt - start < size)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Seal the text of a module that has loaded. D1 copies the text into
+ * anonymous memory in the window, makes it read-only and executable there,
+ * where D0 cannot change it, and moves it over the text. The copy has no
+ * other mapping, so no memory that D0 can write becomes executable. The
+ * source stays mapped, empty, until it is reserved again, so the window
+ * never has a hole.
+ */
+long __uml_mpk_entry uml_mpk_exec_seal_d1(unsigned long start,
+					  unsigned long size)
+{
+	struct mpk_ctl *ctl = mpk_ctl();
+	struct mpk_exec *e;
+	long slot, err = 0;
+	char *p;
+
+	uml_mpk_lock(&ctl->exec_lock);
+	e = mpk_find_exec(start);
+	if (!e || e->start != start || e->size != size || e->sealed)
+		err = -EINVAL;
+	slot = err ? -1 : mpk_alloc_slots(size);
+	if (!err && slot < 0)
+		err = -ENOMEM;
+	if (!err) {
+		p = mpk_slot(slot);
+		if (mpk_mmap(p, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS |
+			     MAP_FIXED, -1, 0) < 0 ||
+		    mpk_protect(p, size, PROT_READ | PROT_WRITE) < 0)
+			uml_mpk_fail("Failed to map a copy of a module's text");
+		memcpy(p, (void *)start, size);
+		if (uml_mpk_syscall(__NR_pkey_mprotect, (unsigned long)p, size,
+				    PROT_READ | PROT_EXEC, 0, 0, 0) < 0 ||
+		    uml_mpk_syscall(__NR_mremap, (unsigned long)p, size, size,
+				    MREMAP_MAYMOVE | MREMAP_FIXED |
+				    MREMAP_DONTUNMAP, start, 0) < 0)
+			uml_mpk_fail("Failed to seal a module's text");
+		mpk_reserve(p, size);
+		mpk_free_slots(slot, size);
+		mpk_exec_set(e, e->start, e->size, 1);
+	}
+	uml_mpk_unlock(&ctl->exec_lock);
+	return err;
+}
+
+/*
+ * Drop the text of a module before its memory is freed. Sealed text becomes
+ * read-only memory that is not executable, which the kernel can still read
+ * until it unmaps the range. Returns 1 if start was module text.
+ */
+long __uml_mpk_entry uml_mpk_exec_remove_d1(unsigned long start)
+{
+	struct mpk_ctl *ctl = mpk_ctl();
+	struct mpk_exec *e;
+	long r = 0;
+
+	uml_mpk_lock(&ctl->exec_lock);
+	e = mpk_find_exec(start);
+	if (e && e->start == start) {
+		if (e->sealed &&
+		    mpk_mmap((void *)e->start, e->size, PROT_READ,
+			     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) < 0)
+			uml_mpk_fail("Failed to drop a module's text");
+		mpk_exec_set(e, 0, 0, 0);
+		r = 1;
+	}
+	uml_mpk_unlock(&ctl->exec_lock);
+	return r;
 }
 
 static unsigned int *mpk_pkru_field(ucontext_t *uc)
@@ -848,6 +1025,8 @@ void __init uml_mpk_init(void)
 		return;
 	}
 
+	uml_mpk_vm_start = start_vm;
+	uml_mpk_vm_end = end_vm;
 	uml_mpk_enabled = 1;
 	uml_mpk_cpu_init(0);
 	os_info("Protecting the VirtIO transport with protection key %d\n",
@@ -917,6 +1096,20 @@ int uml_mpk_test_regs(void)
 void uml_mpk_test_munmap(void)
 {
 	syscall(__NR_munmap, uml_mpk_window, MPK_PAGE_SIZE);
+}
+
+/*
+ * Make an executable mapping at the stub's address from outside the stub's
+ * code, and unmap it again if the host made it.
+ */
+void uml_mpk_test_exec(void)
+{
+	long r = syscall(__NR_mmap, STUB_START, MPK_PAGE_SIZE,
+			 PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
+			 -1, 0);
+
+	if (r != -1)
+		munmap((void *)r, MPK_PAGE_SIZE);
 }
 
 static long __uml_mpk_entry mpk_test_maps_d1(char *from)

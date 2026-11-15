@@ -94,7 +94,8 @@ int os_map_memory(void *virt, int fd, unsigned long long off, unsigned long len,
 	prot = (r ? PROT_READ : 0) | (w ? PROT_WRITE : 0) |
 		(x ? PROT_EXEC : 0);
 
-	if (uml_mpk_protected((unsigned long)virt, len))
+	if (uml_mpk_protected((unsigned long)virt, len) ||
+	    (IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled && x))
 		return -EPERM;
 	loc = mmap64((void *) virt, len, prot, MAP_SHARED | MAP_FIXED,
 		     fd, off);
@@ -108,7 +109,8 @@ int os_protect_memory(void *addr, unsigned long len, int r, int w, int x)
 	int prot = ((r ? PROT_READ : 0) | (w ? PROT_WRITE : 0) |
 		    (x ? PROT_EXEC : 0));
 
-	if (uml_mpk_overlaps((unsigned long)addr, len))
+	if (uml_mpk_overlaps((unsigned long)addr, len) ||
+	    (IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled && x))
 		return -EPERM;
 	if (mprotect(addr, len, prot) < 0)
 		return -errno;

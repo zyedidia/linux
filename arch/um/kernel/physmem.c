@@ -15,6 +15,7 @@
 #include <kern.h>
 #include <kern_util.h>
 #include <mem_user.h>
+#include <mpk.h>
 #include <os.h>
 
 static int physmem_fd = -1;
@@ -103,8 +104,10 @@ void __init setup_physmem(unsigned long start, unsigned long reserve_end,
 
 	physmem_fd = create_mem_file(len);
 
+	/* Under protection keys, no memory that D0 can write is executable. */
 	err = os_map_memory((void *) reserve_end, physmem_fd, reserve,
-			    map_size, 1, 1, 1);
+			    map_size, 1, 1,
+			    !(IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled));
 	if (err < 0) {
 		os_warn("setup_physmem - mapping %lu bytes of memory at 0x%p "
 			"failed - errno = %d\n", map_size,

@@ -22,6 +22,7 @@ struct faultinfo {
 };
 
 #define FAULT_WRITE(fi) ((fi).error_code & 2)
+#define FAULT_EXEC(fi) ((fi).error_code & 0x10)
 #define FAULT_ADDRESS(fi) ((fi).cr2)
 
 /* This is Page Fault */

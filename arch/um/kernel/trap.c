@@ -12,6 +12,7 @@
 #include <linux/cfi.h>
 #include <asm/current.h>
 #include <asm/tlbflush.h>
+#include <asm/mpk.h>
 #include <arch.h>
 #include <as-layout.h>
 #include <kern_util.h>
@@ -335,6 +336,20 @@ unsigned long segv(struct faultinfo fi, unsigned long ip, int is_user,
 		current->thread.segv_regs = container_of(regs, struct pt_regs, regs);
 
 	if (!is_user && address >= start_vm && address < end_vm) {
+#ifdef CONFIG_UML_MPK
+		/*
+		 * Only D1 makes memory in this range executable, and nothing
+		 * writes module text once it is sealed.
+		 */
+		if (uml_mpk_enabled &&
+		    (FAULT_EXEC(fi) ||
+		     (FAULT_WRITE(fi) &&
+		      uml_mpk_exec_sealed(address & PAGE_MASK) > 0))) {
+			show_regs(container_of(regs, struct pt_regs, regs));
+			panic("Kernel mode fault on protected memory at 0x%lx, ip 0x%lx",
+			      address, ip);
+		}
+#endif
 		/*
 		 * Kernel has pending updates from set_ptes that were not
 		 * flushed yet. Syncing them should fix the pagefault (if not

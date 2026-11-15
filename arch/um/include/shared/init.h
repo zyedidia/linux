@@ -50,6 +50,10 @@ typedef void (*exitcall_t)(void);
 #define __exitdata	__section(".exit.data")
 #define __exit_call	__used __section(".exitcall.exit")
 
+#ifndef __ro_after_init
+#define __ro_after_init	__section(".data..ro_after_init")
+#endif
+
 #ifdef MODULE
 #define __exit		__section(".exit.text")
 #else

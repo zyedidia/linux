@@ -3,6 +3,7 @@
 #define __UM_ASM_MPK_H
 
 #include <linux/irqflags.h>
+#include <linux/types.h>
 #include <mpk.h>
 
 /*
@@ -36,5 +37,15 @@ static inline long __uml_mpk_gate(void *fn, unsigned long a0, unsigned long a1,
 #define uml_mpk_gate(fn, ...)						\
 	__uml_mpk_gate((void *)(fn),					\
 		       __uml_mpk_args(__VA_ARGS__, 0, 0, 0, 0, 0, 0))
+
+/*
+ * Module text is the only executable kernel memory outside the image. It is
+ * registered when it is allocated, made executable and read-only when its
+ * module has loaded, and dropped when it is freed.
+ */
+int uml_mpk_exec_add(void *start, size_t size);
+int uml_mpk_exec_seal(void *start, size_t size);
+void uml_mpk_exec_remove(void *start);
+int uml_mpk_exec_sealed(unsigned long virt);
 
 #endif /* __UM_ASM_MPK_H */

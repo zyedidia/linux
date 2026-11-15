@@ -1,6 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include <asm-generic/vmlinux.lds.h>
 
+  /*
+   * The executable sections end before the data, so that no segment of the
+   * binary is both writable and executable.
+   */
+  .altinstr_replacement : { *(.altinstr_replacement) }
+  /* .exit.text is kept at link time for the references from .eh_frame. */
+  .exit.text : { EXIT_TEXT }
   .fini      : { *(.fini)    } =0x9090
   _etext = .;
   PROVIDE (etext = .);
@@ -70,10 +77,6 @@
 	*(.altinstructions)
 	__alt_instructions_end = .;
   }
-  .altinstr_replacement : { *(.altinstr_replacement) }
-  /* .exit.text is discard at runtime, not link time, to deal with references
-     from .altinstructions and .eh_frame */
-  .exit.text : { EXIT_TEXT }
   .exit.data : { *(.exit.data) }
 
   .preinit_array : {

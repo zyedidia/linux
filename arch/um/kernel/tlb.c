@@ -9,6 +9,7 @@
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
+#include <asm/mpk.h>
 #include <as-layout.h>
 #include <mem_user.h>
 #include <os.h>
@@ -25,10 +26,21 @@ struct vm_ops {
 		     unsigned long virt, unsigned long len);
 };
 
+/*
+ * UML's page tables make every kernel page executable. Under protection
+ * keys, kern_map strips execute permission from every page except sealed
+ * module text, which it leaves as D1 mapped it.
+ */
 static int kern_map(struct mm_id *mm_idp,
 		    unsigned long virt, unsigned long len, int prot,
 		    int phys_fd, unsigned long long offset)
 {
+	if (IS_ENABLED(CONFIG_UML_MPK) && uml_mpk_enabled &&
+	    (prot & UM_PROT_EXEC)) {
+		if (len == PAGE_SIZE && uml_mpk_exec_sealed(virt))
+			return 0;
+		prot &= ~UM_PROT_EXEC;
+	}
 	return os_map_memory((void *)virt, phys_fd, offset, len,
 			     prot & UM_PROT_READ, prot & UM_PROT_WRITE,
 			     prot & UM_PROT_EXEC);

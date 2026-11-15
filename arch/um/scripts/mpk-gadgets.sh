@@ -7,7 +7,8 @@
 # inside other instructions, such as in a displacement, are reported as a
 # warning. Reaching them needs a jump into the middle of an instruction,
 # which shadow stacks and kCFI make hard, and removing them would need the
-# instructions around them rewritten.
+# instructions around them rewritten. It also fails if a segment of the
+# binary is both writable and executable.
 #
 # usage: mpk-gadgets.sh <objdump> <objcopy> <nm> <binary>
 
@@ -60,6 +61,15 @@ in_ranges() {
 }
 
 bad=0
+
+# No segment, and not the stack, may be both writable and executable.
+if "$objdump" -p "$bin" | awk '
+	$1 == "LOAD" || $1 == "STACK" { load = 1; next }
+	load && /flags/ { load = 0; if ($NF ~ /w/ && $NF ~ /x/) found = 1 }
+	END { exit !found }'; then
+	echo "$bin: a segment is writable and executable" >&2
+	bad=1
+fi
 
 # The instructions, at the addresses where the disassembly decodes them.
 "$objdump" -d --no-show-raw-insn "$bin" |

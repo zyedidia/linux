@@ -278,7 +278,7 @@ static void handle_trap(struct uml_pt_regs *regs)
 
 extern char __syscall_stub_start[];
 
-static int stub_exe_fd;
+static int stub_exe_fd __ro_after_init;
 
 struct tramp_data {
 	struct stub_data *stub_data;
@@ -454,8 +454,7 @@ int start_userspace(struct mm_id *mm_id)
 	int status, n, err;
 
 	/* setup a temporary stack page */
-	stack = mmap(NULL, UM_KERN_PAGE_SIZE,
-		     PROT_READ | PROT_WRITE | PROT_EXEC,
+	stack = mmap(NULL, UM_KERN_PAGE_SIZE, PROT_READ | PROT_WRITE,
 		     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (stack == MAP_FAILED) {
 		err = -errno;

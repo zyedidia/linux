@@ -56,8 +56,8 @@ void kasan_map_memory(void *start, size_t len)
 /* Set by make_tempfile() during early boot. */
 char *tempdir = NULL;
 
-#ifndef MFD_EXEC
-#define MFD_EXEC 0x0010U
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
 #endif
 
 /* Set if memory files are memfds instead of files in tempdir. */
@@ -154,8 +154,11 @@ static int __init make_tempfile(const char *template)
 	char *tempname;
 	int fd;
 
+	/* The memory may be mapped executable, but is never run as a program. */
 	if (use_memfd) {
-		fd = memfd_create("uml-memory", MFD_EXEC | MFD_CLOEXEC);
+		fd = memfd_create("uml-memory", MFD_NOEXEC_SEAL | MFD_CLOEXEC);
+		if (fd < 0 && errno == EINVAL)
+			fd = memfd_create("uml-memory", MFD_CLOEXEC);
 		if (fd < 0)
 			os_warn("memfd_create failed: %s\n", strerror(errno));
 		return fd;
@@ -171,7 +174,7 @@ static int __init make_tempfile(const char *template)
 	}
 
 #ifdef O_TMPFILE
-	fd = open(tempdir, O_CLOEXEC | O_RDWR | O_EXCL | O_TMPFILE, 0700);
+	fd = open(tempdir, O_CLOEXEC | O_RDWR | O_EXCL | O_TMPFILE, 0600);
 	/*
 	 * If the running system does not support O_TMPFILE flag then retry
 	 * without it.

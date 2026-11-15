@@ -18,6 +18,9 @@
 #include <linux/text-patching.h>
 
 #include <asm/tlbflush.h>
+#ifdef CONFIG_UML_MPK
+#include <asm/mpk.h>
+#endif
 
 #include "internal.h"
 
@@ -491,6 +494,11 @@ void *execmem_alloc_rw(enum execmem_type type, size_t size)
 	if (err)
 		return NULL;
 
+#ifdef CONFIG_UML_MPK
+	if (type == EXECMEM_MODULE_TEXT && uml_mpk_exec_add(p, size))
+		return NULL;
+#endif
+
 	return no_free_ptr(p);
 }
 
@@ -502,6 +510,9 @@ void execmem_free(void *ptr)
 	 */
 	WARN_ON(in_interrupt());
 
+#ifdef CONFIG_UML_MPK
+	uml_mpk_exec_remove(ptr);
+#endif
 	if (!execmem_cache_free(ptr))
 		vfree(ptr);
 }

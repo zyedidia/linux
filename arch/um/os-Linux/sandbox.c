@@ -10,6 +10,7 @@
  * traps the system calls that it denies.
  */
 
+#include <elf.h>
 #include <errno.h>
 #include <signal.h>
 #include <stddef.h>
@@ -295,6 +296,22 @@ static void __init allow_from_gate(void)
 }
 
 /*
+ * Trap the system call unless it comes from the gates' system call stub. The
+ * accumulator is clobbered.
+ */
+static void __init trap_unless_gate(void)
+{
+	unsigned long ip = (unsigned long)uml_mpk_syscall_ip;
+
+	load(IP_LO);
+	emit(BPF_JMP | BPF_JEQ | BPF_K, (unsigned int)ip, 1, 0);
+	ret(SECCOMP_RET_TRAP);
+	load(IP_HI);
+	emit(BPF_JMP | BPF_JEQ | BPF_K, ip >> 32, 1, 0);
+	ret(SECCOMP_RET_TRAP);
+}
+
+/*
  * Emit a check that the 64-bit value at offset is in [lo, hi], and return
  * the three jumps that branch out when it is not: the false branches of the
  * first two and the true branch of the last.
@@ -391,15 +408,145 @@ static void __init trap_window(unsigned int nr, int is_mmap)
 	land_jf(skip);
 }
 
+extern char stub_exe_start[], stub_exe_end[];
+
+/*
+ * Find the executable segment of the stub executable, which a new guest
+ * process runs at its link address before it jumps to the stub.
+ */
+static void __init stub_exe_text(unsigned long *lo, unsigned long *hi)
+{
+	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)stub_exe_start;
+	unsigned long size = stub_exe_end - stub_exe_start;
+	const Elf64_Phdr *ph;
+	int i, found = 0;
+
+	if (size < sizeof(*eh) || eh->e_type != ET_EXEC ||
+	    eh->e_phentsize != sizeof(*ph) || eh->e_phoff > size ||
+	    eh->e_phnum > (size - eh->e_phoff) / sizeof(*ph))
+		goto bad;
+	ph = (const Elf64_Phdr *)(stub_exe_start + eh->e_phoff);
+	for (i = 0; i < eh->e_phnum; i++) {
+		if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X))
+			continue;
+		if (found++ || !ph[i].p_memsz)
+			goto bad;
+		*lo = ph[i].p_vaddr;
+		*hi = ph[i].p_vaddr + ph[i].p_memsz - 1;
+	}
+	if (found)
+		return;
+bad:
+	os_warn("The stub executable needs one executable segment at a fixed address\n");
+	exit(1);
+}
+
+/*
+ * Trap system call nr if its prot, the third argument, has PROT_EXEC, unless
+ * it comes from the stub of a guest process, which maps the guest's code, or
+ * from the stub executable, which maps the stub. UML maps nothing executable
+ * at either in its own address space. The gates make module text executable
+ * with pkey_mprotect instead. The accumulator holds nr before and after.
+ */
+static void __init trap_exec(unsigned int nr)
+{
+	unsigned short skip, noexec, stub[3], exe[3];
+	unsigned long lo, hi;
+
+	stub_exe_text(&lo, &hi);
+	if ((STUB_END > uml_mpk_vm_start && STUB_START < uml_mpk_vm_end) ||
+	    (hi >= uml_mpk_vm_start && lo < uml_mpk_vm_end) ||
+	    uml_mpk_protected(STUB_START, STUB_SIZE) ||
+	    uml_mpk_protected(lo, hi - lo + 1)) {
+		os_warn("The stub overlaps the range of module text or protected memory\n");
+		exit(1);
+	}
+	skip = jump(BPF_JEQ | BPF_K, nr);
+	load(ARG_LO(2));
+	noexec = jump(BPF_JSET | BPF_K, PROT_EXEC);
+
+	/* An instruction pointer outside a range leads to the next check. */
+	in_range(IP_LO, STUB_START, STUB_END - 1, stub);
+	land_jf(stub[0]);
+	land_jf(stub[1]);
+	land_jt(stub[2]);
+	in_range(IP_LO, lo, hi, exe);
+	land_jf(exe[0]);
+	land_jf(exe[1]);
+	land_jt(exe[2]);
+	ret(SECCOMP_RET_TRAP);
+
+	land_jf(noexec);
+	land_jf(stub[2]);
+	land_jf(exe[2]);
+	load(offsetof(struct seccomp_data, nr));
+	land_jf(skip);
+}
+
+/*
+ * Allow pkey_mprotect from the gates' stub with key 1 and without execute
+ * permission, which protects the window, or with key 0, read and execute
+ * permission and a range in the window, which seals the copy of a module's
+ * text before it moves out. Trap it otherwise. The accumulator holds the
+ * system call number before and after.
+ */
+static void __init trap_pkey_mprotect(void)
+{
+	unsigned int w = uml_mpk_window >> UML_MPK_WINDOW_SHIFT;
+	unsigned short skip, key1, bad[4], wrap, nocarry;
+
+	skip = jump(BPF_JEQ | BPF_K, __NR_pkey_mprotect);
+	trap_unless_gate();
+
+	load(ARG_LO(3));
+	key1 = jump(BPF_JEQ | BPF_K, UML_MPK_KEY);
+	load(ARG_LO(2));
+	emit(BPF_JMP | BPF_JSET | BPF_K, PROT_EXEC, 0, 1);
+	ret(SECCOMP_RET_TRAP);
+	ret(SECCOMP_RET_ALLOW);
+	land_jf(key1);
+
+	load(ARG_LO(3));
+	bad[0] = jump(BPF_JEQ | BPF_K, 0);
+	load(ARG_LO(2));
+	bad[1] = jump(BPF_JEQ | BPF_K, PROT_READ | PROT_EXEC);
+	load(ARG_HI(0));
+	bad[2] = jump(BPF_JEQ | BPF_K, w);
+	load(ARG_HI(1));
+	bad[3] = jump(BPF_JEQ | BPF_K, 0);
+
+	/* The range ends in the window if the low words carry only to 0. */
+	load(ARG_LO(0));
+	stmt(BPF_ST, 0);
+	load(ARG_LO(1));
+	stmt(BPF_LDX | BPF_MEM, 0);
+	stmt(BPF_ALU | BPF_ADD | BPF_X, 0);
+	wrap = jump(BPF_JEQ | BPF_K, 0);
+	nocarry = jump(BPF_JGE | BPF_X, 0);
+	land_jf(bad[0]);
+	land_jf(bad[1]);
+	land_jf(bad[2]);
+	land_jf(bad[3]);
+	land_jf(nocarry);
+	ret(SECCOMP_RET_TRAP);
+	land_jt(wrap);
+	land_jt(nocarry);
+	ret(SECCOMP_RET_ALLOW);
+	land_jf(skip);
+}
+
 /*
  * The gates alone may change the window's mappings, and pkey_mprotect,
- * mremap and VFIO DMA maps are allowed only for them, pkey_mprotect only with
- * the window's key. Other code may still map, unmap and protect memory
- * outside the window.
+ * mremap and VFIO DMA maps are allowed only for them. Other code may still
+ * map, unmap and protect memory outside the window, but not make it
+ * executable.
  */
 static void __init build_mpk_rules(void)
 {
-	unsigned short skip, key;
+	unsigned short skip;
+#if IS_ENABLED(CONFIG_UML_PCI_OVER_VFIO)
+	unsigned short map;
+#endif
 
 	/*
 	 * An rseq area would let the host move a thread to an abort handler
@@ -407,14 +554,7 @@ static void __init build_mpk_rules(void)
 	 */
 	ret_if(__NR_rseq, SECCOMP_RET_ERRNO | ENOSYS);
 
-	skip = jump(BPF_JEQ | BPF_K, __NR_pkey_mprotect);
-	load(ARG_LO(3));
-	key = jump(BPF_JEQ | BPF_K, UML_MPK_KEY);
-	ret(SECCOMP_RET_TRAP);
-	land_jt(key);
-	allow_from_gate();
-	ret(SECCOMP_RET_TRAP);
-	land_jf(skip);
+	trap_pkey_mprotect();
 
 	skip = jump(BPF_JEQ | BPF_K, __NR_mremap);
 	allow_from_gate();
@@ -425,13 +565,16 @@ static void __init build_mpk_rules(void)
 	/* VFIO pins pages for DMA without checking their key. */
 	skip = jump(BPF_JEQ | BPF_K, __NR_ioctl);
 	load(ARG_LO(1));
-	key = jump(BPF_JEQ | BPF_K, VFIO_IOMMU_MAP_DMA);
+	map = jump(BPF_JEQ | BPF_K, VFIO_IOMMU_MAP_DMA);
 	allow_from_gate();
 	ret(SECCOMP_RET_TRAP);
-	land_jf(key);
+	land_jf(map);
 	load(offsetof(struct seccomp_data, nr));
 	land_jf(skip);
 #endif
+
+	trap_exec(__NR_mmap);
+	trap_exec(__NR_mprotect);
 
 	trap_window(__NR_munmap, 0);
 	trap_window(__NR_mprotect, 0);

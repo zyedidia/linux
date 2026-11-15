@@ -31,6 +31,8 @@
 #ifndef __ASSEMBLER__
 
 extern int uml_mpk_enabled;
+/* The range of UML's virtual memory, which holds all module text. */
+extern unsigned long uml_mpk_vm_start, uml_mpk_vm_end;
 extern unsigned long uml_mpk_window;
 
 static inline unsigned int uml_mpk_rdpkru(void)
@@ -124,6 +126,10 @@ void uml_mpk_set_ip(void *mc, unsigned long ip);
  * These run only in D1. Allocations are zeroed. The map functions place a
  * mapping in the window with key 1, and return 0 or a negative error.
  */
+long uml_mpk_exec_add_d1(unsigned long start, unsigned long size);
+long uml_mpk_exec_sealed_d1(unsigned long virt);
+long uml_mpk_exec_seal_d1(unsigned long start, unsigned long size);
+long uml_mpk_exec_remove_d1(unsigned long start);
 void *uml_mpk_alloc(unsigned long size);
 void uml_mpk_free(void *p);
 int uml_mpk_map(int fd, unsigned long long offset, unsigned long size,
@@ -135,6 +141,7 @@ void uml_mpk_unmap(void *addr, unsigned long size);
 int uml_mpk_test_frame(void);
 int uml_mpk_test_regs(void);
 void uml_mpk_test_munmap(void);
+void uml_mpk_test_exec(void);
 int uml_mpk_test_maps(void);
 #endif
 

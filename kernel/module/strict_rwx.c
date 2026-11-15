@@ -10,6 +10,9 @@
 #include <linux/vmalloc.h>
 #include <linux/set_memory.h>
 #include <linux/execmem.h>
+#ifdef CONFIG_UML_MPK
+#include <asm/mpk.h>
+#endif
 #include "internal.h"
 
 static int module_set_memory(const struct module *mod, enum mod_mem_type type,
@@ -36,6 +39,11 @@ int module_enable_text_rox(const struct module *mod)
 		const struct module_memory *mem = &mod->mem[type];
 		int ret;
 
+#ifdef CONFIG_UML_MPK
+		ret = uml_mpk_exec_seal(mem->base, mem->size);
+		if (ret)
+			return ret;
+#endif
 		if (mem->is_rox)
 			ret = execmem_restore_rox(mem->base, mem->size);
 		else if (IS_ENABLED(CONFIG_STRICT_MODULE_RWX))
