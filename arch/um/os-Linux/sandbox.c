@@ -31,6 +31,7 @@
 #if IS_ENABLED(CONFIG_UML_PCI_OVER_VFIO)
 #include <linux/vfio.h>
 #endif
+#include <as-layout.h>
 #include <init.h>
 #include <mpk.h>
 #include <os.h>
@@ -294,12 +295,47 @@ static void __init allow_from_gate(void)
 }
 
 /*
+ * Emit a check that the 64-bit value at offset is in [lo, hi], and return
+ * the three jumps that branch out when it is not: the false branches of the
+ * first two and the true branch of the last.
+ */
+static void __init in_range(unsigned int offset, unsigned long lo,
+			    unsigned long hi, unsigned short out[3])
+{
+	if (lo > hi || lo >> 32 != hi >> 32) {
+		os_warn("A sandbox range is empty or crosses a 4 GiB boundary\n");
+		exit(1);
+	}
+	load(offset + 4);
+	out[0] = jump(BPF_JEQ | BPF_K, lo >> 32);
+	load(offset);
+	out[1] = jump(BPF_JGE | BPF_K, (unsigned int)lo);
+	out[2] = jump(BPF_JGT | BPF_K, (unsigned int)hi);
+}
+
+/*
+ * Allow the system call if it comes from the stub code of a guest process,
+ * whose address space has no window. The accumulator is clobbered.
+ */
+static void __init allow_from_stub(void)
+{
+	unsigned short out[3];
+
+	in_range(IP_LO, STUB_START, STUB_END - 1, out);
+	ret(SECCOMP_RET_ALLOW);
+	land_jf(out[0]);
+	land_jf(out[1]);
+	land_jt(out[2]);
+}
+
+/*
  * Trap system call nr if the range in its first two arguments overlaps the
- * window, unless it comes from the gates' stub. For mmap, only a MAP_FIXED
- * mapping is checked, since the window has no hole for another one to land
- * in. The window is aligned to its size, so its high word is the same at
- * every address in it, and the end of the range is computed with a carry
- * from the low words. The accumulator holds nr before and after.
+ * window, unless it comes from the gates' stub or the stub of a guest
+ * process. For mmap, only a MAP_FIXED mapping is checked, since the window
+ * has no hole for another one to land in. The window is aligned to its size,
+ * so its high word is the same at every address in it, and the end of the
+ * range is computed with a carry from the low words. The accumulator holds nr
+ * before and after.
  */
 static void __init trap_window(unsigned int nr, int is_mmap)
 {
@@ -308,6 +344,7 @@ static void __init trap_window(unsigned int nr, int is_mmap)
 
 	skip = jump(BPF_JEQ | BPF_K, nr);
 	allow_from_gate();
+	allow_from_stub();
 	if (is_mmap) {
 		load(ARG_LO(3));
 		fixed = jump(BPF_JSET | BPF_K, MAP_FIXED);
