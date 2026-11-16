@@ -31,7 +31,13 @@
  * which the compiler could/should do much better anyway.
  */
 SYM_TYPED_FUNC_START(__memcpy)
+#ifdef CONFIG_UML
+	/* UML applies no alternatives, so it tests the host's FSRM at run time. */
+	cmpb $0, uml_fsrm(%rip)
+	je memcpy_orig
+#else
 	ALTERNATIVE "jmp memcpy_orig", "", X86_FEATURE_FSRM
+#endif
 
 	movq %rdi, %rax
 	movq %rdx, %rcx
